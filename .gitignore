@@ -1,0 +1,31 @@
+/bin/
+/dist/
+/coverage/
+/.cache/
+/.idea/
+/.vscode/
+*.log
+*.tmp
+*.sqlite
+*.sqlite3
+*.db
+*.apk
+*.AppImage
+*.deb
+*.rpm
+*.keystore
+*.jks
+.env
+
+# Local account/runtime data must never enter Git.
+/data/
+/state/
+/runtime/
+/screenshots/
+
+# Android/Gradle outputs.
+/.gradle/
+/android/.gradle/
+/android/**/build/
+/android/local.properties
+__pycache__/

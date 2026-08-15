@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">wechatcopilot companion</string>
+    <string name="accessibility_description">Expose the local official WeCom client to the loopback-only wechatcopilot daemon.</string>
+</resources>

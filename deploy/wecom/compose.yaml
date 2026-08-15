@@ -1,0 +1,22 @@
+services:
+  redroid:
+    image: "${REDROID_IMAGE:?set an image pinned with @sha256}"
+    pull_policy: never
+    privileged: true
+    hostname: "${REDROID_HOSTNAME:-wecom-local}"
+    environment:
+      androidboot.redroid_gpu_mode: guest
+    volumes:
+      - type: bind
+        source: "${WECOM_ACCOUNT_DATA:?set an isolated absolute account data directory}"
+        target: /data
+    labels:
+      dev.wechatcopilot.driver: wecom-diagnostic
+    networks:
+      - account
+    restart: "no"
+
+networks:
+  account:
+    driver: bridge
+    attachable: false

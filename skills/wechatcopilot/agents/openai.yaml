@@ -1,0 +1,4 @@
+interface:
+  display_name: "WeChat Copilot"
+  short_description: "Operate personal WeChat and WeCom accounts safely"
+  default_prompt: "Use $wechatcopilot to check unread messages and prepare a safe reply."

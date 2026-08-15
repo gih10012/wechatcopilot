@@ -1,0 +1,11 @@
+# SPDX identifiers accepted for source dependencies, one per line.
+0BSD
+Apache-2.0
+BSD-2-Clause
+BSD-3-Clause
+ISC
+MIT
+MPL-2.0
+Unicode-3.0
+Unicode-DFS-2016
+Unlicense

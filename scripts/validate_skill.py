@@ -11,6 +11,10 @@ from pathlib import Path
 
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 LINK_RE = re.compile(r"\[[^]]+\]\(([^)#]+)(?:#[^)]+)?\)")
+LOGIN_COMMAND_RE = re.compile(
+    r"(?:wechatcopilot\s+)?(?:accounts\s+login|auth\s+(?:begin|status|wait|submit))",
+    re.IGNORECASE,
+)
 
 
 def fail(message: str) -> None:
@@ -89,6 +93,18 @@ def validate(skill_dir: Path) -> None:
             fail(f"SKILL.md link escapes the skill directory: {target}")
         if not linked.is_file():
             fail(f"SKILL.md link does not exist: {target}")
+
+    # Login commands emit a one-time bearer URL. Every Skill document that
+    # mentions them must keep invocation outside agent/tool context.
+    for path in (skill_file, *sorted((skill_dir / "references").glob("*.md"))):
+        document = path.read_text(encoding="utf-8")
+        if not LOGIN_COMMAND_RE.search(document):
+            continue
+        lowered = document.lower()
+        if "bearer login url" not in lowered or "any `auth` subcommand" not in lowered or not (
+            "never execute" in lowered or "never invoke" in lowered
+        ):
+            fail(f"{path.relative_to(skill_dir)} lacks the agent login-secret guard")
 
     validate_openai_yaml(skill_dir / "agents" / "openai.yaml", name)
 

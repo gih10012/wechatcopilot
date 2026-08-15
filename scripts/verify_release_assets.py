@@ -25,6 +25,16 @@ REQUIRED_ARCHIVE_MEMBERS = {
     "LICENSES/README.md",
     "LICENSES/allowed.txt",
     "THIRD_PARTY_NOTICES.md",
+    "skills",
+    "skills/wechatcopilot",
+    "skills/wechatcopilot/SKILL.md",
+    "skills/wechatcopilot/agents",
+    "skills/wechatcopilot/agents/openai.yaml",
+    "skills/wechatcopilot/references",
+    "skills/wechatcopilot/references/accounts.md",
+    "skills/wechatcopilot/references/cli.md",
+    "skills/wechatcopilot/references/mcp.md",
+    "skills/wechatcopilot/references/safety.md",
     "wechatcopilot",
 }
 

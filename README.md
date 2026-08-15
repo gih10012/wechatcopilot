@@ -106,6 +106,13 @@ In another terminal, add and activate a profile using the returned opaque ID:
 ```bash
 ./bin/wechatcopilot accounts add --platform wechat --alias personal --json
 ./bin/wechatcopilot accounts activate --account ACCOUNT_ID --json
+```
+
+Run the login command yourself in a separate trusted terminal. Never ask an
+agent to execute it or paste its output into an agent conversation because the
+output contains a one-time bearer URL:
+
+```bash
 ./bin/wechatcopilot accounts login --account ACCOUNT_ID --wait --json
 ```
 
@@ -158,9 +165,9 @@ Start the stdio MCP server with:
 
 The MCP process delegates to the same daemon and intentionally exposes no login
 code, raw X11, ADB, database, container, or shell tool. The repository's
-[`wechatcopilot` Skill](skills/wechatcopilot/SKILL.md) adds account-selection,
-capability, confirmation, partial-read, and uncertain-send policy for
-cooperative agents.
+[`wechatcopilot` Skill](skills/wechatcopilot/SKILL.md), also included in Linux
+release archives, adds account-selection, capability, confirmation,
+partial-read, and uncertain-send policy for cooperative agents.
 
 MCP and the Skill are behavioral guardrails, not a same-UID security sandbox.
 Every process running as the daemon's Unix user can access that user's files

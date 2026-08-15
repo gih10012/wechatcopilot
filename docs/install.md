@@ -179,6 +179,13 @@ The command refuses to replace an existing unit unless `--force` is explicit. A 
 ```bash
 wechatcopilot accounts add --platform wechat --alias personal --json
 wechatcopilot accounts activate --account ACCOUNT_ID --json
+```
+
+Run the following command yourself in a separate trusted terminal. Do not have
+an agent execute it or paste its output into an agent conversation; the output
+contains a one-time bearer URL:
+
+```bash
 wechatcopilot accounts login --account ACCOUNT_ID --lan --lan-address 192.168.1.20 --json
 ```
 
@@ -194,7 +201,7 @@ After an account reports `ONLINE`, restart its runtime and then the daemon. Conf
 wechatcopilot accounts status --account ACCOUNT_ID --json
 ```
 
-A saved profile normally survives client, container, daemon, and host restarts on the same machine. Tencent can invalidate a session at any time; the correct response is a new user-completed login challenge, not an authentication bypass.
+A saved profile normally survives client, container, daemon, and host restarts on the same machine. A transient driver dependency failure during daemon startup leaves the requested account active with a degraded status; restore the dependency and explicitly activate that same account, or restart the daemon, to retry without losing the requested slot. Tencent can invalidate a session at any time; the correct response is a new user-completed login challenge, not an authentication bypass.
 
 ## Multiple accounts
 
@@ -208,4 +215,4 @@ Expose the stdio MCP server to a local agent with:
 wechatcopilot mcp serve
 ```
 
-Install `skills/wechatcopilot` through the supported Skill mechanism of the agent host. The Skill contains operating policy and uses the same daemon; it does not embed credentials or a second implementation.
+Install `skills/wechatcopilot` through the supported Skill mechanism of the agent host. The directory is included in every Linux release archive and in a source checkout. The Skill contains operating policy and uses the same daemon; it does not embed credentials or a second implementation.

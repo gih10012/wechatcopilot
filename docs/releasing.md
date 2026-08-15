@@ -23,7 +23,7 @@ Create an annotated `vMAJOR.MINOR.PATCH` tag only from the reviewed `main` commi
 
 The workflow publishes:
 
-- Linux amd64 and arm64 `wechatcopilot` archives.
+- Linux amd64 and arm64 `wechatcopilot` archives, each including the installable `wechatcopilot` Skill.
 - A signed project-owned Android companion APK.
 - SPDX JSON SBOM, SHA-256 checksums, and GitHub build-provenance attestations.
 - MIT and third-party dependency notices inside each Go archive.

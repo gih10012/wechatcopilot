@@ -36,7 +36,7 @@ Activation is serialized per platform:
 4. Lock and mount the requested profile.
 5. Start the new driver and report its observed authentication state.
 
-Inactive profiles remain queryable at their last indexed point but do not receive live messages. A daemon restart restores the last requested platform slots. It never starts two clients against the same profile.
+Inactive profiles remain queryable at their last indexed point but do not receive live messages. A daemon restart restores the last requested platform slots. If a transient dependency failure prevents startup, the requested slot remains durably active with a degraded status so an explicit activation or later daemon restart can retry it; restore never silently turns it into an inactive profile. The manager never starts two clients against the same profile.
 
 Account removal is a durable two-phase transition. The registry first records `deleting:true` and makes the account unusable, then the driver purges its stopped runtime and the account store removes its state. A failed cleanup leaves the marker in place across restarts; repeating the same confirmed purge resumes cleanup. Only the account list exposes an account in this state.
 

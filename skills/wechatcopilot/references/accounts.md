@@ -14,7 +14,7 @@ Keep provisioning and unlock in a trusted interactive terminal. `create` closes 
    A failed `state_mount` check means the pinned encrypted state volume is absent or wrong; do not start the daemon or create a replacement directory at that path.
 2. Add an account with a unique human alias; record the returned opaque `account_id`.
 3. Activate the account.
-4. Run `accounts login` in a trusted terminal. Add `--lan` only when the user needs to complete login from another device on the same private network. Let the daemon prefer the default-route interface, or add `--lan-address <RFC1918_IP>` only for an exact address assigned to another eligible local interface.
+4. Stop agent execution and tell the user to run `accounts login` manually in a separate trusted terminal. Never invoke it or any `auth` subcommand through an agent shell or tool, and never ask the user to paste their inputs or outputs: those commands handle a bearer login URL or verification secret. Add `--lan` only when the user needs to complete login from another device on the same private network. Let the daemon prefer the default-route interface, or add `--lan-address <RFC1918_IP>` only for an exact address assigned to another eligible local interface.
 5. Open the one-time URL directly, complete QR scan, phone confirmation, or SMS entry, and wait for `ONLINE`.
 6. Verify that restarting the runtime preserves `ONLINE` before relying on unattended reads.
 
@@ -34,4 +34,4 @@ The daemon persists `deleting:true` before driver cleanup begins. A deleting acc
 
 ## Recover authentication
 
-When Tencent invalidates a session, preserve the profile and enter `AUTH_REQUIRED`. Create a new login challenge rather than adding a replacement account. Stop if the official client reports a risk warning, device rejection, or unsupported environment; the project does not automate around these controls.
+When Tencent invalidates a session, preserve the profile and enter `AUTH_REQUIRED`. Ask the user to create a new login challenge manually rather than adding a replacement account; never create it through an agent tool. Stop if the official client reports a risk warning, device rejection, or unsupported environment; the project does not automate around these controls.

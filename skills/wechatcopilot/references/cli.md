@@ -18,12 +18,19 @@ wechatcopilot accounts list --json
 wechatcopilot accounts status --account ACCOUNT_ID --json
 wechatcopilot accounts activate --account ACCOUNT_ID --json
 wechatcopilot accounts deactivate --account ACCOUNT_ID --json
-wechatcopilot accounts login --account ACCOUNT_ID --lan --lan-address RFC1918_IP --json
 wechatcopilot accounts remove --account ACCOUNT_ID --confirm --purge --json
 wechatcopilot capabilities --account ACCOUNT_ID --json
 ```
 
-`accounts login` creates a short-lived authentication challenge. The user must complete it directly. Do not pass a verification code in an argument or environment variable.
+All login commands are user-only. Never execute `accounts login` or any `auth` subcommand through an agent shell or tool because their inputs or outputs can contain a bearer login URL or verification secret that would enter model or tool history. Tell the user to type the appropriate `accounts login` command in a separate trusted terminal and never ask them to paste its output:
+
+```bash
+wechatcopilot accounts login --account ACCOUNT_ID --wait
+# Private LAN only when needed:
+wechatcopilot accounts login --account ACCOUNT_ID --lan --lan-address RFC1918_IP --wait
+```
+
+The user must open the one-time URL and complete the challenge directly. Do not pass a verification code in an argument or environment variable.
 
 Omit `--lan` for loopback-only login. With `--lan`, omit `--lan-address` to prefer the default-route interface or provide an exact RFC1918 IPv4 assigned to an eligible local interface. Never use a public, wildcard, loopback, container-bridge, or unassigned address.
 
@@ -83,8 +90,8 @@ Use the opaque `surface_ref` returned on a message; a `message_id` is not a surf
 
 | Code | Required response |
 | --- | --- |
-| `AUTH_REQUIRED` | Stop and ask the user to run the login flow. |
-| `AUTH_EXPIRED` | Create a new login challenge; do not reuse the old page. |
+| `AUTH_REQUIRED` | Stop and ask the user to run the login flow manually outside agent context. |
+| `AUTH_EXPIRED` | Ask the user to create a new challenge manually; do not reuse the old page. |
 | `CONFLICT` with `deleting:true` | Retry only the exact `accounts remove --confirm --purge` operation. |
 | `ACCOUNT_INACTIVE` | Activate the exact account or use its last indexed data only. |
 | `DRIVER_UNAVAILABLE` | Run `doctor`; report the failed driver dependency. |

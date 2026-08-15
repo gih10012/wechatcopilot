@@ -37,7 +37,7 @@ Do not request arbitrary coordinates, keyboard events, ADB, JavaScript injection
 
 ## Failure behavior
 
-- `AUTH_REQUIRED`: ask the user to start a trusted CLI login challenge.
+- `AUTH_REQUIRED`: ask the user to start a CLI login challenge manually in a separate trusted terminal. Never run `accounts login` or an `auth` subcommand through an agent tool, or ask for their bearer-URL/verification-secret input or output.
 - `TARGET_AMBIGUOUS`: present the candidates and wait for a choice.
 - `CLIENT_INCOMPATIBLE`: stop and report the exact detected client version.
 - `UNSUPPORTED_CAPABILITY`: report the boundary; do not find a raw-input workaround.

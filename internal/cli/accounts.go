@@ -173,7 +173,7 @@ func (a *application) accountLoginCommand() *cobra.Command {
 	var wait bool
 	command := &cobra.Command{
 		Use:   "login",
-		Short: "Create a user-completed QR or phone verification challenge",
+		Short: "User-only: create a QR or phone verification challenge",
 		Args:  noArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			if err := requireValue("account", accountID); err != nil {
@@ -205,7 +205,7 @@ func (a *application) accountLoginCommand() *cobra.Command {
 }
 
 func (a *application) authCommand() *cobra.Command {
-	command := &cobra.Command{Use: "auth", Short: "Manage short-lived user login challenges"}
+	command := &cobra.Command{Use: "auth", Short: "User-only low-level login challenge commands", Hidden: true}
 	command.AddCommand(a.authBeginCommand(), a.authStatusCommand(), a.authSubmitCommand(), a.authWaitCommand())
 	return command
 }

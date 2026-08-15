@@ -53,7 +53,7 @@ func (m *Manager) Restore(ctx context.Context) []error {
 	var result []error
 	for _, item := range m.accounts.List() {
 		if item.Active && !item.Deleting {
-			if _, err := m.Activate(ctx, item.ID); err != nil {
+			if _, err := m.activate(ctx, item.ID, true); err != nil {
 				result = append(result, fmt.Errorf("restore %s: %w", item.Alias, err))
 			}
 		}
@@ -79,6 +79,13 @@ func (m *Manager) BeginDelete(value string) (account.Account, error) {
 }
 
 func (m *Manager) Activate(ctx context.Context, value string) (account.Account, error) {
+	return m.activate(ctx, value, false)
+}
+
+// activate preserves a previously requested active slot during daemon restore.
+// A transient dependency failure must not turn an automatic restart into a
+// durable deactivation; explicit activation failures still roll back normally.
+func (m *Manager) activate(ctx context.Context, value string, restoring bool) (account.Account, error) {
 	target, err := m.accounts.Resolve(value)
 	if err != nil {
 		return account.Account{}, err
@@ -130,19 +137,16 @@ func (m *Manager) Activate(ctx context.Context, value string) (account.Account, 
 	}
 	runtimeConfig := m.accounts.Runtime(activated)
 	if err := os.MkdirAll(runtimeConfig.RuntimeDir, 0o700); err != nil {
-		_ = m.accounts.UpdateStatus(activated.ID, driver.Status{State: driver.StateDegraded, Reason: err.Error(), ObservedAt: time.Now().UTC()})
-		_, _ = m.accounts.Deactivate(activated.ID)
+		m.recordActivationFailure(activated.ID, err, restoring)
 		return account.Account{}, err
 	}
 	instance, err := factory(runtimeConfig)
 	if err != nil {
-		_ = m.accounts.UpdateStatus(activated.ID, driver.Status{State: driver.StateDegraded, Reason: err.Error(), ObservedAt: time.Now().UTC()})
-		_, _ = m.accounts.Deactivate(activated.ID)
+		m.recordActivationFailure(activated.ID, err, restoring)
 		return account.Account{}, err
 	}
 	if err := instance.Start(ctx, runtimeConfig); err != nil {
-		_ = m.accounts.UpdateStatus(activated.ID, driver.Status{State: driver.StateDegraded, Reason: err.Error(), ObservedAt: time.Now().UTC()})
-		_, _ = m.accounts.Deactivate(activated.ID)
+		m.recordActivationFailure(activated.ID, err, restoring)
 		return account.Account{}, err
 	}
 	status, statusErr := instance.Status(ctx)
@@ -157,6 +161,15 @@ func (m *Manager) Activate(ctx context.Context, value string) (account.Account, 
 	m.mu.Unlock()
 	go m.ingestLoop(runCtx, runtime)
 	return m.accounts.Resolve(activated.ID)
+}
+
+func (m *Manager) recordActivationFailure(accountID string, failure error, restoring bool) {
+	_ = m.accounts.UpdateStatus(accountID, driver.Status{
+		State: driver.StateDegraded, Reason: failure.Error(), ObservedAt: time.Now().UTC(),
+	})
+	if !restoring {
+		_, _ = m.accounts.Deactivate(accountID)
+	}
 }
 
 func (m *Manager) Deactivate(ctx context.Context, value string) (account.Account, error) {

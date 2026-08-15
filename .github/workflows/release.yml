@@ -53,11 +53,12 @@ jobs:
           fi
           cp LICENSE THIRD_PARTY_NOTICES.md staging/
           cp -R LICENSES staging/
+          cp -R skills staging/
           go install github.com/google/go-licenses/v2@v2.0.1
           CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_GOARCH" go-licenses report ./cmd/wechatcopilot > go-licenses.csv
           python3 scripts/check_dependency_licenses.py go-licenses.csv
           CGO_ENABLED=0 GOOS=linux GOARCH="$TARGET_GOARCH" go-licenses save ./cmd/wechatcopilot --save_path=staging/LICENSES/go
-          tar -C staging -czf "wechatcopilot-linux-${TARGET_GOARCH}.tar.gz" wechatcopilot LICENSE LICENSES THIRD_PARTY_NOTICES.md
+          tar -C staging -czf "wechatcopilot-linux-${TARGET_GOARCH}.tar.gz" wechatcopilot LICENSE LICENSES THIRD_PARTY_NOTICES.md skills
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wechatcopilot-linux-${{ matrix.goarch }}

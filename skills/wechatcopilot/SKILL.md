@@ -13,7 +13,7 @@ Use `wechatcopilot` as the semantic control plane for official WeChat and WeCom 
    If `state_mount` or `swap_confidentiality` fails, stop. Never unset mount constraints, substitute an unmounted fallback directory, or bypass the swap gate. Before first real-account authentication, follow the encrypted-volume and swap gates in [account and authentication workflow](references/accounts.md).
 2. Run `wechatcopilot accounts list --json` and select the exact `account_id`.
 3. Run `wechatcopilot accounts status --account <account_id> --json`.
-4. If the account is not `ONLINE`, do not send, watch, refresh visible UI data, or operate surfaces. A bounded read or search may use only its existing local index when the user accepts stale data; label it as an inactive snapshot. For a live operation, activate the exact account and direct the user to the CLI login flow if authentication is required. Never request, receive, or relay an SMS code through the model or MCP.
+4. If the account is not `ONLINE`, do not send, watch, refresh visible UI data, or operate surfaces. A bounded read or search may use only its existing local index when the user accepts stale data; label it as an inactive snapshot. For a live operation, activate the exact account and direct the user to run the CLI login flow manually if authentication is required. Never execute `accounts login` or any `auth` subcommand through an agent shell or tool: their inputs or outputs can contain a bearer login URL or verification secret. Never request, receive, or relay that output or an SMS code through the model or MCP.
 5. For an `ONLINE` account, run `wechatcopilot capabilities --account <account_id> --json` before relying on a beta, experimental, or platform-specific feature. An inactive stale-index read neither requires nor proves current driver capabilities; use only the stored result provenance and completeness.
 
 When several accounts exist, always pass `--account`; do not infer an account from its alias. Read [CLI reference](references/cli.md) for commands and stable errors. For MCP calls, read [MCP reference](references/mcp.md).
@@ -51,7 +51,7 @@ Do not invent coordinates or expose X11, ADB, shell, or raw input commands. Stop
 
 ## Handle authentication and multiple accounts
 
-Use the CLI login flow outside model context. A user may open its one-time local or LAN page to scan a QR code, confirm on a phone, or enter an SMS code. The code must never appear in command arguments, environment variables, logs, chat, or MCP calls.
+Use the CLI login flow outside model context. Tell the user the exact `accounts login` command to type in a trusted terminal, but never execute it or an `auth begin`, `auth status`, `auth wait`, or `auth submit` command through an agent shell or tool, and never ask the user to paste their output. These commands handle a one-time bearer URL or verification secret; only the user may open the page to scan a QR code, confirm on a phone, or enter an SMS code. The URL, QR content, and code must never appear in tool output, command arguments, environment variables, logs, chat, or MCP calls.
 
 Only one account per platform is active at a time. Switching accounts preserves the inactive profile and indexed history but does not collect new messages while that profile is stopped. WeChat and WeCom may each have one active account concurrently. Read [account and authentication workflow](references/accounts.md) before adding, activating, removing, or recovering an account.
 
@@ -61,4 +61,4 @@ Only one account per platform is active at a time. Switching accounts preserves 
 - Describe `experimental` behavior before using it on an important account.
 - Stop on `AUTH_REQUIRED`, `CLIENT_INCOMPATIBLE`, `TARGET_AMBIGUOUS`, or any account-risk warning.
 - Never bypass Tencent controls, install unofficial protocol gateways, or modify official client traffic.
-- Keep message bodies, screenshots, QR codes, auth challenges, local paths, and database material out of logs and final responses unless the user explicitly needs the content.
+- Never include login URLs, QR content, verification codes, or authentication challenges in tool calls, logs, chat, or final responses. Keep message bodies, screenshots, local paths, and database material out of logs and final responses unless the user explicitly needs the content.

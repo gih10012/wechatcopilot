@@ -216,6 +216,74 @@ func TestActivateRollsBackWhenRuntimeDirectoryCannotBeCreated(t *testing.T) {
 	}
 }
 
+func TestRestorePreservesRequestedSlotAfterTransientStartFailure(t *testing.T) {
+	store := testAccountStore(t)
+	item, err := store.Add("first", driver.PlatformWeChat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Activate(item.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	failing := NewManager(store)
+	failing.Register(driver.PlatformWeChat, func(driver.AccountRuntime) (driver.Driver, error) {
+		return nil, errors.New("temporary Docker outage")
+	})
+	restoreErrors := failing.Restore(context.Background())
+	if len(restoreErrors) != 1 {
+		t.Fatalf("restore errors = %v, want one transient failure", restoreErrors)
+	}
+	preserved, err := store.Resolve(item.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !preserved.Active || preserved.State != driver.StateDegraded || preserved.LastError == "" {
+		t.Fatalf("restore failure discarded requested slot or status: %#v", preserved)
+	}
+	recovered := NewManager(store)
+	recovered.Register(driver.PlatformWeChat, func(driver.AccountRuntime) (driver.Driver, error) {
+		return fake.New(driver.PlatformWeChat), nil
+	})
+	if restoreErrors := recovered.Restore(context.Background()); len(restoreErrors) != 0 {
+		t.Fatalf("second restore did not recover: %v", restoreErrors)
+	}
+	if _, _, err := recovered.Driver(item.ID); err != nil {
+		t.Fatalf("requested slot was not restored after dependency recovery: %v", err)
+	}
+	if err := recovered.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExplicitActivateRetriesPreservedRestoreSlot(t *testing.T) {
+	store := testAccountStore(t)
+	item, err := store.Add("first", driver.PlatformWeChat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.Activate(item.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := NewManager(store)
+	manager.Register(driver.PlatformWeChat, func(driver.AccountRuntime) (driver.Driver, error) {
+		return nil, errors.New("temporary Docker outage")
+	})
+	if restoreErrors := manager.Restore(context.Background()); len(restoreErrors) != 1 {
+		t.Fatalf("restore errors = %v, want one transient failure", restoreErrors)
+	}
+	manager.Register(driver.PlatformWeChat, func(driver.AccountRuntime) (driver.Driver, error) {
+		return fake.New(driver.PlatformWeChat), nil
+	})
+	if _, err := manager.Activate(context.Background(), item.ID); err != nil {
+		t.Fatalf("explicit activation did not retry the requested slot: %v", err)
+	}
+	if err := manager.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type stopDriver struct {
 	*fake.Driver
 	failStop bool

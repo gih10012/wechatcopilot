@@ -39,4 +39,4 @@ Account removal is a separate destructive operation. Call `account_remove` only 
 
 ## Authentication
 
-MCP does not accept QR images, phone confirmations, verification codes, account passwords, or database keys. If an account reports `AUTH_REQUIRED`, direct the user to `wechatcopilot accounts login` in a trusted terminal.
+MCP does not accept QR images, phone confirmations, verification codes, account passwords, or database keys. If an account reports `AUTH_REQUIRED`, direct the user to type `wechatcopilot accounts login` manually in a separate trusted terminal. Never invoke it or any `auth` subcommand through an agent shell or tool, and never ask for their inputs or outputs, because those commands handle a bearer login URL or verification secret.

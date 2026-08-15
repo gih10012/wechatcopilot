@@ -19,6 +19,8 @@ Tool names and schemas are discoverable from the running server. Prefer discover
 
 For a bounded initial history read, call `messages_list` with `latest:true` and a limit. The daemon applies the message filters, selects the newest matching window, and returns that window in ascending local sequence order. Do not combine latest mode with a nonzero `after_sequence`; the daemon rejects that ambiguous request. Without latest mode, `after_sequence` reads forward from the cursor.
 
+Capability keys describe data guarantees rather than separate tools. If `messages.history` is `unsupported` but `messages.visible` is available, `messages_list` is still the documented transport for the bounded current UI view. Preserve its `source:"ui"` and `complete:false`; stop only when both read capabilities are `unsupported`.
+
 ## Polling
 
 Use the bounded message poll tool rather than expecting an unbounded MCP response. Supply its last cursor and persist the returned cursor. A cursor only orders the local account journal; it does not prove complete server history.

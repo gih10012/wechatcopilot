@@ -35,6 +35,7 @@ scripts-check:
 	$(PYTHON) -c 'compile(open("deploy/wechat/ui_driver.py", "rb").read(), "ui_driver.py", "exec")'
 	$(PYTHON) -m unittest -v deploy/wechat/test_ui_driver.py
 	@set -e; for script in deploy/wechat/*.sh; do sh -n "$$script"; done
+	bash -n scripts/provision_state_volume.sh
 
 skill-check:
 	$(PYTHON) scripts/validate_skill.py skills/wechatcopilot

@@ -1,8 +1,17 @@
 # Accounts and authentication
 
+## Host storage gate
+
+Before any real-account login, require `doctor` to report `swap_confidentiality` healthy. When a dedicated or file-backed state mount is configured, also require the `state_mount` check to be present and healthy. Accept no swap, a real zram block device whose sysfs `backing_dev` is absent or `none`, or a separately verified dm-crypt swap device; the provisioning script itself only warns, while the daemon refuses to start or restore accounts when the swap check fails.
+
+When the backing disk is NTFS3, use it only for the outer fully allocated 64 GiB LUKS2 image. The live state root is the inner ext4 mount. Keep the outer filesystem UUID distinct from the inner ext4 UUID: every mutating provisioning command (`create`, `configure`, `unlock`, and `lock`) requires the outer UUID, while the daemon's three mount-gate variables identify the inner mapper, ext4 type, and ext4 UUID.
+
+Keep provisioning and unlock in a trusted interactive terminal. `create` closes the manually formatted mapper and asks for the passphrase again while systemd reopens it. After changing `/share` idle-timeout settings, run `systemctl daemon-reload`. Before `daemon install`, export `WECHATCOPILOT_HOME` and all three gate variables; the installer writes the three constraints to its required `state-mount.environment` and refuses a later implicit downgrade when those variables are missing. Do not configure TPM or key-file automatic unlock. Before `lock`, stop the daemon and all project containers.
+
 ## Add and authenticate
 
 1. Run `doctor` and resolve all blocking checks.
+   A failed `state_mount` check means the pinned encrypted state volume is absent or wrong; do not start the daemon or create a replacement directory at that path.
 2. Add an account with a unique human alias; record the returned opaque `account_id`.
 3. Activate the account.
 4. Run `accounts login` in a trusted terminal. Add `--lan` only when the user needs to complete login from another device on the same private network. Let the daemon prefer the default-route interface, or add `--lan-address <RFC1918_IP>` only for an exact address assigned to another eligible local interface.

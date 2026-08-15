@@ -21,6 +21,9 @@ import (
 
 const (
 	EnvHome                      = "WECHATCOPILOT_HOME"
+	EnvStateMountSource          = "WECHATCOPILOT_STATE_MOUNT_SOURCE"
+	EnvStateMountFSType          = "WECHATCOPILOT_STATE_MOUNT_FSTYPE"
+	EnvStateMountUUID            = "WECHATCOPILOT_STATE_MOUNT_UUID"
 	EnvDocker                    = "WECHATCOPILOT_DOCKER"
 	EnvLANAddress                = "WECHATCOPILOT_LAN_ADDRESS"
 	EnvWeChatImage               = "WECHATCOPILOT_WECHAT_IMAGE"
@@ -41,6 +44,7 @@ var (
 	digestPattern      = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
 	imagePattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,511}$`)
 	pinnedImagePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,511}@sha256:[a-f0-9]{64}$`)
+	zramDevicePattern  = regexp.MustCompile(`^zram[0-9]+$`)
 )
 
 type Paths struct {
@@ -220,15 +224,37 @@ type Check struct {
 
 func Doctor(paths Paths, runtimeChecks bool) []Check {
 	checks := []Check{{Name: "platform", OK: runtime.GOOS == "linux", Detail: runtime.GOOS}}
-	if err := paths.Ensure(); err != nil {
+	stateReady := true
+	if check, required, guard := requiredStateMountCheck(paths.Home); required {
+		checks = append(checks, check)
+		stateReady = check.OK
+		if guard != nil {
+			defer guard.Close()
+		}
+	}
+	if !stateReady {
+		checks = append(checks, Check{
+			Name:   "state_permissions",
+			OK:     false,
+			Detail: "not checked because the required state volume is unavailable",
+			Fix:    "Unlock and mount the configured state volume; never use the unmounted fallback directory.",
+		})
+		// Keep doctor read-only while the required mount is unavailable. A
+		// misconfigured runtime path may otherwise recreate the fallback tree.
+		checks = append(checks, privateDirectoryCheck("runtime_permissions", paths.Runtime, 0o700))
+		checks = append(checks, daemonSocketCheck(paths.Socket))
+	} else if err := paths.Ensure(); err != nil {
 		checks = append(checks, Check{Name: "state_permissions", OK: false, Detail: err.Error()})
 	} else {
 		checks = append(checks, Check{Name: "state_permissions", OK: true, Detail: paths.Home})
 		checks = append(checks, diskCheck(paths.Home))
 		checks = append(checks, lockCheck(paths.Home))
 	}
-	checks = append(checks, privateDirectoryCheck("runtime_permissions", paths.Runtime, 0o700))
-	checks = append(checks, daemonSocketCheck(paths.Socket))
+	if stateReady {
+		checks = append(checks, privateDirectoryCheck("runtime_permissions", paths.Runtime, 0o700))
+		checks = append(checks, daemonSocketCheck(paths.Socket))
+	}
+	checks = append(checks, swapConfidentialityCheck())
 	if !runtimeChecks {
 		return checks
 	}
@@ -254,6 +280,81 @@ func Doctor(paths Paths, runtimeChecks bool) []Check {
 	checks = append(checks, apkCheck("wecom_companion_apk", companionAPK, "", true))
 	checks = append(checks, distinctArtifactsCheck(officialAPK, companionAPK))
 	return checks
+}
+
+func swapConfidentialityCheck() Check {
+	contents, err := os.ReadFile("/proc/swaps")
+	if err != nil {
+		return Check{
+			Name: "swap_confidentiality", OK: false, Detail: err.Error(),
+			Fix: "Verify swap manually; use no swap or zram before real-account login.",
+		}
+	}
+	return swapConfidentialityCheckFrom(contents, isZRAMBlockDevice, isDMEncryptedBlockDevice)
+}
+
+// ValidateSwapConfidentiality prevents a daemon from restoring real-account
+// state while decrypted pages can be written to unprotected disk swap.
+func ValidateSwapConfidentiality() error {
+	check := swapConfidentialityCheck()
+	if !check.OK {
+		return errors.New(check.Detail)
+	}
+	return nil
+}
+
+func swapConfidentialityCheckFrom(contents []byte, zramBlockDevice, encryptedBlockDevice func(string) bool) Check {
+	unsafe := 0
+	for index, line := range strings.Split(string(contents), "\n") {
+		if index == 0 || strings.TrimSpace(line) == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 || zramBlockDevice(fields[0]) || encryptedBlockDevice(fields[0]) {
+			continue
+		}
+		unsafe++
+	}
+	if unsafe > 0 {
+		return Check{
+			Name: "swap_confidentiality", OK: false,
+			Detail: fmt.Sprintf("%d unprotected disk-backed swap target(s) can retain decrypted account data", unsafe),
+			Fix:    "Disable unprotected swap or replace it with zram or a dm-crypt swap device before real-account login.",
+		}
+	}
+	return Check{Name: "swap_confidentiality", OK: true, Detail: "no unprotected disk-backed swap is active"}
+}
+
+func isZRAMBlockDevice(path string) bool {
+	return isZRAMBlockDeviceWith(path, os.ReadFile)
+}
+
+func isZRAMBlockDeviceWith(path string, readFile func(string) ([]byte, error)) bool {
+	var stat unix.Stat_t
+	if err := unix.Stat(path, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFBLK {
+		return false
+	}
+	sysfsPath := filepath.Join("/sys/dev/block", fmt.Sprintf("%d:%d", unix.Major(uint64(stat.Rdev)), unix.Minor(uint64(stat.Rdev))))
+	resolved, err := filepath.EvalSymlinks(sysfsPath)
+	return err == nil && zramDevicePattern.MatchString(filepath.Base(resolved)) && zramWritebackDisabled(resolved, readFile)
+}
+
+func zramWritebackDisabled(sysfsDevicePath string, readFile func(string) ([]byte, error)) bool {
+	contents, err := readFile(filepath.Join(sysfsDevicePath, "backing_dev"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return true
+	}
+	return err == nil && strings.TrimSpace(string(contents)) == "none"
+}
+
+func isDMEncryptedBlockDevice(path string) bool {
+	var stat unix.Stat_t
+	if err := unix.Stat(path, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFBLK {
+		return false
+	}
+	dmUUIDPath := filepath.Join("/sys/dev/block", fmt.Sprintf("%d:%d", unix.Major(uint64(stat.Rdev)), unix.Minor(uint64(stat.Rdev))), "dm", "uuid")
+	uuid, err := os.ReadFile(dmUUIDPath)
+	return err == nil && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(string(uuid))), "CRYPT-")
 }
 
 func commandCheck(name, binary, fix string) Check {

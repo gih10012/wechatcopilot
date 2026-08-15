@@ -31,11 +31,12 @@ jobs:
         run: go test -race -coverprofile=coverage.out ./...
       - name: Scan reachable Go vulnerabilities
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
-      - name: Check WeChat runtime scripts
+      - name: Check runtime and provisioning scripts
         run: |
           python3 -c 'compile(open("deploy/wechat/ui_driver.py", "rb").read(), "ui_driver.py", "exec")'
           python3 -m unittest -v deploy/wechat/test_ui_driver.py
           for script in deploy/wechat/*.sh; do sh -n "$script"; done
+          bash -n scripts/provision_state_volume.sh
       - name: Build CLI
         run: go build -trimpath -o bin/wechatcopilot ./cmd/wechatcopilot
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

@@ -10,10 +10,11 @@ Use `wechatcopilot` as the semantic control plane for official WeChat and WeCom 
 ## Start every workflow
 
 1. Run `wechatcopilot doctor --json` when runtime health is unknown.
+   If `state_mount` or `swap_confidentiality` fails, stop. Never unset mount constraints, substitute an unmounted fallback directory, or bypass the swap gate. Before first real-account authentication, follow the encrypted-volume and swap gates in [account and authentication workflow](references/accounts.md).
 2. Run `wechatcopilot accounts list --json` and select the exact `account_id`.
 3. Run `wechatcopilot accounts status --account <account_id> --json`.
-4. If the account is not `ONLINE`, stop the requested operation and direct the user to the CLI login flow. Never request, receive, or relay an SMS code through the model or MCP.
-5. Run `wechatcopilot capabilities --account <account_id> --json` before relying on a beta, experimental, or platform-specific feature.
+4. If the account is not `ONLINE`, do not send, watch, refresh visible UI data, or operate surfaces. A bounded read or search may use only its existing local index when the user accepts stale data; label it as an inactive snapshot. For a live operation, activate the exact account and direct the user to the CLI login flow if authentication is required. Never request, receive, or relay an SMS code through the model or MCP.
+5. For an `ONLINE` account, run `wechatcopilot capabilities --account <account_id> --json` before relying on a beta, experimental, or platform-specific feature. An inactive stale-index read neither requires nor proves current driver capabilities; use only the stored result provenance and completeness.
 
 When several accounts exist, always pass `--account`; do not infer an account from its alias. Read [CLI reference](references/cli.md) for commands and stable errors. For MCP calls, read [MCP reference](references/mcp.md).
 
@@ -21,9 +22,10 @@ When several accounts exist, always pass `--account`; do not infer an account fr
 
 1. Resolve a conversation through `conversations list` or `conversations search`.
 2. Select by opaque `conversation_id`, not by title alone.
-3. Read using `messages history`; use `--latest --limit N` for a bounded initial tail, and preserve `complete`, `source`, and `confidence` in any answer. Latest results are still ordered by ascending local sequence.
-4. Treat `complete:false` as a partial client-side view, especially for inactive WeCom accounts.
-5. Use bounded `messages watch` or MCP polling for new messages. Persist the returned cursor when operating continuously.
+3. Check both `messages.history` and `messages.visible`. If history is available, read it with `messages history`. If history is `unsupported` but visible messages are available, use the same command to read the bounded current UI view; this is the documented transport for `messages.visible`, not a history-capability bypass. Stop only when both read capabilities are `unsupported`.
+4. Use `--latest --limit N` for a bounded initial tail, and preserve `complete`, `source`, and `confidence` in any answer. Latest results are still ordered by ascending local sequence.
+5. Treat `complete:false` as a partial client-side view. Personal WeChat UI observations normally report `source:"ui"` and `complete:false`; inactive accounts and WeCom UI collection can also be incomplete.
+6. Use bounded `messages watch` or MCP polling for new messages. Persist the returned cursor when operating continuously.
 
 Never claim that locally observed messages represent complete cloud history.
 
@@ -55,7 +57,7 @@ Only one account per platform is active at a time. Switching accounts preserves 
 
 ## Respect capability and failure boundaries
 
-- Treat `unsupported` as final for the current driver and client version.
+- Treat `unsupported` as final for that capability and client version. The documented `messages.visible` transport above does not turn visible UI observations into history.
 - Describe `experimental` behavior before using it on an important account.
 - Stop on `AUTH_REQUIRED`, `CLIENT_INCOMPATIBLE`, `TARGET_AMBIGUOUS`, or any account-risk warning.
 - Never bypass Tencent controls, install unofficial protocol gateways, or modify official client traffic.

@@ -63,6 +63,19 @@ runtime root/
 
 Account state directories and databases are mode `0700`/`0600`. The generated login-link QR file is runtime-only and removed on completion or expiry; official-client login screenshots remain in memory while a challenge is active. See [Security](security.md) for the data and trust model.
 
+An operator may pin the state root to an exact mounted device, filesystem type, and filesystem UUID. When configured, the daemon validates that mount and holds a guard on it before `Paths.Ensure` can create any directory; `doctor` holds the same guard through all state checks. `daemon install` copies the three exported constraints into a required `state-mount.environment` loaded after the optional general environment file. The persisted environment file or its required unit reference also acts as a downgrade marker, so `doctor`, foreground `daemon serve`, and later installs fail when a new shell omits the constraints. This fail-closed gate prevents a missing encrypted mount, forgotten exports, or a general-setting override from producing an unencrypted fallback registry or profile tree.
+
+The supported file-backed layout keeps NTFS3 outside the live-state boundary:
+
+```text
+outer NTFS3 filesystem (pinned outer UUID)
+  `- fully allocated 64 GiB state.luks (LUKS2)
+       `- /dev/mapper/wechatcopilot-state
+            `- ext4 mount (pinned inner UUID) -> state root
+```
+
+The outer UUID is required by every mutating provisioning operation; the daemon gate uses the distinct inner ext4 UUID. Generated systemd units are `noauto` and use a manually entered passphrase. The workflow does not configure a key file or TPM automatic unlock. Locking requires the daemon and all project containers to be stopped first, and real-account use requires no raw or unencrypted disk-backed swap.
+
 ## Driver contract
 
 A driver owns exactly one active official-client runtime. It reports lifecycle state and a complete capability map where each stable key is `stable`, `beta`, `experimental`, or `unsupported`. The shared keys cover QR/SMS authentication, visible/history/watch message reads, text and attachment sends, official-account reads, web and mini-program opens, and surface actions. Identity and exact client version are capability-dependent observations and may be absent when the official UI does not expose them reliably.

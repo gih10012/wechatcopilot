@@ -20,6 +20,232 @@ func TestContainsLineHandlesProcFilesystemsFields(t *testing.T) {
 	}
 }
 
+func TestSwapConfidentialityAcceptsOnlyProtectedSwap(t *testing.T) {
+	header := "Filename Type Size Used Priority\n"
+	for _, test := range []struct {
+		name     string
+		contents string
+		ok       bool
+	}{
+		{name: "none", contents: header, ok: true},
+		{name: "zram", contents: header + "/dev/zram0 partition 1048572 0 100\n", ok: true},
+		{name: "raw partition", contents: header + "/dev/sda2 partition 5242876 1 -2\n", ok: false},
+		{name: "swap file", contents: header + "/swapfile file 1048572 0 -2\n", ok: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			check := swapConfidentialityCheckFrom(
+				[]byte(test.contents),
+				func(path string) bool { return path == "/dev/zram0" },
+				func(string) bool { return false },
+			)
+			if check.Name != "swap_confidentiality" || check.OK != test.ok {
+				t.Fatalf("swap check = %#v, want ok=%v", check, test.ok)
+			}
+		})
+	}
+	encrypted := swapConfidentialityCheckFrom(
+		[]byte(header+"/dev/mapper/cryptswap partition 1048572 0 -2\n"),
+		func(string) bool { return false },
+		func(path string) bool { return path == "/dev/mapper/cryptswap" },
+	)
+	if !encrypted.OK {
+		t.Fatalf("dm-crypt swap check = %#v", encrypted)
+	}
+	spoofedZRAM := swapConfidentialityCheckFrom(
+		[]byte(header+"/dev/zram-spoof file 1048572 0 -2\n"),
+		func(string) bool { return false },
+		func(string) bool { return false },
+	)
+	if spoofedZRAM.OK {
+		t.Fatalf("zram-like path bypassed the block-device check: %#v", spoofedZRAM)
+	}
+}
+
+func TestZRAMWritebackDisabled(t *testing.T) {
+	sysfsDevicePath := "/sys/devices/virtual/block/zram0"
+	backingDevPath := filepath.Join(sysfsDevicePath, "backing_dev")
+	readError := errors.New("permission denied")
+	for _, test := range []struct {
+		name     string
+		contents string
+		err      error
+		want     bool
+	}{
+		{name: "unsupported", err: os.ErrNotExist, want: true},
+		{name: "disabled", contents: "none\n", want: true},
+		{name: "raw backing device", contents: "/dev/nvme0n1p1\n", want: false},
+		{name: "read error", err: readError, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := zramWritebackDisabled(sysfsDevicePath, func(path string) ([]byte, error) {
+				if path != backingDevPath {
+					t.Fatalf("read path = %q, want %q", path, backingDevPath)
+				}
+				return []byte(test.contents), test.err
+			})
+			if got != test.want {
+				t.Fatalf("zramWritebackDisabled() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestFindMountInfoRequiresExactDecodedMountPoint(t *testing.T) {
+	contents := strings.Join([]string{
+		`31 20 0:42 / /srv/private rw,relatime - ext4 /dev/mapper/other rw`,
+		`32 20 253:7 / /srv/private\040state rw,nosuid,nodev - ext4 /dev/mapper/wechatcopilot-state rw`,
+		`33 20 253:8 / /srv/private\040state rw,nosuid,nodev - ext4 /dev/mapper/stacked-overmount rw`,
+	}, "\n")
+	entry, err := findMountInfo(strings.NewReader(contents), "/srv/private state", 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.MountID != 32 || entry.Major != 253 || entry.Minor != 7 || entry.Root != "/" || entry.FSType != "ext4" || entry.Source != "/dev/mapper/wechatcopilot-state" {
+		t.Fatalf("mount entry = %#v", entry)
+	}
+	if !mountOption(entry.Options, "rw") || mountOption(entry.Options, "ro") {
+		t.Fatalf("mount options = %q", entry.Options)
+	}
+	if _, err := findMountInfo(strings.NewReader(contents), "/srv/private"); err != nil {
+		t.Fatalf("exact sibling mount was not found: %v", err)
+	}
+	if _, err := findMountInfo(strings.NewReader(contents), "/srv"); err == nil {
+		t.Fatal("non-mount ancestor was accepted")
+	}
+}
+
+func TestRequiredStateMountConfigurationIsAllOrNothing(t *testing.T) {
+	t.Setenv(EnvStateMountSource, "/dev/mapper/wechatcopilot-state")
+	t.Setenv(EnvStateMountFSType, "")
+	t.Setenv(EnvStateMountUUID, "")
+	if _, required, err := stateMountRequirementFromEnv(); !required || err == nil {
+		t.Fatalf("partial mount requirement: required=%v err=%v", required, err)
+	}
+
+	t.Setenv(EnvStateMountFSType, "EXT4")
+	t.Setenv(EnvStateMountUUID, "not-a-uuid")
+	if _, _, err := stateMountRequirementFromEnv(); err == nil {
+		t.Fatal("invalid filesystem UUID was accepted")
+	}
+
+	t.Setenv(EnvStateMountUUID, "AABBCCDD-4455-6677-8899-AABBCCDDEEFF")
+	requirement, required, err := stateMountRequirementFromEnv()
+	if err != nil || !required || requirement.FSType != "ext4" || requirement.UUID != "aabbccdd-4455-6677-8899-aabbccddeeff" {
+		t.Fatalf("valid mount requirement = %#v required=%v err=%v", requirement, required, err)
+	}
+	environment, err := RequiredStateMountEnvironment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		`WECHATCOPILOT_STATE_MOUNT_SOURCE="/dev/mapper/wechatcopilot-state"`,
+		`WECHATCOPILOT_STATE_MOUNT_FSTYPE="ext4"`,
+		`WECHATCOPILOT_STATE_MOUNT_UUID="aabbccdd-4455-6677-8899-aabbccddeeff"`,
+	}
+	if strings.Join(environment, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("state mount environment = %#v, want %#v", environment, want)
+	}
+}
+
+func TestAcquireRequiredStateMountIsNilWhenDisabled(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv(EnvStateMountSource, "")
+	t.Setenv(EnvStateMountFSType, "")
+	t.Setenv(EnvStateMountUUID, "")
+	guard, err := AcquireRequiredStateMount(filepath.Join(t.TempDir(), "missing"))
+	if err != nil || guard != nil {
+		t.Fatalf("disabled mount guard = %#v err=%v", guard, err)
+	}
+	if err := guard.Close(); err != nil {
+		t.Fatalf("close nil mount guard: %v", err)
+	}
+	if err := (&RequiredStateMountGuard{}).Close(); err != nil {
+		t.Fatalf("close zero-value mount guard: %v", err)
+	}
+}
+
+func TestPersistedStateMountGateFailsClosedWhenShellEnvironmentIsMissing(t *testing.T) {
+	root := t.TempDir()
+	configHome := filepath.Join(root, "config")
+	persistedEnvironment := filepath.Join(configHome, "wechatcopilot", "state-mount.environment")
+	if err := os.MkdirAll(filepath.Dir(persistedEnvironment), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(persistedEnvironment, []byte("persisted gate fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv(EnvStateMountSource, "")
+	t.Setenv(EnvStateMountFSType, "")
+	t.Setenv(EnvStateMountUUID, "")
+	stateHome := filepath.Join(root, "state-must-not-exist")
+	guard, err := AcquireRequiredStateMount(stateHome)
+	if guard != nil || err == nil || !strings.Contains(err.Error(), "persisted state mount gate") {
+		t.Fatalf("persisted mount guard = %#v err=%v", guard, err)
+	}
+	checks := Doctor(Paths{
+		Home: stateHome, Accounts: filepath.Join(stateHome, "accounts"), Downloads: filepath.Join(stateHome, "downloads"),
+		Runtime: filepath.Join(root, "runtime"), Socket: filepath.Join(root, "runtime", "daemon.sock"), Registry: filepath.Join(stateHome, "accounts.json"),
+	}, false)
+	if _, statErr := os.Stat(stateHome); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("doctor created fallback state despite persisted gate: %v", statErr)
+	}
+	byName := map[string]Check{}
+	for _, check := range checks {
+		byName[check.Name] = check
+	}
+	if byName["state_mount"].OK || !strings.Contains(byName["state_mount"].Detail, "persisted state mount gate") {
+		t.Fatalf("persisted state mount check = %#v", byName["state_mount"])
+	}
+}
+
+func TestAcquireRequiredStateMountRejectsSpecialModeBits(t *testing.T) {
+	stateHome := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(stateHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stateHome, 0o700|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvStateMountSource, "/dev/mapper/wechatcopilot-state")
+	t.Setenv(EnvStateMountFSType, "ext4")
+	t.Setenv(EnvStateMountUUID, "00112233-4455-6677-8899-aabbccddeeff")
+	guard, err := AcquireRequiredStateMount(stateHome)
+	if guard != nil || err == nil || !strings.Contains(err.Error(), "no special bits") {
+		t.Fatalf("special-mode mount guard = %#v err=%v", guard, err)
+	}
+}
+
+func TestDoctorDoesNotCreateFallbackStateWhenRequiredMountIsMissing(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "state-must-be-mounted")
+	runtimeDir := filepath.Join(home, "misconfigured-runtime")
+	t.Setenv(EnvStateMountSource, "/dev/mapper/wechatcopilot-state")
+	t.Setenv(EnvStateMountFSType, "ext4")
+	t.Setenv(EnvStateMountUUID, "00112233-4455-6677-8899-aabbccddeeff")
+
+	checks := Doctor(Paths{
+		Home: home, Accounts: filepath.Join(home, "accounts"), Downloads: filepath.Join(home, "downloads"),
+		Runtime: runtimeDir, Socket: filepath.Join(runtimeDir, "daemon.sock"), Registry: filepath.Join(home, "accounts.json"),
+	}, false)
+	if _, err := os.Stat(home); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("doctor created an unmounted fallback state path: %v", err)
+	}
+	byName := map[string]Check{}
+	for _, check := range checks {
+		byName[check.Name] = check
+	}
+	if byName["state_mount"].OK || !strings.Contains(byName["state_mount"].Detail, "without creating it") {
+		t.Fatalf("state mount check = %#v", byName["state_mount"])
+	}
+	if byName["state_permissions"].OK {
+		t.Fatalf("state permissions check = %#v", byName["state_permissions"])
+	}
+	if byName["runtime_permissions"].OK {
+		t.Fatalf("runtime permissions check = %#v", byName["runtime_permissions"])
+	}
+}
+
 func TestSecureDirRejectsSymlinksAndRepairsMode(t *testing.T) {
 	root := t.TempDir()
 	directory := filepath.Join(root, "state")
@@ -224,6 +450,7 @@ func TestPinnedImagePatternRequiresLowercaseDigest(t *testing.T) {
 
 func TestDoctorWithoutRuntimeChecksStillChecksSocket(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	home := filepath.Join(root, "state")
 	runtimeDir := filepath.Join(root, "runtime")
 	paths := Paths{
@@ -232,9 +459,13 @@ func TestDoctorWithoutRuntimeChecksStillChecksSocket(t *testing.T) {
 	}
 	checks := Doctor(paths, false)
 	foundSocket := false
+	foundSwap := false
 	for _, check := range checks {
 		if check.Name == "daemon_socket" {
 			foundSocket = true
+		}
+		if check.Name == "swap_confidentiality" {
+			foundSwap = true
 		}
 		if check.Name == "wechat_appimage" || check.Name == "wecom_apk" {
 			t.Fatalf("runtime artifact check %q ran with runtimeChecks=false", check.Name)
@@ -243,10 +474,14 @@ func TestDoctorWithoutRuntimeChecksStillChecksSocket(t *testing.T) {
 	if !foundSocket {
 		t.Fatal("daemon socket was not checked")
 	}
+	if !foundSwap {
+		t.Fatal("swap confidentiality was skipped with runtimeChecks=false")
+	}
 }
 
 func TestDoctorChecksLocalRuntimeArtifactsWithoutADB(t *testing.T) {
 	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	home := filepath.Join(root, "state")
 	runtimeDir := filepath.Join(root, "runtime")
 	paths := Paths{

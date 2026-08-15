@@ -11,11 +11,12 @@ import (
 	"time"
 
 	"github.com/gih10012/wechatcopilot/internal/api"
+	"github.com/gih10012/wechatcopilot/internal/config"
 	"github.com/gih10012/wechatcopilot/internal/daemon"
 )
 
 func TestSystemdUnitCreatesWritablePrivateRuntimeDirectory(t *testing.T) {
-	unit := systemdUnit("/opt/wechatcopilot", "/srv/private/wechatcopilot", "/home/operator/.config/wechatcopilot/environment")
+	unit := systemdUnit("/opt/wechatcopilot", "/srv/private/wechatcopilot", "/home/operator/.config/wechatcopilot/environment", "")
 	for _, expected := range []string{
 		"RuntimeDirectory=wechatcopilot",
 		"RuntimeDirectoryMode=0700",
@@ -25,6 +26,20 @@ func TestSystemdUnitCreatesWritablePrivateRuntimeDirectory(t *testing.T) {
 		if !strings.Contains(unit, expected) {
 			t.Fatalf("systemd unit is missing %q:\n%s", expected, unit)
 		}
+	}
+}
+
+func TestSystemdUnitLoadsRequiredStateMountEnvironmentLast(t *testing.T) {
+	general := "/home/operator/.config/wechatcopilot/environment"
+	required := "/home/operator/.config/wechatcopilot/state-mount.environment"
+	unit := systemdUnit("/opt/wechatcopilot", "/srv/wechatcopilot-state", general, required)
+	generalLine := "EnvironmentFile=-" + `"` + general + `"`
+	requiredLine := "EnvironmentFile=" + `"` + required + `"`
+	generalIndex := strings.Index(unit, generalLine)
+	requiredIndex := strings.Index(unit, requiredLine)
+	execIndex := strings.Index(unit, "ExecStart=")
+	if generalIndex < 0 || requiredIndex <= generalIndex || execIndex <= requiredIndex {
+		t.Fatalf("state mount environment is not required and loaded last:\n%s", unit)
 	}
 }
 
@@ -76,18 +91,20 @@ func TestDaemonInstallInitializesCustomStateHome(t *testing.T) {
 		t.Fatal(err)
 	}
 	systemctl := filepath.Join(binDir, "systemctl")
-	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+	systemctlLog := filepath.Join(root, "systemctl.log")
+	if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$SYSTEMCTL_LOG\"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir)
+	t.Setenv("SYSTEMCTL_LOG", systemctlLog)
 	t.Setenv("XDG_CONFIG_HOME", configHome)
 	t.Setenv("XDG_RUNTIME_DIR", runtimeHome)
 	t.Setenv("WECHATCOPILOT_HOME", "")
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	rootCommand := NewRoot("test", bytes.NewReader(nil), &stdout, &stderr)
-	rootCommand.SetArgs([]string{"--home", stateHome, "--json", "daemon", "install", "--no-start"})
+	rootCommand := newRoot("test", bytes.NewReader(nil), &stdout, &stderr, func() error { return nil })
+	rootCommand.SetArgs([]string{"--home", stateHome, "--json", "daemon", "install"})
 	if err := rootCommand.ExecuteContext(context.Background()); err != nil {
 		t.Fatalf("daemon install: %v stderr=%s stdout=%s", err, stderr.String(), stdout.String())
 	}
@@ -110,6 +127,193 @@ func TestDaemonInstallInitializesCustomStateHome(t *testing.T) {
 	if !strings.Contains(string(contents), "ReadWritePaths=%t/wechatcopilot") {
 		t.Fatalf("installed unit does not allow the runtime socket directory:\n%s", contents)
 	}
+	systemctlCalls, err := os.ReadFile(systemctlLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"--user daemon-reload",
+		"--user enable wechatcopilot.service",
+		"--user restart wechatcopilot.service",
+	} {
+		if !strings.Contains(string(systemctlCalls), expected) {
+			t.Fatalf("daemon install did not run %q:\n%s", expected, systemctlCalls)
+		}
+	}
+}
+
+func TestDaemonServeDoesNotCreateFallbackForMissingRequiredMount(t *testing.T) {
+	root := t.TempDir()
+	stateHome := filepath.Join(root, "state-must-be-mounted")
+	runtimeHome := filepath.Join(root, "runtime")
+	t.Setenv("XDG_RUNTIME_DIR", runtimeHome)
+	t.Setenv("WECHATCOPILOT_HOME", "")
+	t.Setenv(config.EnvStateMountSource, "/dev/mapper/wechatcopilot-state")
+	t.Setenv(config.EnvStateMountFSType, "ext4")
+	t.Setenv(config.EnvStateMountUUID, "00112233-4455-6677-8899-aabbccddeeff")
+
+	command := NewRoot("test", bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{})
+	command.SetArgs([]string{"--home", stateHome, "--json", "daemon", "serve"})
+	err := command.ExecuteContext(context.Background())
+	var appErr *api.AppError
+	if !errors.As(err, &appErr) || appErr.Code != api.CodeDaemonUnavailable {
+		t.Fatalf("daemon serve error = %v, want %s", err, api.CodeDaemonUnavailable)
+	}
+	if _, statErr := os.Stat(stateHome); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("daemon created an unmounted fallback state path: %v", statErr)
+	}
+}
+
+func TestDaemonServeRejectsUnsafeSwapBeforeCreatingState(t *testing.T) {
+	root := t.TempDir()
+	stateHome := filepath.Join(root, "state-must-not-exist")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(root, "runtime"))
+	t.Setenv("WECHATCOPILOT_HOME", "")
+	t.Setenv(config.EnvStateMountSource, "")
+	t.Setenv(config.EnvStateMountFSType, "")
+	t.Setenv(config.EnvStateMountUUID, "")
+
+	command := newRoot("test", bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}, func() error {
+		return errors.New("unsafe swap fixture")
+	})
+	command.SetArgs([]string{"--home", stateHome, "--json", "daemon", "serve"})
+	err := command.ExecuteContext(context.Background())
+	var appErr *api.AppError
+	if !errors.As(err, &appErr) || appErr.Code != api.CodeDaemonUnavailable {
+		t.Fatalf("daemon serve unsafe swap error = %v, want %s", err, api.CodeDaemonUnavailable)
+	}
+	if _, statErr := os.Stat(stateHome); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("daemon created state before rejecting unsafe swap: %v", statErr)
+	}
+}
+
+func TestDaemonInstallRejectsUnsafeSwapBeforeCreatingState(t *testing.T) {
+	root := t.TempDir()
+	stateHome := filepath.Join(root, "state-must-not-exist")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(root, "runtime"))
+	t.Setenv("WECHATCOPILOT_HOME", "")
+	t.Setenv(config.EnvStateMountSource, "")
+	t.Setenv(config.EnvStateMountFSType, "")
+	t.Setenv(config.EnvStateMountUUID, "")
+
+	command := newRoot("test", bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}, func() error {
+		return errors.New("unsafe swap fixture")
+	})
+	command.SetArgs([]string{"--home", stateHome, "--json", "daemon", "install"})
+	err := command.ExecuteContext(context.Background())
+	var appErr *api.AppError
+	if !errors.As(err, &appErr) || appErr.Code != api.CodeDaemonUnavailable {
+		t.Fatalf("daemon install unsafe swap error = %v, want %s", err, api.CodeDaemonUnavailable)
+	}
+	if _, statErr := os.Stat(stateHome); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("daemon install created state before rejecting unsafe swap: %v", statErr)
+	}
+}
+
+func TestDaemonInstallNoStartDefersSwapValidationToServe(t *testing.T) {
+	root := t.TempDir()
+	stateHome := filepath.Join(root, "state")
+	binDir := filepath.Join(root, "bin")
+	if err := os.MkdirAll(binDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "systemctl"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(root, "runtime"))
+	t.Setenv("WECHATCOPILOT_HOME", "")
+	t.Setenv(config.EnvStateMountSource, "")
+	t.Setenv(config.EnvStateMountFSType, "")
+	t.Setenv(config.EnvStateMountUUID, "")
+
+	validationCalled := false
+	command := newRoot("test", bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}, func() error {
+		validationCalled = true
+		return errors.New("unsafe swap fixture")
+	})
+	command.SetArgs([]string{"--home", stateHome, "--json", "daemon", "install", "--no-start"})
+	if err := command.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("daemon install --no-start: %v", err)
+	}
+	if validationCalled {
+		t.Fatal("daemon install --no-start unexpectedly validated current swap")
+	}
+	if _, err := os.Stat(stateHome); err != nil {
+		t.Fatalf("daemon install --no-start did not create its inspectable state layout: %v", err)
+	}
+}
+
+func TestDaemonInstallRejectsPartialMountGateBeforeCreatingState(t *testing.T) {
+	root := t.TempDir()
+	stateHome := filepath.Join(root, "state-must-not-exist")
+	t.Setenv("WECHATCOPILOT_HOME", "")
+	t.Setenv(config.EnvStateMountSource, "/dev/mapper/wechatcopilot-state")
+	t.Setenv(config.EnvStateMountFSType, "")
+	t.Setenv(config.EnvStateMountUUID, "")
+
+	command := NewRoot("test", bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{})
+	command.SetArgs([]string{"--home", stateHome, "--json", "daemon", "install", "--no-start"})
+	err := command.ExecuteContext(context.Background())
+	var appErr *api.AppError
+	if !errors.As(err, &appErr) || appErr.Code != api.CodeDaemonUnavailable {
+		t.Fatalf("daemon install partial mount error = %v, want %s", err, api.CodeDaemonUnavailable)
+	}
+	if _, statErr := os.Stat(stateHome); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("daemon install created state for partial mount gate: %v", statErr)
+	}
+}
+
+func TestDaemonInstallRefusesPersistedMountGateDowngradeBeforeCreatingState(t *testing.T) {
+	root := t.TempDir()
+	stateHome := filepath.Join(root, "state-must-not-exist")
+	configHome := filepath.Join(root, "config")
+	stateMountEnvironment := filepath.Join(configHome, "wechatcopilot", "state-mount.environment")
+	if err := os.MkdirAll(filepath.Dir(stateMountEnvironment), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateMountEnvironment, []byte("persisted gate fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(root, "runtime"))
+	t.Setenv("WECHATCOPILOT_HOME", "")
+	t.Setenv(config.EnvStateMountSource, "")
+	t.Setenv(config.EnvStateMountFSType, "")
+	t.Setenv(config.EnvStateMountUUID, "")
+
+	command := NewRoot("test", bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{})
+	command.SetArgs([]string{"--home", stateHome, "--json", "daemon", "install", "--force", "--no-start"})
+	err := command.ExecuteContext(context.Background())
+	var appErr *api.AppError
+	if !errors.As(err, &appErr) || appErr.Code != api.CodeConflict {
+		t.Fatalf("daemon install gate downgrade error = %v, want %s", err, api.CodeConflict)
+	}
+	if _, statErr := os.Stat(stateHome); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("daemon install created state before refusing gate downgrade: %v", statErr)
+	}
+}
+
+func TestPersistedMountGateIsDetectedFromUnitWhenEnvironmentFileIsMissing(t *testing.T) {
+	root := t.TempDir()
+	configHome := filepath.Join(root, "config")
+	unitPath := filepath.Join(configHome, "systemd", "user", "wechatcopilot.service")
+	environmentPath := filepath.Join(configHome, "wechatcopilot", "state-mount.environment")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	unit := systemdUnit("/opt/wechatcopilot", "/srv/wechatcopilot-state", "/tmp/general", environmentPath)
+	if err := os.WriteFile(unitPath, []byte(unit), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	persisted, err := config.HasPersistedStateMountGate()
+	if err != nil || !persisted {
+		t.Fatalf("persisted gate detection = %v, err=%v", persisted, err)
+	}
 }
 
 func TestDaemonServeLocksStateAcrossDifferentSockets(t *testing.T) {
@@ -119,6 +323,7 @@ func TestDaemonServeLocksStateAcrossDifferentSockets(t *testing.T) {
 	socketOne := filepath.Join(runtimeHome, "wechatcopilot", "one.sock")
 	socketTwo := filepath.Join(runtimeHome, "wechatcopilot", "two.sock")
 	t.Setenv("XDG_RUNTIME_DIR", runtimeHome)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("WECHATCOPILOT_HOME", "")
 	t.Setenv("WECHATCOPILOT_FAKE_DRIVERS", "true")
 
@@ -126,13 +331,13 @@ func TestDaemonServeLocksStateAcrossDifferentSockets(t *testing.T) {
 	defer cancelFirst()
 	var firstStdout bytes.Buffer
 	var firstStderr bytes.Buffer
-	first := NewRoot("test", bytes.NewReader(nil), &firstStdout, &firstStderr)
+	first := newRoot("test", bytes.NewReader(nil), &firstStdout, &firstStderr, func() error { return nil })
 	first.SetArgs([]string{"--home", stateHome, "--socket", socketOne, "daemon", "serve"})
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- first.ExecuteContext(firstCtx) }()
 	waitForPath(t, socketOne)
 
-	second := NewRoot("test", bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{})
+	second := newRoot("test", bytes.NewReader(nil), &bytes.Buffer{}, &bytes.Buffer{}, func() error { return nil })
 	second.SetArgs([]string{"--home", stateHome, "--socket", socketTwo, "daemon", "serve"})
 	err := second.ExecuteContext(context.Background())
 	var appErr *api.AppError

@@ -18,17 +18,25 @@ import (
 )
 
 type application struct {
-	version    string
-	home       string
-	socket     string
-	jsonOutput bool
-	stdin      io.Reader
-	stdout     io.Writer
-	stderr     io.Writer
+	version                     string
+	home                        string
+	socket                      string
+	jsonOutput                  bool
+	stdin                       io.Reader
+	stdout                      io.Writer
+	stderr                      io.Writer
+	validateSwapConfidentiality func() error
 }
 
 func NewRoot(version string, stdin io.Reader, stdout, stderr io.Writer) *cobra.Command {
-	a := &application{version: version, stdin: stdin, stdout: stdout, stderr: stderr}
+	return newRoot(version, stdin, stdout, stderr, config.ValidateSwapConfidentiality)
+}
+
+func newRoot(version string, stdin io.Reader, stdout, stderr io.Writer, validateSwapConfidentiality func() error) *cobra.Command {
+	a := &application{
+		version: version, stdin: stdin, stdout: stdout, stderr: stderr,
+		validateSwapConfidentiality: validateSwapConfidentiality,
+	}
 	root := &cobra.Command{
 		Use:           "wechatcopilot",
 		Short:         "Personal WeChat and WeCom control plane for local agents",

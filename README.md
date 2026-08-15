@@ -61,6 +61,14 @@ and [agent guide](docs/agent-guide.md) for the detailed boundaries.
 
 - A headless Linux host with a Linux filesystem supporting Unix permissions,
   advisory locks, and SQLite WAL, with at least 30 GiB free for real profiles.
+  When capacity exists only on local NTFS3, use NTFS3 only as the outer storage
+  for the provisioning workflow's fully allocated 64 GiB LUKS2 image; the live
+  state root is the inner ext4 mount, never NTFS3 itself.
+- No raw or unencrypted disk-backed swap before a real-account login. Use no
+  swap, zram with disk writeback disabled, or a separately reviewed encrypted-
+  swap design. The encrypted state workflow remains manual-passphrase only and
+  does not configure TPM automatic unlock; the daemon refuses to start while
+  unsafe swap is active.
 - Docker Engine accessible by the daemon user. Docker access is effectively
   root-equivalent and belongs in the trusted computing base.
 - An official WeChat AppImage and independently verified SHA-256.

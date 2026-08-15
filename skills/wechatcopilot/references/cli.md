@@ -29,7 +29,7 @@ Omit `--lan` for loopback-only login. With `--lan`, omit `--lan-address` to pref
 
 `accounts remove` always and permanently deletes the deactivated account's profile, runtime state, and message index. It requires both `--confirm` and `--purge`; there is no unregister-without-purge mode in v0.1. If the command returns a retryable `CONFLICT` with `deleting:true`, repeat that exact removal after checking the account ID. Do not activate or use the account while deletion is pending.
 
-`capabilities` returns every stable capability key with one of `stable`, `beta`, `experimental`, or `unsupported`: `auth.qr`, `auth.sms`, `messages.visible`, `messages.history`, `messages.watch`, `messages.send`, `attachments.send`, `official_accounts.read`, `web.open`, `miniprogram.open`, and `surface.act`. Treat a missing or unknown key as a client/daemon contract mismatch.
+For an active runtime, `capabilities` returns every stable capability key with one of `stable`, `beta`, `experimental`, or `unsupported`: `auth.qr`, `auth.sms`, `messages.visible`, `messages.history`, `messages.watch`, `messages.send`, `attachments.send`, `official_accounts.read`, `web.open`, `miniprogram.open`, and `surface.act`. Treat a missing or unknown key from an active runtime as a client/daemon contract mismatch. An inactive account can return an empty map because it has no current driver; a stale-index read does not depend on or claim live capabilities.
 
 ## Conversations and messages
 
@@ -44,6 +44,8 @@ wechatcopilot messages watch --account ACCOUNT_ID --cursor CURSOR --follow --jso
 Use opaque IDs returned by the service. A title is display data, not an addressing key.
 
 By default, `messages history` returns the first matching messages after `--cursor` in ascending local sequence order. With `--latest`, it instead selects the newest `--limit` matching messages and then returns that window in ascending sequence order. The CLI rejects `--latest` together with a nonzero `--cursor`; drop `--latest` when paging forward from a saved cursor.
+
+Capability keys describe the available data guarantee, not one subcommand per key. `messages.visible` has no separate CLI command: when `messages.history` is `unsupported` but `messages.visible` is available, use `messages history` to refresh and return the bounded current UI view. Newly observed personal WeChat UI messages report `source:"ui"` and `complete:false`; do not present them as historical completeness. Refuse the read only when both capabilities are `unsupported`.
 
 ## Transactional send
 

@@ -58,6 +58,9 @@ The daemon reads driver configuration from its environment. `wechatcopilot daemo
 | `WECHATCOPILOT_WECHAT_IMAGE` | Local project runtime image tag. |
 | `WECHATCOPILOT_WECHAT_APPIMAGE` | Absolute verified official AppImage path. |
 | `WECHATCOPILOT_WECHAT_APPIMAGE_SHA256` | Independently obtained 64-character AppImage digest. |
+| `WECHATCOPILOT_STATE_MOUNT_SOURCE` | Optional exact block-device path required for the state root, such as `/dev/mapper/wechatcopilot-state`. |
+| `WECHATCOPILOT_STATE_MOUNT_FSTYPE` | Required filesystem type when a state mount source is configured. |
+| `WECHATCOPILOT_STATE_MOUNT_UUID` | Canonical filesystem UUID required when a state mount source is configured. |
 | `WECHATCOPILOT_LAN_ADDRESS` | Optional RFC1918 address used only when login is explicitly started with `--lan`. It must be assigned to an eligible local interface. |
 | `WECHATCOPILOT_WECOM_REDROID_IMAGE` | Redroid image reference pinned with `@sha256:`. |
 | `WECHATCOPILOT_WECOM_APK_URL` | Approved official Tencent HTTPS APK URL. |
@@ -75,6 +78,86 @@ export WECHATCOPILOT_HOME=/srv/private/wechatcopilot-state
 
 The chosen filesystem must support Unix ownership/modes, advisory locking, and SQLite WAL. Do not place live state on FAT, SMB, object-backed FUSE, or a synchronization folder. Back up the directory only while the corresponding account is stopped or with a filesystem snapshot.
 
+### File-backed encrypted state volume
+
+When only an NTFS3 data disk has enough capacity, use it only as the outer filesystem that stores the encrypted image. The default workflow fully allocates a 64 GiB file, formats that file as LUKS2, and formats the decrypted mapper as ext4. `WECHATCOPILOT_HOME` points to the inner ext4 mount, never to NTFS3. This is less robust than a dedicated native Linux partition: damage, truncation, Windows hibernation, or exhaustion of the outer filesystem can damage the entire inner volume. Disable Windows Fast Startup, keep an offline backup, and never copy the backing file while the inner filesystem is mounted.
+
+The included provisioning script refuses sparse allocation, existing images, symlink targets, finite `/share` automount idle timeouts, unexpected key files, wrong backing-filesystem UUIDs, and colliding mappings. It never accepts a passphrase option; `cryptsetup` reads the passphrase directly from the operator's terminal.
+
+First remove a finite `x-systemd.idle-timeout` from the `/share` entry in `/etc/fstab`, or set it to `0`/`0s`, then reload the system manager. The script checks both `/etc/fstab` and the effective automount unit and rejects a stale finite timeout:
+
+```bash
+sudo systemctl daemon-reload
+```
+
+Use the UUID of the filesystem mounted at `/share` as `OUTER_FILESYSTEM_UUID`. This is the outer backing-filesystem UUID, not the LUKS UUID and not the inner ext4 UUID. Pass it to every state-changing command (`create`, `configure`, `unlock`, and `lock`). The default image is 64 GiB; if `create` uses a non-default `--size-gib`, pass that same value to later `configure`, `unlock`, and `lock` operations so they can detect truncation. Every operation also rejects a sparse or deallocated backing file. Inspect the plan first:
+
+```bash
+./scripts/provision_state_volume.sh preflight \
+  --backing-fs-uuid OUTER_FILESYSTEM_UUID
+```
+
+Create the fully allocated 64 GiB LUKS2 image and inner ext4 filesystem only from a trusted interactive terminal:
+
+```bash
+sudo ./scripts/provision_state_volume.sh create \
+  --backing-fs-uuid OUTER_FILESYSTEM_UUID \
+  --owner "$USER" \
+  --confirm-create
+```
+
+`create` first asks `cryptsetup` to set and confirm a recovery passphrase, opens the new LUKS2 image, formats and verifies ext4, writes the volume marker, and installs marker-delimited `noauto` entries in `/etc/crypttab` and `/etc/fstab`. It then deliberately unmounts and closes the manually opened mapper. Systemd reopens and mounts it to verify the persistent path, so expect another passphrase request before `create` succeeds. The workflow does not install a key file, enroll a TPM, or enable automatic unlock.
+
+On success the inner ext4 filesystem is mounted at `/srv/wechatcopilot-state`; the directory below an unmounted volume remains `root:root 0700`. Copy the four non-secret assignments printed by the script into the current shell. The first selects the state home; the other three are an all-or-nothing mount gate and use the inner ext4 device and filesystem UUID:
+
+```bash
+export WECHATCOPILOT_HOME=/srv/wechatcopilot-state
+export WECHATCOPILOT_STATE_MOUNT_SOURCE=/dev/mapper/wechatcopilot-state
+export WECHATCOPILOT_STATE_MOUNT_FSTYPE=ext4
+export WECHATCOPILOT_STATE_MOUNT_UUID=INNER_EXT4_FILESYSTEM_UUID
+```
+
+Use the exact printed inner UUID, not the outer `/share` UUID. With all three gate variables exported, `doctor`, `daemon serve`, and `daemon install` validate the exact filesystem-root mount, kernel mount ID, `rw,nosuid,nodev` options, filesystem type, device major/minor, and UUID before creating state directories. A locked, bind-mounted, or wrong volume therefore cannot produce an unencrypted fallback profile.
+
+`daemon install` reads the three already-exported gate variables and writes their normalized values to `${XDG_CONFIG_HOME:-$HOME/.config}/wechatcopilot/state-mount.environment` with mode `0600`. The generated user unit treats that file as required and loads it after the optional general `environment` file, so general driver settings cannot override the gate. The file and its generated unit reference remain downgrade markers: `doctor`, foreground `daemon serve`, and later installs refuse to proceed when a new shell omits the three constraints. Always export `WECHATCOPILOT_HOME` and all three gate variables before the initial install or any `daemon install --force`, and export them in every shell that runs `doctor` or `daemon serve`.
+
+`create` already installs and verifies the system files. Use `configure` only to reinstall or revalidate those entries for an existing, exact mounted volume; it is also mutating and requires the outer UUID:
+
+```bash
+sudo ./scripts/provision_state_volume.sh configure \
+  --backing-fs-uuid OUTER_FILESYSTEM_UUID \
+  --owner "$USER"
+```
+
+After a reboot, unlock from a trusted terminal before starting the user daemon:
+
+```bash
+sudo ./scripts/provision_state_volume.sh unlock \
+  --backing-fs-uuid OUTER_FILESYSTEM_UUID \
+  --owner "$USER"
+```
+
+Before locking, stop the daemon and every WeChat/WeCom container. The script verifies that the user service is not active and that no container with either project driver label is running; `--confirm-daemon-stopped` is an acknowledgement, not a bypass:
+
+```bash
+wechatcopilot daemon stop
+docker ps --filter label=io.wechatcopilot.driver
+docker ps --filter label=dev.wechatcopilot.driver
+```
+
+Only after both are stopped, run:
+
+```bash
+sudo ./scripts/provision_state_volume.sh lock \
+  --backing-fs-uuid OUTER_FILESYSTEM_UUID \
+  --owner "$USER" \
+  --confirm-daemon-stopped
+```
+
+The supported workflow intentionally requires a manually entered passphrase for every unlock. The script does not configure TPM enrollment or any automatic unlock, and refuses the conventional auto-discovered key-file locations for this mapper. Keep a recovery passphrase and an offline LUKS header backup; never store a key beside the backing file or in the daemon environment.
+
+Raw or unencrypted disk-backed swap can retain decrypted messages, screenshots, and keys even when the state filesystem uses LUKS. The script reports non-zram swap but does not disable it, while `doctor` reports a blocking `swap_confidentiality` check for unprotected targets. The daemon also refuses to start or restore saved accounts while that check fails; `daemon install --no-start` remains available for inspecting an installed unit. Before the first real-account login, use `swapon --show` and allow only no swap, a real zram block device whose sysfs `backing_dev` is absent or `none`, or a dm-crypt swap device that was separately reviewed. Zram configured with disk writeback is rejected because it can persist decrypted pages. Hibernation needs a separate encrypted, recoverable swap design.
+
 ## Start the daemon
 
 For foreground development:
@@ -89,7 +172,7 @@ For unattended use, install the project-supplied systemd user unit:
 wechatcopilot daemon install
 ```
 
-The command refuses to replace an existing unit unless `--force` is explicit and starts it through `systemctl --user`. Use `--no-start` to inspect the generated unit before enabling it. An administrator may run `loginctl enable-linger USERNAME` for host-boot startup; `wechatcopilot` never elevates privileges. The daemon socket remains accessible only to the operator UID.
+The command refuses to replace an existing unit unless `--force` is explicit. A normal install enables and restarts the service so the newly written unit and mount gate apply even when an older daemon is already active. Use `--no-start` to enable without starting or restarting it while you inspect the generated unit. When the encrypted mount gate is enabled, run this command only after unlocking the volume and exporting `WECHATCOPILOT_HOME` plus all three gate variables; the required `state-mount.environment` file is then generated as described above. An administrator may run `loginctl enable-linger USERNAME` for host-boot startup, but the encrypted state volume still requires its separate manual unlock; `wechatcopilot` never elevates privileges or configures TPM unlock. The daemon socket remains accessible only to the operator UID.
 
 ## Add and log in to an account
 

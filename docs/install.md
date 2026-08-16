@@ -107,7 +107,7 @@ sudo ./scripts/provision_state_volume.sh create \
   --confirm-create
 ```
 
-`create` first asks `cryptsetup` to set and confirm a recovery passphrase, opens the new LUKS2 image, formats and verifies ext4, writes the volume marker, and installs marker-delimited `noauto` entries in `/etc/crypttab` and `/etc/fstab`. It then deliberately unmounts and closes the manually opened mapper. Systemd reopens and mounts it to verify the persistent path, so expect another passphrase request before `create` succeeds. The workflow does not install a key file, enroll a TPM, or enable automatic unlock.
+`create` first asks `cryptsetup` to set and confirm a recovery passphrase, then asks for that same passphrase once more to open the new LUKS2 image. Password input is not echoed. It formats and verifies ext4, writes the volume marker, and installs marker-delimited `noauto` entries in `/etc/crypttab` and `/etc/fstab`. It then deliberately unmounts and closes the manually opened mapper. Systemd reopens and mounts it to verify the persistent path, so expect one final request for the same passphrase before `create` succeeds. The workflow does not install a key file, enroll a TPM, or enable automatic unlock.
 
 On success the inner ext4 filesystem is mounted at `/srv/wechatcopilot-state`; the directory below an unmounted volume remains `root:root 0700`. Copy the four non-secret assignments printed by the script into the current shell. The first selects the state home; the other three are an all-or-nothing mount gate and use the inner ext4 device and filesystem UUID:
 

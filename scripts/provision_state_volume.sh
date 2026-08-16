@@ -882,10 +882,11 @@ create_volume() (
     [[ "$logical_bytes" -eq "$requested_bytes" && "$allocated_bytes" -ge "$logical_bytes" ]] || fail "backing image is sparse or incompletely allocated"
     sync -f "$staging"
 
-    note "cryptsetup will now ask you to type uppercase YES, then request and confirm a new recovery passphrase directly on this terminal."
+    note "cryptsetup will now ask for uppercase YES, the new recovery passphrase twice, and then the same passphrase once more to open the volume. Password input is not echoed."
     cryptsetup luksFormat --type luks2 --verify-passphrase "$staging"
     formatted=true
     opened_by_us=true
+    note "enter the same recovery passphrase once more to open the newly formatted volume."
     cryptsetup open --type luks2 "$staging" "$mapper_name"
     verify_mapping_backing "$staging"
     [[ -z "$(blkid -p -o value -s TYPE "/dev/mapper/$mapper_name" 2>/dev/null || true)" ]] || fail "new mapper unexpectedly contains a filesystem signature"

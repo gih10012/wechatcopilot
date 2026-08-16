@@ -51,7 +51,7 @@ An existing WeChat container is reused only when its immutable image ID, image-d
 
 For WeCom, configure a locally available Redroid image pinned by digest, an official APK URL and independently verified SHA-256, and the project-built companion APK. Control is isolated behind Docker exec and no companion port is published. `doctor` verifies the pinned image locally, both APK structures, the official APK digest, and that the two APK paths resolve to different files. Start with a disposable compatibility profile and stop if the official client rejects the environment or reports account risk.
 
-The daemon reads driver configuration from its environment. `wechatcopilot daemon install` supports a private environment file at `${XDG_CONFIG_HOME:-$HOME/.config}/wechatcopilot/environment`. Keep it mode `0600`; it may contain paths and digests but must never contain login codes or account credentials.
+The daemon reads driver configuration from its environment. `wechatcopilot daemon install` supports a private environment file at `${XDG_CONFIG_HOME:-$HOME/.config}/wechatcopilot/environment`. Keep it mode `0600`; it may contain paths, image references, URLs, and digests but must never contain login codes or account credentials.
 
 | Variable | Meaning |
 | --- | --- |

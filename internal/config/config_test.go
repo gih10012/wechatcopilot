@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -218,6 +219,68 @@ func TestRequiredStateMountConfigurationIsAllOrNothing(t *testing.T) {
 	}
 	if strings.Join(environment, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("state mount environment = %#v, want %#v", environment, want)
+	}
+}
+
+func TestSystemdEnvironmentFilePath(t *testing.T) {
+	path, err := SystemdEnvironmentFilePath("/home/operator/config with space/percent%.environment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != "/home/operator/config with space/percent%%.environment" {
+		t.Fatalf("encoded EnvironmentFile path = %q", path)
+	}
+
+	for _, unsafe := range []string{
+		"relative/environment",
+		"/tmp/not/../clean",
+		"/tmp/trailing ",
+		"/tmp/newline\nEnvironment=INJECTED=true",
+		"/tmp/*.environment",
+		`/tmp/back\slash.environment`,
+		"/tmp/[abc].environment",
+		"/tmp/{one,two}.environment",
+	} {
+		if encoded, err := SystemdEnvironmentFilePath(unsafe); err == nil {
+			t.Errorf("unsafe EnvironmentFile path %q encoded as %q", unsafe, encoded)
+		}
+	}
+}
+
+func TestSystemdEnvironmentFileValue(t *testing.T) {
+	value := `/run/user/1000/runtime with space/quote"/back\slash`
+	encoded, err := SystemdEnvironmentFileValue(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if encoded != strconv.Quote(value) {
+		t.Fatalf("encoded EnvironmentFile value = %q", encoded)
+	}
+	for _, unsafe := range []string{"line one\nline two", "delete\x7f", "zero-width\u200bspace"} {
+		if encoded, err := SystemdEnvironmentFileValue(unsafe); err == nil {
+			t.Errorf("unsafe EnvironmentFile value %q encoded as %q", unsafe, encoded)
+		}
+	}
+}
+
+func TestResolvePathsUsesExactRuntimeOverride(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "state")
+	runtimeDir := filepath.Join(root, "exact-runtime")
+	t.Setenv(EnvHome, home)
+	t.Setenv(EnvRuntime, runtimeDir)
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(root, "ignored-runtime-root"))
+	paths, err := ResolvePaths()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paths.Home != home || paths.Runtime != runtimeDir || paths.Socket != filepath.Join(runtimeDir, "wechatcopilot.sock") {
+		t.Fatalf("resolved paths = %#v", paths)
+	}
+
+	t.Setenv(EnvRuntime, "relative-runtime")
+	if _, err := ResolvePaths(); err == nil || !strings.Contains(err.Error(), "runtime directory must be absolute") {
+		t.Fatalf("relative runtime override error = %v", err)
 	}
 }
 

@@ -206,16 +206,34 @@ func (a *application) daemonInstallCommand() *cobra.Command {
 			stateMountEnvironmentPath := ""
 			if len(stateMountEnvironment) > 0 {
 				stateMountEnvironmentPath = persistedStateMountEnvironmentPath
+			}
+			stateHomeValue, err := config.SystemdEnvironmentFileValue(paths.Home)
+			if err != nil {
+				return invalidArgument(fmt.Sprintf("invalid state home for daemon policy: %v", err))
+			}
+			runtimeValue, err := config.SystemdEnvironmentFileValue(paths.Runtime)
+			if err != nil {
+				return invalidArgument(fmt.Sprintf("invalid runtime directory for daemon policy: %v", err))
+			}
+			swapPolicyContents := []byte(strings.Join([]string{
+				config.EnvStrictSwap + "=" + strconv.FormatBool(strictSwap),
+				config.EnvHome + "=" + stateHomeValue,
+				config.EnvRuntime + "=" + runtimeValue,
+				"TMPDIR=" + runtimeValue,
+			}, "\n") + "\n")
+			unit, err := systemdUnit(binary, paths.Home, environmentPath, persistedSwapPolicyEnvironmentPath, stateMountEnvironmentPath)
+			if err != nil {
+				return invalidArgument(err.Error())
+			}
+			if stateMountEnvironmentPath != "" {
 				contents := []byte(strings.Join(stateMountEnvironment, "\n") + "\n")
 				if err := config.AtomicWrite(stateMountEnvironmentPath, contents, 0o600); err != nil {
 					return internalError("cannot write required state mount environment", err)
 				}
 			}
-			swapPolicyContents := []byte(config.EnvStrictSwap + "=" + strconv.FormatBool(strictSwap) + "\n")
 			if err := config.AtomicWrite(persistedSwapPolicyEnvironmentPath, swapPolicyContents, 0o600); err != nil {
 				return internalError("cannot write required swap policy environment", err)
 			}
-			unit := systemdUnit(binary, paths.Home, environmentPath, persistedSwapPolicyEnvironmentPath, stateMountEnvironmentPath)
 			if err := config.AtomicWrite(unitPath, []byte(unit), 0o600); err != nil {
 				return internalError("cannot write systemd user unit", err)
 			}
@@ -282,12 +300,24 @@ func runSystemctl(ctx context.Context, args ...string) (string, error) {
 	return text, nil
 }
 
-func systemdUnit(binary, stateHome, environmentPath, swapPolicyEnvironmentPath, stateMountEnvironmentPath string) string {
+func systemdUnit(binary, stateHome, environmentPath, swapPolicyEnvironmentPath, stateMountEnvironmentPath string) (string, error) {
 	binary = strings.ReplaceAll(binary, "%", "%%")
 	stateHome = strings.ReplaceAll(stateHome, "%", "%%")
-	environmentPath = strings.ReplaceAll(environmentPath, "%", "%%")
-	swapPolicyEnvironmentPath = strings.ReplaceAll(swapPolicyEnvironmentPath, "%", "%%")
-	stateMountEnvironmentPath = strings.ReplaceAll(stateMountEnvironmentPath, "%", "%%")
+	var err error
+	environmentPath, err = config.SystemdEnvironmentFilePath(environmentPath)
+	if err != nil {
+		return "", fmt.Errorf("invalid optional daemon environment path: %w", err)
+	}
+	swapPolicyEnvironmentPath, err = config.SystemdEnvironmentFilePath(swapPolicyEnvironmentPath)
+	if err != nil {
+		return "", fmt.Errorf("invalid swap policy environment path: %w", err)
+	}
+	if stateMountEnvironmentPath != "" {
+		stateMountEnvironmentPath, err = config.SystemdEnvironmentFilePath(stateMountEnvironmentPath)
+		if err != nil {
+			return "", fmt.Errorf("invalid state mount environment path: %w", err)
+		}
+	}
 	lines := []string{
 		"[Unit]",
 		"Description=WeChat Copilot local daemon",
@@ -296,12 +326,12 @@ func systemdUnit(binary, stateHome, environmentPath, swapPolicyEnvironmentPath, 
 		"[Service]",
 		"Type=simple",
 		"Environment=" + strconv.Quote("WECHATCOPILOT_HOME="+stateHome),
-		"EnvironmentFile=-" + strconv.Quote(environmentPath),
-		"EnvironmentFile=" + strconv.Quote(swapPolicyEnvironmentPath),
+		"EnvironmentFile=-" + environmentPath,
 	}
 	if stateMountEnvironmentPath != "" {
-		lines = append(lines, "EnvironmentFile="+strconv.Quote(stateMountEnvironmentPath))
+		lines = append(lines, "EnvironmentFile="+stateMountEnvironmentPath)
 	}
+	lines = append(lines, "EnvironmentFile="+swapPolicyEnvironmentPath)
 	lines = append(lines,
 		"ExecStart="+strconv.Quote(binary)+" daemon serve",
 		"Restart=on-failure",
@@ -309,18 +339,13 @@ func systemdUnit(binary, stateHome, environmentPath, swapPolicyEnvironmentPath, 
 		"TimeoutStopSec=40",
 		"UMask=0077",
 		"NoNewPrivileges=yes",
-		"PrivateTmp=yes",
-		"ProtectSystem=strict",
-		"ProtectHome=read-only",
 		"RuntimeDirectory=wechatcopilot",
 		"RuntimeDirectoryMode=0700",
-		"ReadWritePaths="+strconv.Quote(stateHome),
-		"ReadWritePaths=%t/wechatcopilot",
 		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
 		"",
 		"[Install]",
 		"WantedBy=default.target",
 		"",
 	)
-	return strings.Join(lines, "\n")
+	return strings.Join(lines, "\n"), nil
 }

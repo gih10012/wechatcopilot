@@ -26,8 +26,8 @@ RUN mkdir -p /opt/wechat /opt/wechatcopilot /home/wechat /wechatcopilot/runtime 
     && chmod 0755 /opt/wechat /opt/wechatcopilot \
     && chmod 0700 /home/wechat /wechatcopilot/runtime
 
-RUN groupadd --gid 1000 wechat \
-    && useradd --uid 1000 --gid 1000 --home-dir /home/wechat --shell /usr/sbin/nologin wechat \
+RUN if ! getent group 1000 >/dev/null; then groupadd --gid 1000 wechat; fi \
+    && if ! getent passwd 1000 >/dev/null; then useradd --uid 1000 --gid 1000 --home-dir /home/wechat --shell /usr/sbin/nologin wechat; fi \
     && chown -R 1000:1000 /home/wechat /wechatcopilot/runtime
 
 COPY deploy/wechat/entrypoint.sh /opt/wechatcopilot/entrypoint

@@ -22,6 +22,7 @@ import (
 
 const (
 	EnvHome                      = "WECHATCOPILOT_HOME"
+	EnvRuntime                   = "WECHATCOPILOT_RUNTIME_DIR"
 	EnvStateMountSource          = "WECHATCOPILOT_STATE_MOUNT_SOURCE"
 	EnvStateMountFSType          = "WECHATCOPILOT_STATE_MOUNT_FSTYPE"
 	EnvStateMountUUID            = "WECHATCOPILOT_STATE_MOUNT_UUID"
@@ -71,15 +72,22 @@ func ResolvePaths() (Paths, error) {
 		}
 		home = filepath.Join(state, "wechatcopilot")
 	}
-	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
+	runtimeDir := os.Getenv(EnvRuntime)
 	if runtimeDir == "" {
-		runtimeDir = filepath.Join(os.TempDir(), fmt.Sprintf("wechatcopilot-%d", os.Getuid()))
-	} else {
-		runtimeDir = filepath.Join(runtimeDir, "wechatcopilot")
+		runtimeDir = os.Getenv("XDG_RUNTIME_DIR")
+		if runtimeDir == "" {
+			runtimeDir = filepath.Join(os.TempDir(), fmt.Sprintf("wechatcopilot-%d", os.Getuid()))
+		} else {
+			runtimeDir = filepath.Join(runtimeDir, "wechatcopilot")
+		}
 	}
 	if !filepath.IsAbs(home) {
 		return Paths{}, fmt.Errorf("%s must be an absolute path", EnvHome)
 	}
+	if !filepath.IsAbs(runtimeDir) {
+		return Paths{}, errors.New("resolved runtime directory must be absolute")
+	}
+	runtimeDir = filepath.Clean(runtimeDir)
 	return Paths{
 		Home:      filepath.Clean(home),
 		Accounts:  filepath.Join(home, "accounts"),

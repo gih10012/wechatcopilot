@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -144,14 +145,57 @@ func HasPersistedStateMountGate() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	escapedPath := strings.ReplaceAll(environmentPath, "%", "%%")
-	requiredLine := "EnvironmentFile=" + strconv.Quote(escapedPath)
+	escapedPath, err := SystemdEnvironmentFilePath(environmentPath)
+	if err != nil {
+		return false, fmt.Errorf("encode persisted state mount environment path: %w", err)
+	}
+	requiredLine := "EnvironmentFile=" + escapedPath
+	legacyRequiredLine := "EnvironmentFile=" + strconv.Quote(escapedPath)
 	for _, line := range strings.Split(string(contents), "\n") {
-		if strings.TrimSpace(line) == requiredLine {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == requiredLine || trimmed == legacyRequiredLine {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// SystemdEnvironmentFilePath validates a literal EnvironmentFile path and
+// escapes systemd specifiers. Glob and control characters are rejected so a
+// configured path cannot expand to additional files or inject unit settings.
+func SystemdEnvironmentFilePath(path string) (string, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return "", fmt.Errorf("environment file path %q must be clean and absolute", path)
+	}
+	if !utf8.ValidString(path) {
+		return "", errors.New("environment file path must be valid UTF-8")
+	}
+	if strings.TrimRight(path, " ") != path {
+		return "", errors.New("environment file path must not end in whitespace")
+	}
+	for _, character := range path {
+		if character < 0x20 || character == 0x7f {
+			return "", errors.New("environment file path must not contain control characters")
+		}
+	}
+	if strings.ContainsAny(path, `\*?[]{}`) {
+		return "", errors.New("environment file path must not contain glob or escape characters")
+	}
+	return strings.ReplaceAll(path, "%", "%%"), nil
+}
+
+// SystemdEnvironmentFileValue quotes a value using the double-quoted syntax
+// accepted by systemd EnvironmentFile entries.
+func SystemdEnvironmentFileValue(value string) (string, error) {
+	if !utf8.ValidString(value) {
+		return "", errors.New("environment file value must be valid UTF-8")
+	}
+	for _, character := range value {
+		if !strconv.IsPrint(character) {
+			return "", errors.New("environment file value must not contain control or non-printable characters")
+		}
+	}
+	return strconv.Quote(value), nil
 }
 
 func persistedStateMountGateError() error {

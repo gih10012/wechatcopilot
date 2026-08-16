@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,8 +17,26 @@ import (
 	"github.com/gih10012/wechatcopilot/internal/daemon"
 )
 
-func TestSystemdUnitCreatesWritablePrivateRuntimeDirectory(t *testing.T) {
-	unit := systemdUnit(
+func mustSystemdUnit(t *testing.T, binary, stateHome, environmentPath, swapPolicyEnvironmentPath, stateMountEnvironmentPath string) string {
+	t.Helper()
+	unit, err := systemdUnit(binary, stateHome, environmentPath, swapPolicyEnvironmentPath, stateMountEnvironmentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return unit
+}
+
+func expectedDaemonPolicy(strictSwap bool, stateHome, runtimeDir string) string {
+	return strings.Join([]string{
+		config.EnvStrictSwap + "=" + strconv.FormatBool(strictSwap),
+		config.EnvHome + "=" + strconv.Quote(stateHome),
+		config.EnvRuntime + "=" + strconv.Quote(runtimeDir),
+		"TMPDIR=" + strconv.Quote(runtimeDir),
+	}, "\n") + "\n"
+}
+
+func TestSystemdUnitUsesPrivateRuntimeWithoutMountNamespace(t *testing.T) {
+	unit := mustSystemdUnit(t,
 		"/opt/wechatcopilot",
 		"/srv/private/wechatcopilot",
 		"/home/operator/.config/wechatcopilot/environment",
@@ -25,41 +44,108 @@ func TestSystemdUnitCreatesWritablePrivateRuntimeDirectory(t *testing.T) {
 		"",
 	)
 	for _, expected := range []string{
+		"NoNewPrivileges=yes",
 		"RuntimeDirectory=wechatcopilot",
 		"RuntimeDirectoryMode=0700",
-		"ReadWritePaths=\"/srv/private/wechatcopilot\"",
-		"ReadWritePaths=%t/wechatcopilot",
+		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
 	} {
 		if !strings.Contains(unit, expected) {
 			t.Fatalf("systemd unit is missing %q:\n%s", expected, unit)
 		}
 	}
-}
-
-func TestSystemdUnitLoadsRequiredStateMountEnvironmentLast(t *testing.T) {
-	general := "/home/operator/.config/wechatcopilot/environment"
-	policy := "/home/operator/.config/wechatcopilot/swap-policy.environment"
-	required := "/home/operator/.config/wechatcopilot/state-mount.environment"
-	unit := systemdUnit("/opt/wechatcopilot", "/srv/wechatcopilot-state", general, policy, required)
-	generalLine := "EnvironmentFile=-" + `"` + general + `"`
-	requiredLine := "EnvironmentFile=" + `"` + required + `"`
-	generalIndex := strings.Index(unit, generalLine)
-	requiredIndex := strings.Index(unit, requiredLine)
-	execIndex := strings.Index(unit, "ExecStart=")
-	if generalIndex < 0 || requiredIndex <= generalIndex || execIndex <= requiredIndex {
-		t.Fatalf("state mount environment is not required and loaded last:\n%s", unit)
+	for _, forbidden := range []string{"PrivateTmp=", "ProtectSystem=", "ProtectHome=", "ReadWritePaths="} {
+		if strings.Contains(unit, forbidden) {
+			t.Fatalf("systemd user unit must not trigger a single-UID mount namespace with %q:\n%s", forbidden, unit)
+		}
 	}
 }
 
-func TestSystemdUnitPinsStrictSwapPolicyAfterGeneralEnvironment(t *testing.T) {
+func TestSystemdUnitLoadsRequiredPoliciesAfterGeneralEnvironment(t *testing.T) {
 	general := "/home/operator/.config/wechatcopilot/environment"
 	policy := "/home/operator/.config/wechatcopilot/swap-policy.environment"
-	unit := systemdUnit("/opt/wechatcopilot", "/srv/wechatcopilot-state", general, policy, "")
-	generalIndex := strings.Index(unit, "EnvironmentFile=-"+strconv.Quote(general))
-	policyLine := "EnvironmentFile=" + strconv.Quote(policy)
+	required := "/home/operator/.config/wechatcopilot/state-mount.environment"
+	unit := mustSystemdUnit(t, "/opt/wechatcopilot", "/srv/wechatcopilot-state", general, policy, required)
+	generalLine := "EnvironmentFile=-" + general
+	requiredLine := "EnvironmentFile=" + required
+	policyLine := "EnvironmentFile=" + policy
+	generalIndex := strings.Index(unit, generalLine)
+	requiredIndex := strings.Index(unit, requiredLine)
+	policyIndex := strings.Index(unit, policyLine)
+	execIndex := strings.Index(unit, "ExecStart=")
+	if generalIndex < 0 || requiredIndex <= generalIndex || policyIndex <= requiredIndex || execIndex <= policyIndex {
+		t.Fatalf("required daemon policies are not loaded after the general environment file:\n%s", unit)
+	}
+}
+
+func TestSystemdUnitPinsDaemonPolicyAfterGeneralEnvironment(t *testing.T) {
+	general := "/home/operator/.config/wechatcopilot/environment"
+	policy := "/home/operator/.config/wechatcopilot/swap-policy.environment"
+	unit := mustSystemdUnit(t, "/opt/wechatcopilot", "/srv/wechatcopilot-state", general, policy, "")
+	generalIndex := strings.Index(unit, "EnvironmentFile=-"+general)
+	policyLine := "EnvironmentFile=" + policy
 	policyIndex := strings.Index(unit, policyLine)
 	if generalIndex < 0 || policyIndex <= generalIndex {
-		t.Fatalf("strict swap policy is not pinned after the general environment file:\n%s", unit)
+		t.Fatalf("daemon policy is not pinned after the general environment file:\n%s", unit)
+	}
+}
+
+func TestSystemdUnitPassesSystemdAnalyze(t *testing.T) {
+	systemdAnalyze, err := exec.LookPath("systemd-analyze")
+	if err != nil {
+		t.Skip("systemd-analyze is unavailable")
+	}
+	root := filepath.Join(t.TempDir(), "fixture with space")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runtimeDir, err := os.MkdirTemp("/tmp", "wcp-systemd-runtime-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(runtimeDir); err != nil {
+			t.Errorf("remove temporary runtime directory: %v", err)
+		}
+	})
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	stateHome := filepath.Join(root, "state")
+	if err := os.Mkdir(stateHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	general := filepath.Join(root, "general.environment")
+	policy := filepath.Join(root, "swap-policy.environment")
+	required := filepath.Join(root, "state-mount.environment")
+	for path, contents := range map[string]string{
+		policy:   expectedDaemonPolicy(false, stateHome, filepath.Join(runtimeDir, "wechatcopilot")),
+		required: config.EnvStateMountFSType + "=ext4\n",
+	} {
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	unitPath := filepath.Join(root, "wechatcopilot.service")
+	unit := mustSystemdUnit(t, "/bin/true", stateHome, general, policy, required)
+	if err := os.WriteFile(unitPath, []byte(unit), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(systemdAnalyze, "--user", "verify", unitPath)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("systemd-analyze verify: %v\n%s\nunit:\n%s", err, output, unit)
+	} else if strings.Contains(string(output), filepath.Base(unitPath)+":") {
+		t.Fatalf("systemd-analyze emitted diagnostics for the generated unit:\n%s\nunit:\n%s", output, unit)
+	}
+}
+
+func TestSystemdUnitRejectsUnsafeEnvironmentFilePath(t *testing.T) {
+	_, err := systemdUnit(
+		"/bin/true",
+		"/srv/wechatcopilot-state",
+		"/tmp/wechatcopilot/*.environment",
+		"/tmp/wechatcopilot/swap-policy.environment",
+		"",
+	)
+	if err == nil || !strings.Contains(err.Error(), "glob or escape") {
+		t.Fatalf("unsafe EnvironmentFile path error = %v", err)
 	}
 }
 
@@ -145,19 +231,21 @@ func TestDaemonInstallInitializesCustomStateHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(contents), "ReadWritePaths=%t/wechatcopilot") {
-		t.Fatalf("installed unit does not allow the runtime socket directory:\n%s", contents)
+	if !strings.Contains(string(contents), "RuntimeDirectory=wechatcopilot") {
+		t.Fatalf("installed unit does not create the private runtime directory:\n%s", contents)
 	}
 	swapPolicyPath := filepath.Join(configHome, "wechatcopilot", "swap-policy.environment")
 	swapPolicy, err := os.ReadFile(swapPolicyPath)
-	if err != nil || string(swapPolicy) != config.EnvStrictSwap+"=false\n" {
+	runtimeDir := filepath.Join(runtimeHome, "wechatcopilot")
+	expectedPolicy := expectedDaemonPolicy(false, stateHome, runtimeDir)
+	if err != nil || string(swapPolicy) != expectedPolicy {
 		t.Fatalf("installed swap policy = %q, err=%v", swapPolicy, err)
 	}
 	swapPolicyInfo, err := os.Stat(swapPolicyPath)
 	if err != nil || swapPolicyInfo.Mode().Perm() != 0o600 {
 		t.Fatalf("installed swap policy mode = %v, err=%v", swapPolicyInfo, err)
 	}
-	if !strings.Contains(string(contents), "EnvironmentFile="+strconv.Quote(swapPolicyPath)) {
+	if !strings.Contains(string(contents), "EnvironmentFile="+swapPolicyPath) {
 		t.Fatalf("installed unit does not require its pinned swap policy:\n%s", contents)
 	}
 	systemctlCalls, err := os.ReadFile(systemctlLog)
@@ -283,7 +371,8 @@ func TestDaemonInstallNoStartDefersSwapValidationToServe(t *testing.T) {
 	}
 	policyPath := filepath.Join(root, "config", "wechatcopilot", "swap-policy.environment")
 	policy, err := os.ReadFile(policyPath)
-	if err != nil || string(policy) != config.EnvStrictSwap+"=true\n" {
+	runtimeDir := filepath.Join(root, "runtime", "wechatcopilot")
+	if err != nil || string(policy) != expectedDaemonPolicy(true, stateHome, runtimeDir) {
 		t.Fatalf("daemon install --no-start policy = %q, err=%v", policy, err)
 	}
 }
@@ -291,6 +380,8 @@ func TestDaemonInstallNoStartDefersSwapValidationToServe(t *testing.T) {
 func TestDaemonInstallRejectsPartialMountGateBeforeCreatingState(t *testing.T) {
 	root := t.TempDir()
 	stateHome := filepath.Join(root, "state-must-not-exist")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(root, "runtime"))
 	t.Setenv("WECHATCOPILOT_HOME", "")
 	t.Setenv(config.EnvStateMountSource, "/dev/mapper/wechatcopilot-state")
 	t.Setenv(config.EnvStateMountFSType, "")
@@ -348,7 +439,7 @@ func TestPersistedMountGateIsDetectedFromUnitWhenEnvironmentFileIsMissing(t *tes
 	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	unit := systemdUnit(
+	unit := mustSystemdUnit(t,
 		"/opt/wechatcopilot",
 		"/srv/wechatcopilot-state",
 		"/tmp/general",
@@ -362,6 +453,26 @@ func TestPersistedMountGateIsDetectedFromUnitWhenEnvironmentFileIsMissing(t *tes
 	persisted, err := config.HasPersistedStateMountGate()
 	if err != nil || !persisted {
 		t.Fatalf("persisted gate detection = %v, err=%v", persisted, err)
+	}
+}
+
+func TestPersistedMountGateDetectsLegacyQuotedEnvironmentFile(t *testing.T) {
+	root := t.TempDir()
+	configHome := filepath.Join(root, "config")
+	unitPath := filepath.Join(configHome, "systemd", "user", "wechatcopilot.service")
+	environmentPath := filepath.Join(configHome, "wechatcopilot", "state-mount.environment")
+	if err := os.MkdirAll(filepath.Dir(unitPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	escapedPath := strings.ReplaceAll(environmentPath, "%", "%%")
+	unit := "[Service]\nEnvironmentFile=" + strconv.Quote(escapedPath) + "\n"
+	if err := os.WriteFile(unitPath, []byte(unit), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CONFIG_HOME", configHome)
+	persisted, err := config.HasPersistedStateMountGate()
+	if err != nil || !persisted {
+		t.Fatalf("legacy persisted gate detection = %v, err=%v", persisted, err)
 	}
 }
 

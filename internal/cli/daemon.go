@@ -73,7 +73,7 @@ func (a *application) daemonServeCommand() *cobra.Command {
 			}
 			defer mountGuard.Close()
 			if err := a.validateSwapConfidentiality(); err != nil {
-				return api.WrapError(http.StatusServiceUnavailable, api.CodeDaemonUnavailable, "unprotected swap prevents daemon startup", err)
+				return api.WrapError(http.StatusServiceUnavailable, api.CodeDaemonUnavailable, "strict swap policy prevents daemon startup", err)
 			}
 			if err := paths.Ensure(); err != nil {
 				return internalError("cannot initialize private state directories", err)
@@ -152,12 +152,17 @@ func (a *application) daemonInstallCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			strictSwap, err := config.StrictSwapPolicy()
+			if err != nil {
+				return invalidArgument(err.Error())
+			}
 			configDir, err := os.UserConfigDir()
 			if err != nil {
 				return internalError("cannot locate user configuration directory", err)
 			}
 			unitPath := filepath.Join(configDir, "systemd", "user", "wechatcopilot.service")
 			environmentPath := filepath.Join(configDir, "wechatcopilot", "environment")
+			persistedSwapPolicyEnvironmentPath := filepath.Join(configDir, "wechatcopilot", "swap-policy.environment")
 			persistedStateMountEnvironmentPath := filepath.Join(configDir, "wechatcopilot", "state-mount.environment")
 			if _, err := os.Lstat(unitPath); err == nil && !force {
 				return api.NewError(http.StatusConflict, api.CodeConflict, "systemd unit already exists; pass --force to replace it")
@@ -184,7 +189,7 @@ func (a *application) daemonInstallCommand() *cobra.Command {
 			defer mountGuard.Close()
 			if !noStart {
 				if err := a.validateSwapConfidentiality(); err != nil {
-					return api.WrapError(http.StatusServiceUnavailable, api.CodeDaemonUnavailable, "unprotected swap prevents daemon startup", err)
+					return api.WrapError(http.StatusServiceUnavailable, api.CodeDaemonUnavailable, "strict swap policy prevents daemon startup", err)
 				}
 			}
 			if err := paths.Ensure(); err != nil {
@@ -206,7 +211,11 @@ func (a *application) daemonInstallCommand() *cobra.Command {
 					return internalError("cannot write required state mount environment", err)
 				}
 			}
-			unit := systemdUnit(binary, paths.Home, environmentPath, stateMountEnvironmentPath)
+			swapPolicyContents := []byte(config.EnvStrictSwap + "=" + strconv.FormatBool(strictSwap) + "\n")
+			if err := config.AtomicWrite(persistedSwapPolicyEnvironmentPath, swapPolicyContents, 0o600); err != nil {
+				return internalError("cannot write required swap policy environment", err)
+			}
+			unit := systemdUnit(binary, paths.Home, environmentPath, persistedSwapPolicyEnvironmentPath, stateMountEnvironmentPath)
 			if err := config.AtomicWrite(unitPath, []byte(unit), 0o600); err != nil {
 				return internalError("cannot write systemd user unit", err)
 			}
@@ -232,7 +241,9 @@ func (a *application) daemonInstallCommand() *cobra.Command {
 			}
 			return a.write(map[string]any{
 				"unit": unitPath, "environment_file": environmentPath,
+				"swap_policy_environment_file": persistedSwapPolicyEnvironmentPath,
 				"state_mount_environment_file": stateMountEnvironmentPath,
+				"strict_swap":                  strictSwap,
 				"started":                      !noStart, "systemctl": strings.Join(systemctlOutput, "\n"),
 			})
 		},
@@ -271,10 +282,11 @@ func runSystemctl(ctx context.Context, args ...string) (string, error) {
 	return text, nil
 }
 
-func systemdUnit(binary, stateHome, environmentPath, stateMountEnvironmentPath string) string {
+func systemdUnit(binary, stateHome, environmentPath, swapPolicyEnvironmentPath, stateMountEnvironmentPath string) string {
 	binary = strings.ReplaceAll(binary, "%", "%%")
 	stateHome = strings.ReplaceAll(stateHome, "%", "%%")
 	environmentPath = strings.ReplaceAll(environmentPath, "%", "%%")
+	swapPolicyEnvironmentPath = strings.ReplaceAll(swapPolicyEnvironmentPath, "%", "%%")
 	stateMountEnvironmentPath = strings.ReplaceAll(stateMountEnvironmentPath, "%", "%%")
 	lines := []string{
 		"[Unit]",
@@ -285,6 +297,7 @@ func systemdUnit(binary, stateHome, environmentPath, stateMountEnvironmentPath s
 		"Type=simple",
 		"Environment=" + strconv.Quote("WECHATCOPILOT_HOME="+stateHome),
 		"EnvironmentFile=-" + strconv.Quote(environmentPath),
+		"EnvironmentFile=" + strconv.Quote(swapPolicyEnvironmentPath),
 	}
 	if stateMountEnvironmentPath != "" {
 		lines = append(lines, "EnvironmentFile="+strconv.Quote(stateMountEnvironmentPath))

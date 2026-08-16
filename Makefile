@@ -36,6 +36,7 @@ scripts-check:
 	$(PYTHON) -m unittest -v deploy/wechat/test_ui_driver.py
 	@set -e; for script in deploy/wechat/*.sh; do sh -n "$$script"; done
 	bash -n scripts/provision_state_volume.sh
+	bash scripts/test_provision_state_volume.sh
 
 skill-check:
 	$(PYTHON) scripts/validate_skill.py skills/wechatcopilot

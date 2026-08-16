@@ -64,11 +64,11 @@ and [agent guide](docs/agent-guide.md) for the detailed boundaries.
   When capacity exists only on local NTFS3, use NTFS3 only as the outer storage
   for the provisioning workflow's fully allocated 64 GiB LUKS2 image; the live
   state root is the inner ext4 mount, never NTFS3 itself.
-- No raw or unencrypted disk-backed swap before a real-account login. Use no
-  swap, zram with disk writeback disabled, or a separately reviewed encrypted-
-  swap design. The encrypted state workflow remains manual-passphrase only and
-  does not configure TPM automatic unlock; the daemon refuses to start while
-  unsafe swap is active.
+- Raw or unencrypted disk-backed swap is supported but can retain decrypted
+  account data. `doctor` reports it as a warning by default; deployments that
+  prefer blocking over normal swap behavior can set
+  `WECHATCOPILOT_STRICT_SWAP=true`. The encrypted state workflow remains
+  manual-passphrase only and does not configure TPM automatic unlock.
 - Docker Engine accessible by the daemon user. Docker access is effectively
   root-equivalent and belongs in the trusted computing base.
 - An official WeChat AppImage and independently verified SHA-256.

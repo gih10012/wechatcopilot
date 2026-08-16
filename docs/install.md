@@ -61,6 +61,7 @@ The daemon reads driver configuration from its environment. `wechatcopilot daemo
 | `WECHATCOPILOT_STATE_MOUNT_SOURCE` | Optional exact block-device path required for the state root, such as `/dev/mapper/wechatcopilot-state`. |
 | `WECHATCOPILOT_STATE_MOUNT_FSTYPE` | Required filesystem type when a state mount source is configured. |
 | `WECHATCOPILOT_STATE_MOUNT_UUID` | Canonical filesystem UUID required when a state mount source is configured. |
+| `WECHATCOPILOT_STRICT_SWAP` | Optional boolean. When `true`, block daemon startup if swap is not zram-without-writeback or dm-crypt; default `false` reports a warning without changing host swap behavior. `daemon install` pins the normalized value in a required service environment file. |
 | `WECHATCOPILOT_LAN_ADDRESS` | Optional RFC1918 address used only when login is explicitly started with `--lan`. It must be assigned to an eligible local interface. |
 | `WECHATCOPILOT_WECOM_REDROID_IMAGE` | Redroid image reference pinned with `@sha256:`. |
 | `WECHATCOPILOT_WECOM_APK_URL` | Approved official Tencent HTTPS APK URL. |
@@ -121,7 +122,7 @@ Use the exact printed inner UUID, not the outer `/share` UUID. With all three ga
 
 `daemon install` reads the three already-exported gate variables and writes their normalized values to `${XDG_CONFIG_HOME:-$HOME/.config}/wechatcopilot/state-mount.environment` with mode `0600`. The generated user unit treats that file as required and loads it after the optional general `environment` file, so general driver settings cannot override the gate. The file and its generated unit reference remain downgrade markers: `doctor`, foreground `daemon serve`, and later installs refuse to proceed when a new shell omits the three constraints. Always export `WECHATCOPILOT_HOME` and all three gate variables before the initial install or any `daemon install --force`, and export them in every shell that runs `doctor` or `daemon serve`.
 
-`create` already installs and verifies the system files. Use `configure` only to reinstall or revalidate those entries for an existing, exact mounted volume; it is also mutating and requires the outer UUID:
+`create` already installs and verifies the system files. Use `configure` to reinstall or revalidate those entries for an existing volume. It also provides the safe resume path if `create` reports that the completed encrypted image was retained after the staging file had already become the final `state.luks`: do not rerun `create` and do not delete that final image. Run `configure` with the same outer UUID, owner, paths, mapper name, and non-default size (if any). For a locked image it requests the existing passphrase, mounts it, and validates the LUKS mapping, ext4 filesystem, and volume marker before reporting success:
 
 ```bash
 sudo ./scripts/provision_state_volume.sh configure \
@@ -156,7 +157,7 @@ sudo ./scripts/provision_state_volume.sh lock \
 
 The supported workflow intentionally requires a manually entered passphrase for every unlock. The script does not configure TPM enrollment or any automatic unlock, and refuses the conventional auto-discovered key-file locations for this mapper. Keep a recovery passphrase and an offline LUKS header backup; never store a key beside the backing file or in the daemon environment.
 
-Raw or unencrypted disk-backed swap can retain decrypted messages, screenshots, and keys even when the state filesystem uses LUKS. The script reports non-zram swap but does not disable it, while `doctor` reports a blocking `swap_confidentiality` check for unprotected targets. The daemon also refuses to start or restore saved accounts while that check fails; `daemon install --no-start` remains available for inspecting an installed unit. Before the first real-account login, use `swapon --show` and allow only no swap, a real zram block device whose sysfs `backing_dev` is absent or `none`, or a dm-crypt swap device that was separately reviewed. Zram configured with disk writeback is rejected because it can persist decrypted pages. Hibernation needs a separate encrypted, recoverable swap design.
+Raw or unencrypted disk-backed swap can retain decrypted messages, screenshots, and keys even when the state filesystem uses LUKS. It can also be important for memory-pressure behavior and hibernation, so WeChat Copilot never disables or reconfigures host swap. The provisioning script reports non-zram swap, and `doctor` returns a non-blocking `swap_confidentiality` warning by default. Set `WECHATCOPILOT_STRICT_SWAP=true` only when the operator explicitly wants `doctor`, daemon startup, and account restoration to fail unless every active target is a real zram block device whose sysfs `backing_dev` is absent or `none`, or a separately reviewed dm-crypt swap device. `doctor` reads the current shell value; `daemon install` writes the normalized value to the required mode-`0600` `swap-policy.environment` file, loaded after the optional general environment file, so rerun installation with `--force` to change the daemon policy. Zram configured with disk writeback does not satisfy strict mode. Hibernation requires its own recoverable encrypted-swap design.
 
 ## Start the daemon
 

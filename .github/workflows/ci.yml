@@ -37,6 +37,7 @@ jobs:
           python3 -m unittest -v deploy/wechat/test_ui_driver.py
           for script in deploy/wechat/*.sh; do sh -n "$script"; done
           bash -n scripts/provision_state_volume.sh
+          bash scripts/test_provision_state_volume.sh
       - name: Build CLI
         run: go build -trimpath -o bin/wechatcopilot ./cmd/wechatcopilot
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

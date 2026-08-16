@@ -2,6 +2,7 @@ package config
 
 import (
 	"archive/zip"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -58,6 +59,79 @@ func TestSwapConfidentialityAcceptsOnlyProtectedSwap(t *testing.T) {
 	)
 	if spoofedZRAM.OK {
 		t.Fatalf("zram-like path bypassed the block-device check: %#v", spoofedZRAM)
+	}
+}
+
+func TestSwapConfidentialityPolicyDefaultsToWarning(t *testing.T) {
+	unsafe := Check{
+		Name: "swap_confidentiality", OK: false,
+		Detail: "one unprotected swap target", Fix: "replace it",
+	}
+	warning := applySwapPolicy(unsafe, false)
+	if !warning.OK || !warning.Warning || !strings.Contains(warning.Detail, "warning:") {
+		t.Fatalf("default swap policy = %#v, want a non-blocking warning", warning)
+	}
+	strict := applySwapPolicy(unsafe, true)
+	if strict.OK || strict.Warning {
+		t.Fatalf("strict swap policy = %#v, want a blocking failure", strict)
+	}
+	safe := applySwapPolicy(Check{Name: "swap_confidentiality", OK: true}, false)
+	if !safe.OK || safe.Warning {
+		t.Fatalf("safe swap policy = %#v, want a clean pass", safe)
+	}
+}
+
+func TestSwapConfidentialityEnforcementMatrix(t *testing.T) {
+	unsafe := Check{Name: "swap_confidentiality", OK: false, Detail: "unsafe swap fixture"}
+	if err := enforceSwapPolicy(unsafe, false); err != nil {
+		t.Fatalf("default policy blocked unsafe swap: %v", err)
+	}
+	if err := enforceSwapPolicy(unsafe, true); err == nil || err.Error() != unsafe.Detail {
+		t.Fatalf("strict policy error = %v, want %q", err, unsafe.Detail)
+	}
+	if err := enforceSwapPolicy(Check{Name: "swap_confidentiality", OK: true}, true); err != nil {
+		t.Fatalf("strict policy blocked protected swap: %v", err)
+	}
+}
+
+func TestSwapWarningJSONIsNonBlockingAndExplicit(t *testing.T) {
+	warning := applySwapPolicy(Check{
+		Name: "swap_confidentiality", OK: false, Detail: "unsafe swap fixture",
+	}, false)
+	payload, err := json.Marshal(struct {
+		OK     bool    `json:"ok"`
+		Checks []Check `json:"checks"`
+	}{OK: warning.OK, Checks: []Check{warning}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(payload)
+	if !strings.Contains(text, `"ok":true`) || !strings.Contains(text, `"warning":true`) {
+		t.Fatalf("warning JSON = %s, want non-blocking ok and explicit warning", text)
+	}
+}
+
+func TestStrictSwapPolicyEnvironment(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  bool
+	}{
+		{value: "", want: false},
+		{value: "false", want: false},
+		{value: "true", want: true},
+		{value: "1", want: true},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			t.Setenv(EnvStrictSwap, test.value)
+			got, err := StrictSwapPolicy()
+			if err != nil || got != test.want {
+				t.Fatalf("strictSwapPolicy() = %v, %v, want %v, nil", got, err, test.want)
+			}
+		})
+	}
+	t.Setenv(EnvStrictSwap, "sometimes")
+	if _, err := StrictSwapPolicy(); err == nil {
+		t.Fatal("invalid strict swap policy was accepted")
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -24,6 +25,7 @@ const (
 	EnvStateMountSource          = "WECHATCOPILOT_STATE_MOUNT_SOURCE"
 	EnvStateMountFSType          = "WECHATCOPILOT_STATE_MOUNT_FSTYPE"
 	EnvStateMountUUID            = "WECHATCOPILOT_STATE_MOUNT_UUID"
+	EnvStrictSwap                = "WECHATCOPILOT_STRICT_SWAP"
 	EnvDocker                    = "WECHATCOPILOT_DOCKER"
 	EnvLANAddress                = "WECHATCOPILOT_LAN_ADDRESS"
 	EnvWeChatImage               = "WECHATCOPILOT_WECHAT_IMAGE"
@@ -216,10 +218,11 @@ func trustedPathComponent(stat *unix.Stat_t) bool {
 }
 
 type Check struct {
-	Name   string `json:"name"`
-	OK     bool   `json:"ok"`
-	Detail string `json:"detail"`
-	Fix    string `json:"fix,omitempty"`
+	Name    string `json:"name"`
+	OK      bool   `json:"ok"`
+	Warning bool   `json:"warning,omitempty"`
+	Detail  string `json:"detail"`
+	Fix     string `json:"fix,omitempty"`
 }
 
 func Doctor(paths Paths, runtimeChecks bool) []Check {
@@ -283,24 +286,72 @@ func Doctor(paths Paths, runtimeChecks bool) []Check {
 }
 
 func swapConfidentialityCheck() Check {
-	contents, err := os.ReadFile("/proc/swaps")
+	strict, err := StrictSwapPolicy()
 	if err != nil {
 		return Check{
 			Name: "swap_confidentiality", OK: false, Detail: err.Error(),
-			Fix: "Verify swap manually; use no swap or zram before real-account login.",
+			Fix: fmt.Sprintf("Unset %s or set it to true or false.", EnvStrictSwap),
 		}
 	}
-	return swapConfidentialityCheckFrom(contents, isZRAMBlockDevice, isDMEncryptedBlockDevice)
+	contents, err := os.ReadFile("/proc/swaps")
+	if err != nil {
+		return applySwapPolicy(Check{
+			Name: "swap_confidentiality", OK: false, Detail: err.Error(),
+			Fix: "Verify active swap manually before handling sensitive account data.",
+		}, strict)
+	}
+	return applySwapPolicy(swapConfidentialityCheckFrom(contents, isZRAMBlockDevice, isDMEncryptedBlockDevice), strict)
 }
 
-// ValidateSwapConfidentiality prevents a daemon from restoring real-account
-// state while decrypted pages can be written to unprotected disk swap.
+// ValidateSwapConfidentiality enforces the optional strict swap policy before
+// a daemon restores real-account state.
 func ValidateSwapConfidentiality() error {
-	check := swapConfidentialityCheck()
-	if !check.OK {
-		return errors.New(check.Detail)
+	strict, err := StrictSwapPolicy()
+	if err != nil {
+		return err
 	}
-	return nil
+	if !strict {
+		return nil
+	}
+	contents, err := os.ReadFile("/proc/swaps")
+	if err != nil {
+		return err
+	}
+	return enforceSwapPolicy(
+		swapConfidentialityCheckFrom(contents, isZRAMBlockDevice, isDMEncryptedBlockDevice),
+		strict,
+	)
+}
+
+// StrictSwapPolicy returns the operator-selected swap enforcement policy.
+func StrictSwapPolicy() (bool, error) {
+	value := strings.TrimSpace(os.Getenv(EnvStrictSwap))
+	if value == "" {
+		return false, nil
+	}
+	strict, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be true or false", EnvStrictSwap)
+	}
+	return strict, nil
+}
+
+func applySwapPolicy(check Check, strict bool) Check {
+	if check.OK || strict {
+		return check
+	}
+	check.OK = true
+	check.Warning = true
+	check.Detail = "warning: " + check.Detail
+	check.Fix = fmt.Sprintf("Optional: use encrypted swap, zram without disk writeback, or set %s=true to enforce strict blocking.", EnvStrictSwap)
+	return check
+}
+
+func enforceSwapPolicy(check Check, strict bool) error {
+	if !strict || check.OK {
+		return nil
+	}
+	return errors.New(check.Detail)
 }
 
 func swapConfidentialityCheckFrom(contents []byte, zramBlockDevice, encryptedBlockDevice func(string) bool) Check {

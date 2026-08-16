@@ -74,7 +74,7 @@ outer NTFS3 filesystem (pinned outer UUID)
             `- ext4 mount (pinned inner UUID) -> state root
 ```
 
-The outer UUID is required by every mutating provisioning operation; the daemon gate uses the distinct inner ext4 UUID. Generated systemd units are `noauto` and use a manually entered passphrase. The workflow does not configure a key file or TPM automatic unlock. Locking requires the daemon and all project containers to be stopped first, and real-account use requires no raw or unencrypted disk-backed swap.
+The outer UUID is required by every mutating provisioning operation; the daemon gate uses the distinct inner ext4 UUID. Generated systemd units are `noauto` and use a manually entered passphrase. The workflow does not configure a key file or TPM automatic unlock. Locking requires the daemon and all project containers to be stopped first. Raw or unencrypted disk-backed swap produces a confidentiality warning; operators may opt into a startup-blocking strict policy.
 
 ## Driver contract
 

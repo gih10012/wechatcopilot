@@ -218,7 +218,7 @@ print_swap_warning() {
     local unsafe
     unsafe=$(awk 'NR > 1 && $1 !~ /^\/dev\/zram/ { print $1 }' /proc/swaps | paste -sd, -)
     if [[ -n "$unsafe" ]]; then
-        note "warning: disk-backed swap is active ($unsafe); disable it or replace it with encrypted/zram swap before real-account login"
+        note "warning: disk-backed swap is active ($unsafe) and may retain decrypted account data; WeChat Copilot will not change host swap"
     fi
 }
 
@@ -583,6 +583,8 @@ install_system_config() {
             if [[ "$fstab_replaced" == true ]]; then
                 if config_file_matches_snapshot /etc/fstab "$fstab_candidate_snapshot"; then
                     restore_config_file /etc/fstab "$fstab_backup" 0644 || rollback_incomplete=true
+                elif config_file_matches_snapshot /etc/fstab "$fstab_original_snapshot"; then
+                    :
                 else
                     printf 'warning: /etc/fstab changed after installation began; refusing to overwrite the concurrent edit during rollback\n' >&2
                     rollback_incomplete=true
@@ -591,6 +593,8 @@ install_system_config() {
             if [[ "$crypt_replaced" == true ]]; then
                 if config_file_matches_snapshot /etc/crypttab "$crypt_candidate_snapshot"; then
                     restore_config_file /etc/crypttab "$crypt_backup" 0600 || rollback_incomplete=true
+                elif config_file_matches_snapshot /etc/crypttab "$crypt_original_snapshot"; then
+                    :
                 else
                     printf 'warning: /etc/crypttab changed after installation began; refusing to overwrite the concurrent edit during rollback\n' >&2
                     rollback_incomplete=true
@@ -614,6 +618,7 @@ install_system_config() {
         rollback_system_config
         fail "system configuration changed before installation; no configuration was replaced"
     fi
+    crypt_replaced=true
     if [[ "$crypt_original_snapshot" == absent ]]; then
         if ! mv -Tn -- "$crypt_candidate" /etc/crypttab; then
             rollback_system_config
@@ -627,11 +632,11 @@ install_system_config() {
         rollback_system_config
         fail "cannot atomically install crypttab"
     fi
-    crypt_replaced=true
     if ! config_file_matches_snapshot /etc/crypttab "$crypt_candidate_snapshot" || ! config_file_matches_snapshot /etc/fstab "$fstab_original_snapshot"; then
         rollback_system_config
         fail "system configuration changed while installing crypttab"
     fi
+    fstab_replaced=true
     if [[ "$fstab_original_snapshot" == absent ]]; then
         if ! mv -Tn -- "$fstab_candidate" /etc/fstab; then
             rollback_system_config
@@ -645,7 +650,6 @@ install_system_config() {
         rollback_system_config
         fail "cannot atomically install fstab"
     fi
-    fstab_replaced=true
     if ! config_file_matches_snapshot /etc/crypttab "$crypt_candidate_snapshot" || ! config_file_matches_snapshot /etc/fstab "$fstab_candidate_snapshot"; then
         rollback_system_config
         fail "system configuration changed before it could be verified"
@@ -667,7 +671,7 @@ install_system_config() {
     note "configuration backups: $crypt_backup $fstab_backup"
 }
 
-start_volume_units() {
+start_volume_units() (
     local crypt_unit mount_unit attempt load_state
     local mapper_was_active=false cleanup_needed=false
     crypt_unit=$(systemd-escape --template=systemd-cryptsetup@.service "$mapper_name")
@@ -691,6 +695,7 @@ start_volume_units() {
 
     cleanup_started_volume() {
         if [[ "$cleanup_needed" == true ]]; then
+            trap - EXIT HUP INT TERM
             set +e
             if ! mountpoint -q "$mount_point" || { mount_source_matches && (verify_mapping_identity "$backing_file") >/dev/null 2>&1; }; then
                 systemctl stop "$mount_unit" >/dev/null 2>&1
@@ -744,7 +749,7 @@ start_volume_units() {
     cleanup_needed=false
     trap - EXIT HUP INT TERM
     note "state volume is unlocked and mounted at $mount_point"
-}
+)
 
 configure_volume() {
 	local fs_uuid
@@ -755,10 +760,19 @@ configure_volume() {
 	require_backing_uuid
 	run_preflight
 	verify_backing_file
-	verify_mounted_volume
-	fs_uuid=$(blkid -s UUID -o value "/dev/mapper/$mapper_name")
+	if mapper_active; then
+		verify_mapping_backing "$backing_file"
+	else
+		require_tty
+		verify_backing_loop_set "$backing_file"
+	fi
+	if mountpoint -q "$mount_point"; then
+		verify_mounted_volume
+	fi
 	install_system_config
 	start_volume_units
+	verify_mounted_volume
+	fs_uuid=$(blkid -s UUID -o value "/dev/mapper/$mapper_name")
 	note "system configuration is installed"
 	note "WECHATCOPILOT_HOME=$mount_point"
 	note "WECHATCOPILOT_STATE_MOUNT_SOURCE=/dev/mapper/$mapper_name"
@@ -766,9 +780,9 @@ configure_volume() {
 	note "WECHATCOPILOT_STATE_MOUNT_UUID=$fs_uuid"
 }
 
-create_volume() {
-    local backing_dir staging requested_bytes available_bytes allocated_bytes logical_bytes
-    local owner_group fs_uuid luks_uuid opened_backing
+create_volume() (
+    local backing_dir orphan_staging staging="" requested_bytes available_bytes allocated_bytes logical_bytes
+    local owner_group fs_uuid luks_uuid opened_backing=""
     local formatted=false mounted=false opened_by_us=false cleanup_needed=false
     validate_arguments
 	require_root
@@ -778,7 +792,7 @@ create_volume() {
     [[ "$confirm_create" == true ]] || fail "create requires --confirm-create"
     require_backing_uuid
     run_preflight
-    [[ ! -e "$backing_file" ]] || fail "backing file already exists; it will never be overwritten"
+    [[ ! -e "$backing_file" ]] || fail "backing file already exists and will never be overwritten; if it came from an interrupted create, resume with configure using the same options"
     [[ ! -e "/dev/mapper/$mapper_name" && ! -L "/dev/mapper/$mapper_name" ]] || fail "mapper already exists: $mapper_name"
     [[ ! -e "$mount_point" ]] || {
         [[ -d "$mount_point" && ! -L "$mount_point" ]] || fail "mount point exists and is not a directory"
@@ -787,13 +801,14 @@ create_volume() {
     }
 
     backing_dir=$(dirname "$backing_file")
+    if [[ -d "$backing_dir" ]]; then
+        orphan_staging=$(find "$backing_dir" -mindepth 1 -maxdepth 1 -type f -name '.state.luks.creating.*' -print -quit)
+        [[ -z "$orphan_staging" ]] || fail "staging image from an earlier interrupted create exists: $orphan_staging"
+    fi
     install -d -m 0700 "$backing_dir"
     requested_bytes=$((size_gib * GIB))
     available_bytes=$(df --output=avail -B1 "$backing_dir" | tail -n 1 | tr -d ' ')
     ((available_bytes >= requested_bytes + 5 * GIB)) || fail "backing filesystem needs the requested size plus 5 GiB headroom"
-    staging=$(mktemp "$backing_dir/.state.luks.creating.XXXXXX")
-    opened_backing="$staging"
-
     mapping_matches_created_backing() {
         local candidate
         for candidate in "$opened_backing" "$staging" "$backing_file"; do
@@ -815,7 +830,9 @@ create_volume() {
     }
 
     cleanup_create() {
+        local luks_probe_status
         [[ "$cleanup_needed" == true ]] || return
+        trap - EXIT HUP INT TERM
         set +e
         if [[ "$mounted" == true && "$opened_by_us" == true ]] && mount_source_matches && mapping_matches_created_backing; then
             umount "$mount_point"
@@ -830,10 +847,23 @@ create_volume() {
         if [[ "$opened_by_us" == true ]] && created_backing_attachment_remains; then
             printf 'warning: failed create cleanup left the encrypted backing file attached to a loop device; inspect unknown mappings manually\n' >&2
         fi
-        if [[ "$formatted" == false && -e "$staging" ]]; then
-            rm -f -- "$staging"
-        elif [[ -e "$staging" ]]; then
-            printf 'retained encrypted staging image for diagnosis: %s\n' "$staging" >&2
+        if [[ "$opened_backing" == "$backing_file" && -f "$backing_file" ]]; then
+            printf 'retained completed encrypted image: %s; rerun configure with the same options to resume verification\n' "$backing_file" >&2
+        fi
+        if [[ -n "$staging" && -e "$staging" ]]; then
+            if [[ "$formatted" == false ]]; then
+                cryptsetup isLuks --type luks2 "$staging" >/dev/null 2>&1
+                luks_probe_status=$?
+                if [[ "$luks_probe_status" -eq 1 ]]; then
+                    rm -f -- "$staging"
+                elif [[ "$luks_probe_status" -eq 0 ]]; then
+                    printf 'retained encrypted staging image for diagnosis: %s\n' "$staging" >&2
+                else
+                    printf 'warning: LUKS probe failed with status %s; retained staging image for diagnosis: %s\n' "$luks_probe_status" "$staging" >&2
+                fi
+            else
+                printf 'retained encrypted staging image for diagnosis: %s\n' "$staging" >&2
+            fi
         fi
     }
     cleanup_needed=true
@@ -842,6 +872,9 @@ create_volume() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
 
+    staging=$(mktemp "$backing_dir/.state.luks.creating.XXXXXX")
+    opened_backing="$staging"
+
     fallocate --length "$requested_bytes" "$staging"
     chmod 0600 "$staging"
     logical_bytes=$(stat -c '%s' "$staging")
@@ -849,11 +882,11 @@ create_volume() {
     [[ "$logical_bytes" -eq "$requested_bytes" && "$allocated_bytes" -ge "$logical_bytes" ]] || fail "backing image is sparse or incompletely allocated"
     sync -f "$staging"
 
-    note "cryptsetup will now request confirmation and a new recovery passphrase directly on this terminal."
+    note "cryptsetup will now ask you to type uppercase YES, then request and confirm a new recovery passphrase directly on this terminal."
     cryptsetup luksFormat --type luks2 --verify-passphrase "$staging"
     formatted=true
-    cryptsetup open --type luks2 "$staging" "$mapper_name"
     opened_by_us=true
+    cryptsetup open --type luks2 "$staging" "$mapper_name"
     verify_mapping_backing "$staging"
     [[ -z "$(blkid -p -o value -s TYPE "/dev/mapper/$mapper_name" 2>/dev/null || true)" ]] || fail "new mapper unexpectedly contains a filesystem signature"
     mkfs.ext4 -E nodiscard -L wcp-state -m 1 "/dev/mapper/$mapper_name"
@@ -862,8 +895,8 @@ create_volume() {
 
     install -d -o root -g root -m 0700 "$mount_point"
     [[ "$(stat -c '%u:%a' "$mount_point")" == "0:700" ]] || fail "unmounted state mountpoint must be root-owned with mode 0700"
-    mount -t ext4 -o rw,nosuid,nodev,noatime,errors=remount-ro "/dev/mapper/$mapper_name" "$mount_point"
     mounted=true
+    mount -t ext4 -o rw,nosuid,nodev,noatime,errors=remount-ro "/dev/mapper/$mapper_name" "$mount_point"
     owner_group=$(id -gn -- "$owner_name")
     chown "$owner_name:$owner_group" "$mount_point"
     chmod 0700 "$mount_point"
@@ -889,12 +922,12 @@ create_volume() {
     verify_mapping_backing "$backing_file"
     cryptsetup close "$mapper_name"
     opened_by_us=false
-    cleanup_needed=false
-    trap - EXIT HUP INT TERM
 
     note "systemd will now request the passphrase once to verify the persistent unlock path."
     start_volume_units
     verify_mounted_volume $((30 * GIB))
+	cleanup_needed=false
+	trap - EXIT HUP INT TERM
 
     note "state volume created and mounted successfully"
     note "add these non-secret values to the daemon environment file:"
@@ -903,7 +936,7 @@ create_volume() {
     note "WECHATCOPILOT_STATE_MOUNT_FSTYPE=ext4"
     note "WECHATCOPILOT_STATE_MOUNT_UUID=$fs_uuid"
     print_swap_warning
-}
+)
 
 unlock_volume() {
     validate_arguments

@@ -2,7 +2,7 @@
 
 ## Host storage gate
 
-Before any real-account login, require `doctor` to report `swap_confidentiality` healthy. When a dedicated or file-backed state mount is configured, also require the `state_mount` check to be present and healthy. Accept no swap, a real zram block device whose sysfs `backing_dev` is absent or `none`, or a separately verified dm-crypt swap device; the provisioning script itself only warns, while the daemon refuses to start or restore accounts when the swap check fails.
+Before any real-account login, inspect `doctor`. When a dedicated or file-backed state mount is configured, require the `state_mount` check to be present and healthy. A `swap_confidentiality` warning records that raw swap may retain decrypted account data; report it, but never disable or reconfigure host swap through an agent. Stop when that check has `ok:false`; either the operator enabled strict policy and an active target is unprotected, or `WECHATCOPILOT_STRICT_SWAP` is invalid. Strict mode accepts no swap, a real zram block device whose sysfs `backing_dev` is absent or `none`, or a separately verified dm-crypt swap device.
 
 When the backing disk is NTFS3, use it only for the outer fully allocated 64 GiB LUKS2 image. The live state root is the inner ext4 mount. Keep the outer filesystem UUID distinct from the inner ext4 UUID: every mutating provisioning command (`create`, `configure`, `unlock`, and `lock`) requires the outer UUID, while the daemon's three mount-gate variables identify the inner mapper, ext4 type, and ext4 UUID.
 

@@ -10,7 +10,7 @@ Use `wechatcopilot` as the semantic control plane for official WeChat and WeCom 
 ## Start every workflow
 
 1. Run `wechatcopilot doctor --json` when runtime health is unknown.
-   If `state_mount` or `swap_confidentiality` fails, stop. Never unset mount constraints, substitute an unmounted fallback directory, or bypass the swap gate. Before first real-account authentication, follow the encrypted-volume and swap gates in [account and authentication workflow](references/accounts.md).
+   If `state_mount` fails, stop. Report a `swap_confidentiality` warning as a host confidentiality tradeoff, but do not disable or reconfigure swap. Stop when this check has `ok:false`; either strict swap policy rejected an active target or the policy value is invalid. Never unset mount constraints or substitute an unmounted fallback directory. Before first real-account authentication, follow the storage guidance in [account and authentication workflow](references/accounts.md).
 2. Run `wechatcopilot accounts list --json` and select the exact `account_id`.
 3. Run `wechatcopilot accounts status --account <account_id> --json`.
 4. If the account is not `ONLINE`, do not send, watch, refresh visible UI data, or operate surfaces. A bounded read or search may use only its existing local index when the user accepts stale data; label it as an inactive snapshot. For a live operation, activate the exact account and direct the user to run the CLI login flow manually if authentication is required. Never execute `accounts login` or any `auth` subcommand through an agent shell or tool: their inputs or outputs can contain a bearer login URL or verification secret. Never request, receive, or relay that output or an SMS code through the model or MCP.

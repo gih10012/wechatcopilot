@@ -21,6 +21,7 @@ internal object CompanionRuntime {
     // A time-based epoch keeps host cursors monotonic across companion process restarts.
     private val sequence = AtomicLong(System.currentTimeMillis() * 1_000L)
     private val accessibility = AtomicReference<WeComAccessibilityService?>()
+    private val observedWindow = AtomicReference<ObservedWindow?>()
     private val events = ArrayDeque<EventRecord>()
     private val server = AtomicReference<LocalRpcServer?>()
 
@@ -40,22 +41,36 @@ internal object CompanionRuntime {
     }
 
     fun attach(service: WeComAccessibilityService) {
+        observedWindow.set(null)
         accessibility.set(service)
         start(service)
         markUiChanged()
     }
 
     fun detach(service: WeComAccessibilityService) {
-        accessibility.compareAndSet(service, null)
-        markUiChanged()
+        if (accessibility.compareAndSet(service, null)) {
+            observedWindow.set(null)
+            markUiChanged()
+        }
     }
 
     fun markUiChanged(): Long = sequence.incrementAndGet()
 
+    fun observeWindow(className: String, windowId: Int): Long {
+        observedWindow.set(className.takeIf { it.isNotBlank() }?.let { ObservedWindow(it, windowId) })
+        return markUiChanged()
+    }
+
     fun currentSequence(): Long = sequence.get()
 
+    fun currentWindowClass(packageName: String, windowId: Int): String {
+        if (packageName != WECOM_PACKAGE || windowId < 0) return ""
+        val observed = observedWindow.get() ?: return ""
+        return observed.className.takeIf { observed.windowId >= 0 && observed.windowId == windowId }.orEmpty()
+    }
+
     fun snapshot(): UiSnapshotModel = accessibility.get()?.buildSnapshot()
-        ?: UiSnapshotModel(currentSequence(), "", "", Instant.now(), emptyList())
+        ?: UiSnapshotModel(currentSequence(), "", "", "", Instant.now(), emptyList())
 
     fun perform(action: CompanionAction): ActionResult {
         return when (action.kind) {
@@ -149,6 +164,8 @@ internal object CompanionRuntime {
         }
     }
 }
+
+private data class ObservedWindow(val className: String, val windowId: Int)
 
 internal object TokenPolicy {
     private val tokenPattern = Regex("^[A-Za-z0-9_-]{43,128}$")

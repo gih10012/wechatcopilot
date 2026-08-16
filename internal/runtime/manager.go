@@ -94,7 +94,9 @@ func (m *Manager) activate(ctx context.Context, value string, restoring bool) (a
 		return account.Account{}, account.ErrDeleting
 	}
 	operation := m.operations[target.Platform]
-	operation.Lock()
+	if err := lockOperation(ctx, operation); err != nil {
+		return account.Account{}, err
+	}
 	defer operation.Unlock()
 	target, err = m.accounts.Resolve(target.ID)
 	if err != nil {
@@ -181,7 +183,9 @@ func (m *Manager) Deactivate(ctx context.Context, value string) (account.Account
 		return account.Account{}, account.ErrDeleting
 	}
 	operation := m.operations[target.Platform]
-	operation.Lock()
+	if err := lockOperation(ctx, operation); err != nil {
+		return account.Account{}, err
+	}
 	defer operation.Unlock()
 	target, err = m.accounts.Resolve(target.ID)
 	if err != nil {
@@ -242,28 +246,54 @@ func (m *Manager) Status(ctx context.Context, value string) (driver.Status, erro
 func (m *Manager) Shutdown(ctx context.Context) error {
 	wechatOperation := m.operations[driver.PlatformWeChat]
 	wecomOperation := m.operations[driver.PlatformWeCom]
-	wechatOperation.Lock()
+	if err := lockOperation(ctx, wechatOperation); err != nil {
+		return err
+	}
 	defer wechatOperation.Unlock()
-	wecomOperation.Lock()
+	if err := lockOperation(ctx, wecomOperation); err != nil {
+		return err
+	}
 	defer wecomOperation.Unlock()
 
 	m.mu.Lock()
 	m.closed = true
-	var result error
 	var stopped []*activeRuntime
 	for platform, runtime := range m.active {
-		if err := runtime.driver.Stop(ctx); err != nil {
-			result = errors.Join(result, err)
-		}
 		runtime.cancel()
 		stopped = append(stopped, runtime)
 		delete(m.active, platform)
 	}
 	m.mu.Unlock()
-	for _, runtime := range stopped {
-		<-runtime.done
+
+	// Platform runtimes are independent. Stop them concurrently so their
+	// individual container grace periods fit inside the daemon shutdown budget.
+	type stopResult struct {
+		index int
+		err   error
 	}
-	return result
+	stopErrors := make([]error, len(stopped))
+	results := make(chan stopResult, len(stopped))
+	for index, runtime := range stopped {
+		go func(index int, runtime *activeRuntime) {
+			results <- stopResult{index: index, err: runtime.driver.Stop(ctx)}
+		}(index, runtime)
+	}
+	for range stopped {
+		select {
+		case result := <-results:
+			stopErrors[result.index] = result.err
+		case <-ctx.Done():
+			return errors.Join(append(stopErrors, ctx.Err())...)
+		}
+	}
+	for _, runtime := range stopped {
+		select {
+		case <-runtime.done:
+		case <-ctx.Done():
+			return errors.Join(append(stopErrors, ctx.Err())...)
+		}
+	}
+	return errors.Join(stopErrors...)
 }
 
 func (m *Manager) Sync(ctx context.Context, value string) error {
@@ -278,6 +308,27 @@ func (m *Manager) Sync(ctx context.Context, value string) error {
 		return errors.New("account is not active")
 	}
 	return m.ingestOnce(ctx, runtime)
+}
+
+func lockOperation(ctx context.Context, operation *sync.Mutex) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if operation.TryLock() {
+		return nil
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if operation.TryLock() {
+				return nil
+			}
+		}
+	}
 }
 
 func (m *Manager) ingestLoop(ctx context.Context, runtime *activeRuntime) {
@@ -348,7 +399,9 @@ func (m *Manager) Purge(ctx context.Context, value string) error {
 		return errors.New("deactivate the account before purging it")
 	}
 	operation := m.operations[target.Platform]
-	operation.Lock()
+	if err := lockOperation(ctx, operation); err != nil {
+		return err
+	}
 	defer operation.Unlock()
 	m.mu.RLock()
 	factory := m.factories[target.Platform]

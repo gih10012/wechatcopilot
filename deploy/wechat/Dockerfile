@@ -10,7 +10,19 @@ RUN apt-get update \
         dbus-x11 \
         fonts-noto-cjk \
         imagemagick \
+        libatomic1 \
         libfuse2t64 \
+        libnspr4 \
+        libnss3 \
+        libpulse0 \
+        libxcb-icccm4 \
+        libxcb-image0 \
+        libxcb-keysyms1 \
+        libxcb-render-util0 \
+        libxcb-xkb1 \
+        libxdamage1 \
+        libxkbcommon-x11-0 \
+        libxkbcommon0 \
         openbox \
         python3 \
         python3-pyatspi \

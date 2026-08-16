@@ -80,6 +80,52 @@ func TestCapabilitiesUseSharedCompleteContract(t *testing.T) {
 	}
 }
 
+func TestClassifyLoginUsesObservedWeComWindowClass(t *testing.T) {
+	tests := []struct {
+		name        string
+		windowClass string
+		want        core.RuntimeState
+	}{
+		{name: "login", windowClass: weComLoginWxAuthActivity, want: core.StateAuthRequired},
+		{name: "splash", windowClass: weComLaunchActivity, want: core.StateStarting},
+		{name: "post-login scanner", windowClass: "com.tencent.wework.login.controller.LoginScannerActivity", want: core.StateDegraded},
+		{name: "gesture settings", windowClass: "com.tencent.wework.login.controller.SettingGestureActivity", want: core.StateDegraded},
+		{name: "unknown", windowClass: "com.tencent.wework.unknown.CustomActivity", want: core.StateDegraded},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state, _ := classifyLogin(UISnapshot{PackageName: DefaultWeComPackage, WindowClass: test.windowClass})
+			if state != test.want {
+				t.Fatalf("classifyLogin(%q) = %s, want %s", test.windowClass, state, test.want)
+			}
+		})
+	}
+}
+
+func TestForegroundActivityOverridesOrClearsCompanionObservation(t *testing.T) {
+	snapshot := UISnapshot{
+		PackageName: DefaultWeComPackage,
+		WindowClass: "com.tencent.wework.login.controller.SettingGestureActivity",
+	}
+	android := AndroidContainer{
+		DockerBinary: "docker", Container: "synthetic",
+		Executor: functionExecutor(func(context.Context, string, ...string) ([]byte, error) {
+			return []byte("topResumedActivity=ActivityRecord{x u0 " + DefaultWeComPackage + "/.login.controller.LoginWxAuthActivity}\n"), nil
+		}),
+		Verify: func(context.Context) error { return nil },
+	}
+	got := withForegroundActivity(context.Background(), android, snapshot)
+	if got.WindowClass != weComLoginWxAuthActivity {
+		t.Fatalf("foreground activity = %q, want %q", got.WindowClass, weComLoginWxAuthActivity)
+	}
+
+	android.Executor = &sequenceExecutor{results: []executorResult{{err: errors.New("probe failed")}}}
+	got = withForegroundActivity(context.Background(), android, snapshot)
+	if got.WindowClass != "" {
+		t.Fatalf("failed authoritative probe retained companion class %q", got.WindowClass)
+	}
+}
+
 func TestSameTitleNotificationKeysRemainDistinctConversations(t *testing.T) {
 	const token = "abcdefghijklmnopqrstuvwxyzABCDEFGH0123456789"
 	events := []CompanionEvent{

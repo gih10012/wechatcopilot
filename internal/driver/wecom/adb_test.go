@@ -3,6 +3,7 @@ package wecom
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -143,5 +144,81 @@ func TestAndroidContainerScreenshotRejectsNonPNG(t *testing.T) {
 	}
 	if _, err := android.Screenshot(context.Background()); err == nil {
 		t.Fatal("expected invalid screenshot to be rejected")
+	}
+}
+
+func TestAndroidContainerLaunchWeComResolvesAndConfirmsLauncher(t *testing.T) {
+	var commands []string
+	executor := functionExecutor(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		command := strings.Join(append([]string{name}, args...), " ")
+		commands = append(commands, command)
+		if strings.Contains(command, " resolve-activity ") {
+			return []byte("priority=0\n" + DefaultWeComPackage + "/.launch.LaunchSplashActivity\n"), nil
+		}
+		return []byte("Starting: Intent {...}\nStatus: ok\nComplete\n"), nil
+	})
+	android := AndroidContainer{
+		DockerBinary: "docker", Container: "synthetic", Executor: executor,
+		Verify: func(context.Context) error { return nil },
+	}
+	if err := android.LaunchWeCom(context.Background(), DefaultWeComPackage); err != nil {
+		t.Fatal(err)
+	}
+	expected := []string{
+		"docker container exec synthetic /system/bin/cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER " + DefaultWeComPackage,
+		"docker container exec synthetic /system/bin/am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -n " + DefaultWeComPackage + "/.launch.LaunchSplashActivity",
+	}
+	if fmt.Sprint(commands) != fmt.Sprint(expected) {
+		t.Fatalf("WeCom launch commands = %q, want %q", commands, expected)
+	}
+}
+
+func TestAndroidContainerLaunchWeComRejectsUnconfirmedLauncher(t *testing.T) {
+	executor := &sequenceExecutor{results: []executorResult{
+		{output: []byte(DefaultWeComPackage + "/.launch.LaunchSplashActivity\n")},
+		{output: []byte("Error: Activity not started\n")},
+	}}
+	android := AndroidContainer{
+		DockerBinary: "docker", Container: "synthetic", Executor: executor,
+		Verify: func(context.Context) error { return nil },
+	}
+	if err := android.LaunchWeCom(context.Background(), DefaultWeComPackage); !errors.Is(err, ErrClientIncompatible) {
+		t.Fatalf("unconfirmed launcher error = %v, want ErrClientIncompatible", err)
+	}
+}
+
+func TestAndroidContainerForegroundActivityReturnsOnlyOfficialComponent(t *testing.T) {
+	var command string
+	executor := functionExecutor(func(_ context.Context, name string, args ...string) ([]byte, error) {
+		command = strings.Join(append([]string{name}, args...), " ")
+		return []byte("topResumedActivity=ActivityRecord{efce792 u0 " + DefaultWeComPackage + "/.login.controller.LoginWxAuthActivity} t9}\n"), nil
+	})
+	android := AndroidContainer{
+		DockerBinary: "docker", Container: "synthetic", Executor: executor,
+		Verify: func(context.Context) error { return nil },
+	}
+	activity, err := android.ForegroundActivity(context.Background(), DefaultWeComPackage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activity != "com.tencent.wework.login.controller.LoginWxAuthActivity" {
+		t.Fatalf("foreground activity = %q", activity)
+	}
+	expected := "docker container exec synthetic /system/bin/sh -c " + resumedActivityProbe
+	if command != expected {
+		t.Fatalf("foreground command = %q, want %q", command, expected)
+	}
+}
+
+func TestParseResumedActivityRejectsForeignAndMalformedComponents(t *testing.T) {
+	tests := []string{
+		"topResumedActivity=ActivityRecord{x u0 com.android.settings/.Settings}",
+		"topResumedActivity=ActivityRecord{x u0 " + DefaultWeComPackage + "/other.package.Activity}",
+		"topResumedActivity=ActivityRecord{x u0 " + DefaultWeComPackage + "/.login.Bad-Activity}",
+	}
+	for _, output := range tests {
+		if activity, ok := parseResumedActivity([]byte(output), DefaultWeComPackage); ok {
+			t.Fatalf("parseResumedActivity(%q) = %q, want rejection", output, activity)
+		}
 	}
 }

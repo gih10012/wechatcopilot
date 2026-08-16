@@ -51,6 +51,7 @@ internal data class UiSnapshotModel(
     val sequence: Long,
     val packageName: String,
     val windowTitle: String,
+    val windowClass: String,
     val capturedAt: Instant,
     val nodes: List<UiNodeModel>,
 ) {
@@ -61,6 +62,7 @@ internal data class UiSnapshotModel(
             .put("sequence", sequence)
             .put("package_name", packageName)
             .put("window_title", windowTitle)
+            .put("window_class", windowClass)
             .put("captured_at", capturedAt.toString())
             .put("nodes", encodedNodes)
     }

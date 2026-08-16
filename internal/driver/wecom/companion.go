@@ -42,6 +42,7 @@ type UISnapshot struct {
 	Sequence    int64     `json:"sequence"`
 	PackageName string    `json:"package_name"`
 	WindowTitle string    `json:"window_title,omitempty"`
+	WindowClass string    `json:"window_class,omitempty"`
 	CapturedAt  time.Time `json:"captured_at"`
 	Nodes       []Node    `json:"nodes"`
 }

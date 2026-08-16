@@ -10,8 +10,8 @@ docker build \
   .
 ```
 
-For a reproducible release, replace the default `BASE_IMAGE` with an Ubuntu
-digest reviewed by the release workflow:
+For a release build, replace the default `BASE_IMAGE` with an Ubuntu digest
+reviewed by the release workflow:
 
 ```sh
 docker build \
@@ -20,6 +20,11 @@ docker build \
   --tag wechatcopilot/wechat-runtime:local \
   .
 ```
+
+The base digest fixes the starting filesystem, but Ubuntu package repositories
+remain time-dependent. Record and verify the final runtime image digest; a
+fully reproducible build additionally requires a fixed package snapshot and
+package versions.
 
 The Go driver starts the container with five explicit bind mounts:
 

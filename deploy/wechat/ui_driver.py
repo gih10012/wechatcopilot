@@ -141,7 +141,11 @@ def process_running():
         except (OSError, PermissionError):
             continue
         basenames = [value.rsplit(b"/", 1)[-1] for value in arguments]
-        if any(value in (b"wechat", b"xwechat", b"wechatappex") or value.startswith(b".mount_wechat") for value in basenames):
+        if any(
+            value in (b"wechat", b"xwechat", b"wechatappex", b"wechat.appimage")
+            or value.startswith(b".mount_wechat")
+            for value in basenames
+        ):
             return True
     return False
 

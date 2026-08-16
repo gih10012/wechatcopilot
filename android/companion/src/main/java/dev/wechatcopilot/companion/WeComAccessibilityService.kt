@@ -15,7 +15,11 @@ class WeComAccessibilityService : AccessibilityService() {
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event?.packageName?.toString() == CompanionRuntime.WECOM_PACKAGE) {
-            CompanionRuntime.markUiChanged()
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                CompanionRuntime.observeWindow(event.className?.toString().orEmpty(), event.windowId)
+            } else {
+                CompanionRuntime.markUiChanged()
+            }
         }
     }
 
@@ -28,13 +32,32 @@ class WeComAccessibilityService : AccessibilityService() {
 
     internal fun buildSnapshot(): UiSnapshotModel {
         val root = rootInActiveWindow
-            ?: return UiSnapshotModel(CompanionRuntime.currentSequence(), "", "", Instant.now(), emptyList())
+            ?: return UiSnapshotModel(
+                CompanionRuntime.currentSequence(),
+                "",
+                "",
+                "",
+                Instant.now(),
+                emptyList(),
+            )
+        val packageName = root.packageName?.toString().orEmpty()
+        if (packageName != CompanionRuntime.WECOM_PACKAGE) {
+            return UiSnapshotModel(
+                CompanionRuntime.currentSequence(),
+                packageName,
+                "",
+                "",
+                Instant.now(),
+                emptyList(),
+            )
+        }
         val nodes = ArrayList<UiNodeModel>()
         traverse(root, "0", null, nodes, 0)
         return UiSnapshotModel(
             sequence = CompanionRuntime.currentSequence(),
-            packageName = root.packageName?.toString().orEmpty(),
+            packageName = packageName,
             windowTitle = root.window?.title?.toString().orEmpty(),
+            windowClass = CompanionRuntime.currentWindowClass(packageName, root.windowId),
             capturedAt = Instant.now(),
             nodes = nodes,
         )

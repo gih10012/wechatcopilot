@@ -144,6 +144,133 @@ func TestDeactivateWaitsForIngestLoop(t *testing.T) {
 	}
 }
 
+func TestShutdownStopsPlatformRuntimesConcurrently(t *testing.T) {
+	store := testAccountStore(t)
+	wechat, _ := store.Add("personal", driver.PlatformWeChat)
+	wecom, _ := store.Add("work", driver.PlatformWeCom)
+	manager := NewManager(store)
+	entered := make(chan driver.Platform, 2)
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	for _, platform := range []driver.Platform{driver.PlatformWeChat, driver.PlatformWeCom} {
+		platform := platform
+		manager.Register(platform, func(driver.AccountRuntime) (driver.Driver, error) {
+			return &coordinatedStopDriver{Driver: fake.New(platform), entered: entered, release: release}, nil
+		})
+	}
+	if _, err := manager.Activate(context.Background(), wechat.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Activate(context.Background(), wecom.ID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- manager.Shutdown(context.Background()) }()
+	seen := make(map[driver.Platform]bool, 2)
+	for len(seen) < 2 {
+		select {
+		case platform := <-entered:
+			seen[platform] = true
+		case <-time.After(time.Second):
+			t.Fatalf("shutdown stopped runtimes serially; entered=%v", seen)
+		}
+	}
+	close(release)
+	released = true
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShutdownDeadlineBoundsUnresponsiveIngestLoop(t *testing.T) {
+	store := testAccountStore(t)
+	item, _ := store.Add("personal", driver.PlatformWeChat)
+	manager := NewManager(store)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	instance := &stubbornIngestDriver{
+		Driver: fake.New(driver.PlatformWeChat), started: started, release: release,
+	}
+	manager.Register(driver.PlatformWeChat, func(driver.AccountRuntime) (driver.Driver, error) {
+		return instance, nil
+	})
+	if _, err := manager.Activate(context.Background(), item.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("ingest loop did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := manager.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want deadline exceeded", err)
+	}
+	close(release)
+}
+
+func TestShutdownDeadlineBoundsUnresponsiveStop(t *testing.T) {
+	store := testAccountStore(t)
+	item, _ := store.Add("personal", driver.PlatformWeChat)
+	manager := NewManager(store)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	instance := &stubbornStopDriver{
+		Driver: fake.New(driver.PlatformWeChat), started: started, release: release,
+	}
+	manager.Register(driver.PlatformWeChat, func(driver.AccountRuntime) (driver.Driver, error) {
+		return instance, nil
+	})
+	if _, err := manager.Activate(context.Background(), item.ID); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- manager.Shutdown(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("stop did not start")
+	}
+	if err := <-done; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want deadline exceeded", err)
+	}
+	close(release)
+}
+
+func TestShutdownDeadlineBoundsOccupiedPlatformLock(t *testing.T) {
+	store := testAccountStore(t)
+	manager := NewManager(store)
+	operation := manager.operations[driver.PlatformWeChat]
+	operation.Lock()
+	defer operation.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := manager.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Shutdown error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestLockOperationRejectsCanceledContextWhenUnlocked(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var operation sync.Mutex
+	if err := lockOperation(ctx, &operation); !errors.Is(err, context.Canceled) {
+		t.Fatalf("lockOperation error = %v, want context canceled", err)
+	}
+	if !operation.TryLock() {
+		t.Fatal("canceled lockOperation acquired the mutex")
+	}
+	operation.Unlock()
+}
+
 func TestDeletingAccountCannotStopActivePlatformRuntime(t *testing.T) {
 	store := testAccountStore(t)
 	active, err := store.Add("active", driver.PlatformWeChat)
@@ -287,6 +414,48 @@ func TestExplicitActivateRetriesPreservedRestoreSlot(t *testing.T) {
 type stopDriver struct {
 	*fake.Driver
 	failStop bool
+}
+
+type coordinatedStopDriver struct {
+	*fake.Driver
+	entered chan<- driver.Platform
+	release <-chan struct{}
+}
+
+type stubbornIngestDriver struct {
+	*fake.Driver
+	started chan<- struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (d *stubbornIngestDriver) ListConversations(ctx context.Context, _ driver.ConversationQuery) ([]driver.Conversation, error) {
+	d.once.Do(func() { close(d.started) })
+	<-d.release
+	return nil, ctx.Err()
+}
+
+type stubbornStopDriver struct {
+	*fake.Driver
+	started chan<- struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (d *stubbornStopDriver) Stop(context.Context) error {
+	d.once.Do(func() { close(d.started) })
+	<-d.release
+	return nil
+}
+
+func (d *coordinatedStopDriver) Stop(ctx context.Context) error {
+	d.entered <- d.Platform()
+	select {
+	case <-d.release:
+		return d.Driver.Stop(ctx)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (d *stopDriver) Stop(ctx context.Context) error {

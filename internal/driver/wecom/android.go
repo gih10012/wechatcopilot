@@ -10,7 +10,10 @@ import (
 	"time"
 )
 
-const maxCompanionWireBytes int64 = (8 << 20) + (64 << 10)
+const (
+	maxCompanionWireBytes int64 = (8 << 20) + (64 << 10)
+	resumedActivityProbe        = "/system/bin/dumpsys activity activities 2>/dev/null | /system/bin/toybox grep -E -m 1 'topResumedActivity=|mResumedActivity='"
+)
 
 // AndroidContainer invokes a small, fixed command set inside the exact
 // ownership-checked Redroid container. It never opens an ADB host port.
@@ -274,10 +277,91 @@ func TokenValid(token string) bool {
 }
 
 func (a AndroidContainer) LaunchWeCom(ctx context.Context, packageName string) error {
-	if _, err := a.run(ctx, "/system/bin/monkey", "-p", packageName, "-c", "android.intent.category.LAUNCHER", "1"); err != nil {
+	const action = "android.intent.action.MAIN"
+	const category = "android.intent.category.LAUNCHER"
+	resolved, err := a.run(ctx, "/system/bin/cmd", "package", "resolve-activity", "--brief", "-a", action, "-c", category, packageName)
+	if err != nil {
+		return fmt.Errorf("resolve official WeCom launcher: %w", err)
+	}
+	component := ""
+	for _, line := range strings.Split(string(resolved), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, packageName+"/") && !strings.ContainsAny(line, " \t\r") {
+			component = line
+		}
+	}
+	if component == "" {
+		return fmt.Errorf("%w: Android package manager did not resolve the official WeCom launcher", ErrClientIncompatible)
+	}
+	output, err := a.run(ctx, "/system/bin/am", "start", "-W", "-a", action, "-c", category, "-n", component)
+	if err != nil {
 		return fmt.Errorf("launch official WeCom client: %w", err)
 	}
+	if !outputHasExactLine(output, "Status: ok") {
+		return fmt.Errorf("%w: Android activity manager did not confirm the official WeCom launch", ErrClientIncompatible)
+	}
 	return nil
+}
+
+// ForegroundActivity returns only a strictly parsed component from Android's
+// resumed-activity record. The fixed in-container filter prevents the full
+// activity dump, which can contain intent details, from reaching the host.
+func (a AndroidContainer) ForegroundActivity(ctx context.Context, packageName string) (string, error) {
+	if packageName != DefaultWeComPackage {
+		return "", errors.New("foreground activity probe is restricted to the official WeCom package")
+	}
+	output, err := a.run(ctx, "/system/bin/sh", "-c", resumedActivityProbe)
+	if err != nil {
+		return "", fmt.Errorf("inspect resumed official WeCom activity: %w", err)
+	}
+	activity, ok := parseResumedActivity(output, packageName)
+	if !ok {
+		return "", fmt.Errorf("%w: Android did not report the official WeCom activity in the foreground", ErrClientIncompatible)
+	}
+	return activity, nil
+}
+
+func parseResumedActivity(output []byte, packageName string) (string, bool) {
+	prefix := packageName + "/"
+	for _, field := range strings.Fields(string(output)) {
+		component := strings.TrimRight(field, "}")
+		if !strings.HasPrefix(component, prefix) {
+			continue
+		}
+		className := strings.TrimPrefix(component, prefix)
+		if strings.HasPrefix(className, ".") {
+			className = packageName + className
+		}
+		if !strings.HasPrefix(className, packageName+".") || !validAndroidClassName(className) {
+			return "", false
+		}
+		return className, true
+	}
+	return "", false
+}
+
+func validAndroidClassName(value string) bool {
+	if len(value) == 0 || len(value) > 256 {
+		return false
+	}
+	for _, character := range value {
+		if (character < 'A' || character > 'Z') &&
+			(character < 'a' || character > 'z') &&
+			(character < '0' || character > '9') &&
+			character != '.' && character != '_' && character != '$' {
+			return false
+		}
+	}
+	return true
+}
+
+func outputHasExactLine(output []byte, expected string) bool {
+	for _, line := range strings.Split(string(output), "\n") {
+		if strings.TrimSpace(line) == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func (a AndroidContainer) Screenshot(ctx context.Context) ([]byte, error) {

@@ -15,7 +15,10 @@ func TestCompanionClientAuthenticatesAndDecodesSnapshot(t *testing.T) {
 			t.Fatalf("missing bearer token")
 		}
 		writer.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(writer).Encode(UISnapshot{Sequence: 7, PackageName: DefaultWeComPackage})
+		_ = json.NewEncoder(writer).Encode(UISnapshot{
+			Sequence: 7, PackageName: DefaultWeComPackage,
+			WindowClass: "com.tencent.wework.login.controller.LoginWxAuthActivity",
+		})
 	}))
 	defer server.Close()
 	client, err := newCompanionClientForURL(server.URL, token, server.Client())
@@ -26,7 +29,8 @@ func TestCompanionClientAuthenticatesAndDecodesSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Sequence != 7 || snapshot.PackageName != DefaultWeComPackage {
+	if snapshot.Sequence != 7 || snapshot.PackageName != DefaultWeComPackage ||
+		snapshot.WindowClass != "com.tencent.wework.login.controller.LoginWxAuthActivity" {
 		t.Fatalf("unexpected snapshot: %+v", snapshot)
 	}
 }

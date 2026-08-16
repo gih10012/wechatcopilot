@@ -22,7 +22,20 @@ if command -v at-spi-bus-launcher >/dev/null 2>&1; then
     at-spi-bus-launcher --launch-immediately >/dev/null 2>&1 &
 elif [ -x /usr/libexec/at-spi-bus-launcher ]; then
     /usr/libexec/at-spi-bus-launcher --launch-immediately >/dev/null 2>&1 &
+else
+    echo "AT-SPI bus launcher is unavailable" >&2
+    exit 1
 fi
+
+deadline=$(( $(date +%s) + 10 ))
+while ! dbus-send --session --reply-timeout=250 --dest=org.a11y.Bus --type=method_call --print-reply \
+    /org/a11y/bus org.a11y.Bus.GetAddress >/dev/null 2>&1; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "AT-SPI accessibility bus did not become ready" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
 
 openbox >/wechatcopilot/runtime/openbox.log 2>&1 &
 

@@ -29,6 +29,11 @@ var (
 	ErrClientIncompatible    = core.NewFailure(core.FailureClientIncompatible, "the configured WeCom client runtime is incompatible")
 )
 
+const (
+	weComLoginWxAuthActivity = "com.tencent.wework.login.controller.LoginWxAuthActivity"
+	weComLaunchActivity      = "com.tencent.wework.launch.LaunchSplashActivity"
+)
+
 type surfaceState struct {
 	surface  core.Surface
 	actions  map[string]CompanionAction
@@ -261,6 +266,7 @@ func (d *Driver) Status(ctx context.Context) (core.Status, error) {
 			Capabilities: capabilities(),
 		}, nil
 	}
+	snapshot = d.withForegroundActivity(ctx, snapshot)
 	state, reason := classifyLogin(snapshot)
 	return core.Status{
 		State:         state,
@@ -298,6 +304,7 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (core.AuthSnapshot, error) {
 	if err != nil {
 		return core.AuthSnapshot{}, err
 	}
+	snapshot = withForegroundActivity(ctx, android, snapshot)
 	png, err := android.Screenshot(ctx)
 	if err != nil {
 		return core.AuthSnapshot{}, err
@@ -306,10 +313,10 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (core.AuthSnapshot, error) {
 	kind := core.AuthPhoneConfirm
 	canSubmit := false
 	text := snapshotText(snapshot)
-	if containsAny(text, "验证码", "verification code", "短信") {
+	if state == core.StateAuthRequired && containsAny(text, "验证码", "verification code", "短信") {
 		kind = core.AuthSMS
 		canSubmit = countEditable(snapshot) == 1
-	} else if containsAny(text, "二维码", "扫码", "scan") {
+	} else if state == core.StateAuthRequired && containsAny(text, "二维码", "扫码", "scan") {
 		kind = core.AuthQR
 	}
 	result := core.AuthSnapshot{
@@ -326,6 +333,30 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (core.AuthSnapshot, error) {
 		result.QRCodePNG = png
 	}
 	return result, nil
+}
+
+func (d *Driver) withForegroundActivity(ctx context.Context, snapshot UISnapshot) UISnapshot {
+	android, err := d.runtime.Android()
+	if err != nil {
+		return snapshot
+	}
+	return withForegroundActivity(ctx, android, snapshot)
+}
+
+func withForegroundActivity(ctx context.Context, android AndroidContainer, snapshot UISnapshot) UISnapshot {
+	if snapshot.PackageName != DefaultWeComPackage {
+		return snapshot
+	}
+	// The resumed Activity is authoritative for state classification. Clear a
+	// companion observation first so a failed probe cannot reuse a stale class.
+	snapshot.WindowClass = ""
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	activity, err := android.ForegroundActivity(probeCtx, DefaultWeComPackage)
+	if err == nil {
+		snapshot.WindowClass = activity
+	}
+	return snapshot
 }
 
 func (d *Driver) SubmitAuthCode(ctx context.Context, code string) error {
@@ -883,14 +914,28 @@ func classifyLogin(snapshot UISnapshot) (core.RuntimeState, string) {
 	if containsAny(text, "扫码登录", "微信登录", "手机号登录", "验证码", "登录企业微信", "scan to log in") {
 		return core.StateAuthRequired, "complete login in the official WeCom client"
 	}
+	if isWeComActivity(snapshot, weComLoginWxAuthActivity) {
+		return core.StateAuthRequired, "complete login in the official WeCom client"
+	}
+	if isWeComActivity(snapshot, weComLaunchActivity) {
+		return core.StateStarting, "waiting for the official WeCom login window"
+	}
 	if snapshot.PackageName == "" {
 		return core.StateStarting, "waiting for an accessibility window"
+	}
+	if snapshot.PackageName == DefaultWeComPackage && strings.TrimSpace(snapshot.WindowClass) == "" {
+		return core.StateDegraded, "official foreground activity is unavailable for safe classification"
 	}
 	return core.StateDegraded, "official client state is not recognized by this compatibility profile"
 }
 
+func isWeComActivity(snapshot UISnapshot, activity string) bool {
+	return snapshot.PackageName == DefaultWeComPackage &&
+		strings.EqualFold(strings.TrimSpace(snapshot.WindowClass), activity)
+}
+
 func classifySurfaceKind(snapshot UISnapshot) string {
-	classText := strings.ToLower(snapshot.WindowTitle + " " + snapshot.PackageName + " " + snapshotText(snapshot))
+	classText := strings.ToLower(snapshot.WindowTitle + " " + snapshot.WindowClass + " " + snapshot.PackageName + " " + snapshotText(snapshot))
 	if strings.Contains(classText, "小程序") || strings.Contains(classText, "miniprogram") {
 		return "miniprogram"
 	}

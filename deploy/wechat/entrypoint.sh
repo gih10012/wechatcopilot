@@ -6,8 +6,9 @@ export HOME=/home/wechat
 export DISPLAY="${WECHAT_DISPLAY:-:99}"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/wechatcopilot/runtime/xdg}"
 
-mkdir -p "$HOME" "$XDG_RUNTIME_DIR" /wechatcopilot/runtime/outbox
+mkdir -p "$HOME" "$XDG_RUNTIME_DIR" /wechatcopilot/runtime/outbox /tmp/.X11-unix
 chmod 0700 "$HOME" "$XDG_RUNTIME_DIR" /wechatcopilot/runtime/outbox
+chmod 1777 /tmp/.X11-unix
 
 Xvfb "$DISPLAY" -screen 0 1440x960x24 -nolisten tcp -noreset &
 

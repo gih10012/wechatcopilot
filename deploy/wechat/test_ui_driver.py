@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 def load_driver():
@@ -155,6 +156,14 @@ class TargetSelectionTests(unittest.TestCase):
             return callback()
         finally:
             driver.time.sleep = original
+
+    def test_official_appimage_name_counts_as_running(self):
+        cmdline = b"/opt/wechat/WeChat.AppImage\x00--no-sandbox\x00"
+        process = driver.Path("/proc/424242")
+        with mock.patch.object(driver.Path, "iterdir", return_value=[process]):
+            with mock.patch.object(driver.Path, "read_bytes", autospec=True, return_value=cmdline) as read_bytes:
+                self.assertTrue(driver.process_running())
+        read_bytes.assert_called_once_with(process / "cmdline")
 
     def test_duplicate_send_buttons_are_ambiguous_without_clicking(self):
         first = FakeNode("Send", "push button", (700, 700, 80, 30), actions=("click",))

@@ -2,6 +2,7 @@ package dev.wechatcopilot.companion
 
 import java.io.BufferedInputStream
 import java.io.ByteArrayInputStream
+import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -9,6 +10,32 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class ProtocolTest {
+    @Test
+    fun observedWindowClassIsBoundToTheCurrentPackageAndWindow() {
+        val activity = "com.tencent.wework.login.controller.LoginWxAuthActivity"
+        CompanionRuntime.observeWindow(activity, 7)
+        assertEquals(activity, CompanionRuntime.currentWindowClass(CompanionRuntime.WECOM_PACKAGE, 7))
+        assertEquals("", CompanionRuntime.currentWindowClass(CompanionRuntime.WECOM_PACKAGE, 8))
+        assertEquals("", CompanionRuntime.currentWindowClass("com.android.systemui", 7))
+        CompanionRuntime.observeWindow(activity, -1)
+        assertEquals("", CompanionRuntime.currentWindowClass(CompanionRuntime.WECOM_PACKAGE, -1))
+        CompanionRuntime.observeWindow("", 7)
+        assertEquals("", CompanionRuntime.currentWindowClass(CompanionRuntime.WECOM_PACKAGE, 7))
+    }
+
+    @Test
+    fun snapshotCarriesTheObservedWindowClass() {
+        val snapshot = UiSnapshotModel(
+            sequence = 7,
+            packageName = CompanionRuntime.WECOM_PACKAGE,
+            windowTitle = "",
+            windowClass = "com.tencent.wework.login.controller.LoginWxAuthActivity",
+            capturedAt = Instant.EPOCH,
+            nodes = emptyList(),
+        )
+        assertEquals("com.tencent.wework.login.controller.LoginWxAuthActivity", snapshot.windowClass)
+    }
+
     @Test
     fun tokenPolicyRequiresStrongUrlSafeToken() {
         assertTrue(TokenPolicy.isValid("abcdefghijklmnopqrstuvwxyzABCDEFGH0123456789"))

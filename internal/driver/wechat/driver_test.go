@@ -251,7 +251,7 @@ func TestDriverSurfaceRejectsHighRiskAndStaleActions(t *testing.T) {
 	}
 }
 
-func TestAuthSnapshotCropsQRCodeWithoutWritingIt(t *testing.T) {
+func TestAuthSnapshotPreservesCompleteScreenshotWhenQRBoundsAreInexact(t *testing.T) {
 	imageValue := image.NewRGBA(image.Rect(0, 0, 20, 20))
 	for y := 5; y < 15; y++ {
 		for x := 4; x < 14; x++ {
@@ -274,12 +274,15 @@ func TestAuthSnapshotCropsQRCodeWithoutWritingIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cropped, err := png.Decode(bytes.NewReader(snapshot.QRCodePNG))
+	complete, err := png.Decode(bytes.NewReader(snapshot.QRCodePNG))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cropped.Bounds().Dx() != 10 || cropped.Bounds().Dy() != 10 {
-		t.Fatalf("QR crop bounds = %v", cropped.Bounds())
+	if complete.Bounds() != imageValue.Bounds() {
+		t.Fatalf("QR image bounds = %v, want complete screenshot %v", complete.Bounds(), imageValue.Bounds())
+	}
+	if !bytes.Equal(snapshot.QRCodePNG, encoded.Bytes()) {
+		t.Fatal("QR image was altered using unreliable accessibility bounds")
 	}
 }
 

@@ -30,8 +30,10 @@ var (
 )
 
 const (
-	weComLoginWxAuthActivity = "com.tencent.wework.login.controller.LoginWxAuthActivity"
-	weComLaunchActivity      = "com.tencent.wework.launch.LaunchSplashActivity"
+	weComLoginWxAuthActivity  = "com.tencent.wework.login.controller.LoginWxAuthActivity"
+	weComSMSVerifyActivity    = "com.tencent.wework.login.controller.LoginVeryfyStep2Activity"
+	weComLaunchActivity       = "com.tencent.wework.launch.LaunchSplashActivity"
+	acceptPrivacyPolicyAction = "accept_privacy_policy"
 )
 
 type surfaceState struct {
@@ -59,6 +61,7 @@ type Driver struct {
 
 var _ core.Driver = (*Driver)(nil)
 var _ core.AccountPurger = (*Driver)(nil)
+var _ core.AuthActionDriver = (*Driver)(nil)
 
 func New(config Config, executor Executor) (*Driver, error) {
 	runtime, err := NewRuntime(config, executor)
@@ -312,10 +315,15 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (core.AuthSnapshot, error) {
 	state, prompt := classifyLogin(snapshot)
 	kind := core.AuthPhoneConfirm
 	canSubmit := false
+	actions := privacyConsentActions(snapshot)
+	if len(actions) != 0 {
+		state = core.StateAuthRequired
+		prompt = "Review and accept the official WeCom privacy policy to continue"
+	}
 	text := snapshotText(snapshot)
-	if state == core.StateAuthRequired && containsAny(text, "验证码", "verification code", "短信") {
+	if validSMSAuthSnapshot(snapshot) {
 		kind = core.AuthSMS
-		canSubmit = countEditable(snapshot) == 1
+		canSubmit = true
 	} else if state == core.StateAuthRequired && containsAny(text, "二维码", "扫码", "scan") {
 		kind = core.AuthQR
 	}
@@ -325,6 +333,7 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (core.AuthSnapshot, error) {
 		Prompt:        prompt,
 		ScreenshotPNG: png,
 		CanSubmitCode: canSubmit,
+		Actions:       actions,
 		ObservedAt:    time.Now().UTC(),
 	}
 	if kind == core.AuthQR {
@@ -333,6 +342,45 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (core.AuthSnapshot, error) {
 		result.QRCodePNG = png
 	}
 	return result, nil
+}
+
+func (d *Driver) PerformAuthAction(ctx context.Context, request core.AuthActionRequest) error {
+	if request.ActionID != acceptPrivacyPolicyAction {
+		return fmt.Errorf("%w: authentication action is not advertised", ErrStale)
+	}
+	if !request.Confirmed {
+		return fmt.Errorf("%w: privacy consent requires explicit user confirmation", ErrUserActionRequired)
+	}
+	d.operationMu.Lock()
+	defer d.operationMu.Unlock()
+	client, err := d.runtime.Companion()
+	if err != nil {
+		return err
+	}
+	snapshot, err := client.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	android, err := d.runtime.Android()
+	if err != nil {
+		return err
+	}
+	snapshot = withForegroundActivity(ctx, android, snapshot)
+	if snapshotRequiresUserAction(snapshot) {
+		return ErrUserActionRequired
+	}
+	target, err := uniquePrivacyConsentTarget(snapshot)
+	if err != nil {
+		return err
+	}
+	if _, err = client.Act(ctx, CompanionAction{
+		Kind:             ActionClick,
+		NodeID:           target.ID,
+		ExpectedSequence: snapshot.Sequence,
+	}); err != nil {
+		return err
+	}
+	return waitForPrivacyConsentDismissal(ctx, client, android, snapshot.Sequence)
 }
 
 func (d *Driver) withForegroundActivity(ctx context.Context, snapshot UISnapshot) UISnapshot {
@@ -379,10 +427,15 @@ func (d *Driver) SubmitAuthCode(ctx context.Context, code string) error {
 	if err != nil {
 		return err
 	}
-	editable := editableNodes(snapshot)
-	if len(editable) != 1 {
-		return fmt.Errorf("%w: expected one verification input, found %d", ErrTargetAmbiguous, len(editable))
+	android, err := d.runtime.Android()
+	if err != nil {
+		return err
 	}
+	snapshot = withForegroundActivity(ctx, android, snapshot)
+	if !validSMSAuthSnapshot(snapshot) {
+		return fmt.Errorf("%w: current official screen does not expose a unique SMS verification input", ErrStale)
+	}
+	editable := editableNodes(snapshot)
 	if _, err := client.Act(ctx, CompanionAction{Kind: ActionSetText, NodeID: editable[0].ID, Text: code, ExpectedSequence: snapshot.Sequence}); err != nil {
 		return err
 	}
@@ -390,8 +443,13 @@ func (d *Driver) SubmitAuthCode(ctx context.Context, code string) error {
 	if err != nil {
 		return err
 	}
+	updated = withForegroundActivity(ctx, android, updated)
+	if !validSMSAuthSnapshot(updated) {
+		return fmt.Errorf("%w: official SMS verification screen changed before submission", ErrStale)
+	}
 	button, err := uniqueNode(updated, func(node Node) bool {
-		return node.Clickable && matchesAny(nodeLabel(node), "确定", "登录", "下一步", "验证", "submit", "continue")
+		return node.Clickable && node.Enabled && node.VisibleToUser && usableBounds(node.Bounds) &&
+			matchesAny(nodeLabel(node), "确定", "登录", "下一步", "验证", "submit", "continue")
 	})
 	if err != nil {
 		return fmt.Errorf("submit verification code: %w", err)
@@ -900,6 +958,157 @@ func (d *Driver) updateSurface(ctx context.Context, id string, snapshot UISnapsh
 	return surface, nil
 }
 
+func privacyConsentActions(snapshot UISnapshot) []core.AuthAction {
+	if snapshotRequiresUserAction(snapshot) {
+		return nil
+	}
+	if _, err := uniquePrivacyConsentTarget(snapshot); err != nil {
+		return nil
+	}
+	return []core.AuthAction{{
+		ID:                   acceptPrivacyPolicyAction,
+		Label:                "同意企业微信隐私政策并继续",
+		Risk:                 "high",
+		Confirmation:         "请确认你已阅读官方企业微信客户端中显示的隐私政策，并同意后继续。",
+		RequiresConfirmation: true,
+	}}
+}
+
+func uniquePrivacyConsentTarget(snapshot UISnapshot) (Node, error) {
+	if !privacyConsentPage(snapshot) || snapshot.Sequence <= 0 {
+		return Node{}, fmt.Errorf("%w: official privacy consent screen is not active", ErrStale)
+	}
+	agree, err := uniqueVisibleLabelTarget(snapshot, "Agree", "同意")
+	if err != nil {
+		return Node{}, fmt.Errorf("privacy consent agree target: %w", err)
+	}
+	disagree, err := uniqueVisibleLabelTarget(snapshot, "Disagree", "不同意")
+	if err != nil {
+		return Node{}, fmt.Errorf("privacy consent disagree target: %w", err)
+	}
+	if agree.ID == disagree.ID {
+		return Node{}, fmt.Errorf("%w: privacy consent choices share one clickable target", ErrTargetAmbiguous)
+	}
+	return agree, nil
+}
+
+func uniqueVisibleLabelTarget(snapshot UISnapshot, labels ...string) (Node, error) {
+	byID := make(map[string]Node, len(snapshot.Nodes))
+	for _, node := range snapshot.Nodes {
+		byID[node.ID] = node
+	}
+	candidates := make(map[string]Node)
+	for _, node := range snapshot.Nodes {
+		if node.ID == "" || !node.VisibleToUser || !matchesAny(nodeLabel(node), labels...) {
+			continue
+		}
+		current := node
+		for depth := 0; depth <= len(snapshot.Nodes); depth++ {
+			if current.Enabled && current.Clickable && current.VisibleToUser && usableBounds(current.Bounds) {
+				candidates[current.ID] = current
+				break
+			}
+			if current.ParentID == "" {
+				break
+			}
+			parent, ok := byID[current.ParentID]
+			if !ok || parent.ID == current.ID {
+				break
+			}
+			current = parent
+		}
+	}
+	if len(candidates) == 0 {
+		return Node{}, fmt.Errorf("%w: matching visible clickable target is unavailable", ErrStale)
+	}
+	if len(candidates) != 1 {
+		return Node{}, fmt.Errorf("%w: multiple matching visible clickable targets", ErrTargetAmbiguous)
+	}
+	for _, candidate := range candidates {
+		return candidate, nil
+	}
+	return Node{}, fmt.Errorf("%w: matching visible clickable target is unavailable", ErrStale)
+}
+
+func privacyConsentPage(snapshot UISnapshot) bool {
+	if snapshot.PackageName != DefaultWeComPackage ||
+		(!isWeComActivity(snapshot, weComLoginWxAuthActivity) && !isWeComActivity(snapshot, weComLaunchActivity)) {
+		return false
+	}
+	return privacyConsentMarkers(snapshot)
+}
+
+func privacyConsentMarkers(snapshot UISnapshot) bool {
+	text := visibleSnapshotText(snapshot)
+	english := containsAny(text, "privacy policy") && containsAny(text, "welcome to wecom")
+	chinese := containsAny(text, "隐私政策") && containsAny(text, "欢迎使用企业微信")
+	return english || chinese
+}
+
+func visibleSnapshotText(snapshot UISnapshot) string {
+	var builder strings.Builder
+	builder.WriteString(snapshot.WindowTitle)
+	for _, node := range snapshot.Nodes {
+		if !node.VisibleToUser {
+			continue
+		}
+		builder.WriteByte('\n')
+		builder.WriteString(node.Text)
+		builder.WriteByte(' ')
+		builder.WriteString(node.ContentDescription)
+	}
+	return strings.ToLower(builder.String())
+}
+
+func waitForPrivacyConsentDismissal(ctx context.Context, client *CompanionClient, android AndroidContainer, previous int64) error {
+	deadline := time.Now().Add(10 * time.Second)
+	changed := false
+	dismissedObservations := 0
+	for {
+		snapshot, err := client.Snapshot(ctx)
+		if err == nil {
+			if snapshot.Sequence > previous {
+				changed = true
+			}
+			if changed {
+				snapshot = withForegroundActivity(ctx, android, snapshot)
+				activity := strings.TrimSpace(snapshot.WindowClass)
+				if snapshot.PackageName == DefaultWeComPackage && strings.HasPrefix(activity, DefaultWeComPackage+".") {
+					if snapshotRequiresUserAction(snapshot) {
+						return ErrUserActionRequired
+					}
+					if privacyConsentMarkers(snapshot) {
+						dismissedObservations = 0
+					} else {
+						dismissedObservations++
+						if dismissedObservations >= 2 {
+							return nil
+						}
+					}
+				} else {
+					dismissedObservations = 0
+				}
+			}
+		} else {
+			dismissedObservations = 0
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: privacy consent screen did not close", ErrStale)
+		}
+		timer := time.NewTimer(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func usableBounds(bounds Bounds) bool {
+	return bounds.Right > bounds.Left && bounds.Bottom > bounds.Top && bounds.Right > 0 && bounds.Bottom > 0
+}
+
 func classifyLogin(snapshot UISnapshot) (core.RuntimeState, string) {
 	text := snapshotText(snapshot)
 	bottomNav := 0
@@ -911,10 +1120,10 @@ func classifyLogin(snapshot UISnapshot) (core.RuntimeState, string) {
 	if snapshot.PackageName == DefaultWeComPackage && bottomNav >= 2 {
 		return core.StateOnline, ""
 	}
-	if containsAny(text, "扫码登录", "微信登录", "手机号登录", "验证码", "登录企业微信", "scan to log in") {
+	if isWeComActivity(snapshot, weComLoginWxAuthActivity) {
 		return core.StateAuthRequired, "complete login in the official WeCom client"
 	}
-	if isWeComActivity(snapshot, weComLoginWxAuthActivity) {
+	if isWeComActivity(snapshot, weComSMSVerifyActivity) {
 		return core.StateAuthRequired, "complete login in the official WeCom client"
 	}
 	if isWeComActivity(snapshot, weComLaunchActivity) {
@@ -961,6 +1170,20 @@ func countEditable(snapshot UISnapshot) int { return len(editableNodes(snapshot)
 
 func editableNodes(snapshot UISnapshot) []Node {
 	return matchingNodes(snapshot, func(node Node) bool { return node.Editable && node.Enabled })
+}
+
+func validSMSAuthSnapshot(snapshot UISnapshot) bool {
+	if snapshot.PackageName != DefaultWeComPackage ||
+		!isWeComActivity(snapshot, weComSMSVerifyActivity) ||
+		snapshot.Sequence <= 0 || snapshotRequiresUserAction(snapshot) {
+		return false
+	}
+	state, _ := classifyLogin(snapshot)
+	if state != core.StateAuthRequired || !containsAny(visibleSnapshotText(snapshot), "验证码", "verification code", "短信") {
+		return false
+	}
+	editable := editableNodes(snapshot)
+	return len(editable) == 1 && editable[0].VisibleToUser && usableBounds(editable[0].Bounds)
 }
 
 func uniqueNode(snapshot UISnapshot, match func(Node) bool) (Node, error) {

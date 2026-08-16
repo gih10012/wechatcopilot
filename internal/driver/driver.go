@@ -109,7 +109,23 @@ type AuthSnapshot struct {
 	QRCodePNG     []byte       `json:"-"`
 	ScreenshotPNG []byte       `json:"-"`
 	CanSubmitCode bool         `json:"can_submit_code"`
+	Actions       []AuthAction `json:"actions,omitempty"`
 	ObservedAt    time.Time    `json:"observed_at"`
+}
+
+// AuthAction is a narrowly advertised operation on the current official login
+// screen. It never carries coordinates or a backend node identifier.
+type AuthAction struct {
+	ID                   string `json:"id"`
+	Label                string `json:"label"`
+	Risk                 string `json:"risk,omitempty"`
+	Confirmation         string `json:"confirmation,omitempty"`
+	RequiresConfirmation bool   `json:"requires_confirmation,omitempty"`
+}
+
+type AuthActionRequest struct {
+	ActionID  string
+	Confirmed bool
 }
 
 type Conversation struct {
@@ -221,6 +237,13 @@ type Driver interface {
 	SnapshotSurface(context.Context, string) (Surface, error)
 	ActSurface(context.Context, string, SurfaceAction) (Surface, error)
 	CloseSurface(context.Context, string) error
+}
+
+// AuthActionDriver is deliberately separate from Driver. Only a user-held,
+// one-time login page may invoke these tightly scoped onboarding operations;
+// they are not part of the daemon API, CLI, or MCP surface.
+type AuthActionDriver interface {
+	PerformAuthAction(context.Context, AuthActionRequest) error
 }
 
 type Factory func(AccountRuntime) (Driver, error)

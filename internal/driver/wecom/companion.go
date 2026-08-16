@@ -36,6 +36,7 @@ type Node struct {
 	Scrollable         bool   `json:"scrollable"`
 	Enabled            bool   `json:"enabled"`
 	Focused            bool   `json:"focused"`
+	VisibleToUser      bool   `json:"visible_to_user"`
 }
 
 type UISnapshot struct {

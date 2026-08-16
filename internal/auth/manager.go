@@ -13,6 +13,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -50,15 +51,20 @@ type Challenge struct {
 }
 
 type entry struct {
-	mu       sync.Mutex
-	public   Challenge
-	token    string
-	driver   driver.Driver
-	server   *http.Server
-	listener net.Listener
-	attempts int
-	closed   bool
-	done     chan struct{}
+	mu               sync.Mutex
+	public           Challenge
+	token            string
+	driver           driver.Driver
+	server           *http.Server
+	listener         net.Listener
+	codeAttempts     int
+	codeInFlight     bool
+	codeSubmitted    bool
+	actionAttempts   int
+	actionInFlight   bool
+	performedActions map[string]bool
+	closed           bool
+	done             chan struct{}
 }
 
 type Manager struct {
@@ -121,12 +127,16 @@ func (m *Manager) Begin(ctx context.Context, accountID string, instance driver.D
 		LinkQRPath: qrPath, State: snapshot.State, Kind: snapshot.Kind, Prompt: snapshot.Prompt,
 		ExpiresAt: time.Now().UTC().Add(challengeTTL),
 	}
-	item := &entry{public: public, token: token, driver: instance, listener: listener, done: make(chan struct{})}
+	item := &entry{
+		public: public, token: token, driver: instance, listener: listener,
+		performedActions: make(map[string]bool), done: make(chan struct{}),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, item.handlePage)
 	mux.HandleFunc(path+"/state", item.handleState)
 	mux.HandleFunc(path+"/image", item.handleImage)
 	mux.HandleFunc(path+"/submit", item.handleSubmit)
+	mux.HandleFunc(path+"/action", item.handleAction)
 	item.server = &http.Server{
 		Handler:           securityHeaders(mux),
 		ReadHeaderTimeout: 5 * time.Second,
@@ -280,8 +290,17 @@ func (e *entry) handleState(w http.ResponseWriter, r *http.Request) {
 	e.public.Kind = snapshot.Kind
 	e.public.Prompt = snapshot.Prompt
 	data := e.public
+	canSubmitCode := snapshot.CanSubmitCode && !e.codeInFlight && !e.codeSubmitted
 	e.mu.Unlock()
-	writeJSON(w, data)
+	writeJSON(w, struct {
+		Challenge
+		CanSubmitCode bool                `json:"can_submit_code"`
+		Actions       []driver.AuthAction `json:"actions,omitempty"`
+		ObservedAt    time.Time           `json:"observed_at"`
+	}{
+		Challenge: data, CanSubmitCode: canSubmitCode,
+		Actions: snapshot.Actions, ObservedAt: snapshot.ObservedAt,
+	})
 }
 
 func (e *entry) handleImage(w http.ResponseWriter, r *http.Request) {
@@ -301,6 +320,13 @@ func (e *entry) handleImage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "driver unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	if snapshot.State == driver.StateOnline {
+		e.mu.Lock()
+		e.public.State = driver.StateOnline
+		e.mu.Unlock()
+		http.Error(w, "login image is no longer available", http.StatusGone)
+		return
+	}
 	image := snapshot.QRCodePNG
 	if len(image) == 0 {
 		image = snapshot.ScreenshotPNG
@@ -318,6 +344,10 @@ func (e *entry) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	if !sameOriginJSONRequest(r, "X-WeChatCopilot-Code", "user-entered") {
+		http.Error(w, "cross-origin verification submission rejected", http.StatusForbidden)
+		return
+	}
 	var body struct {
 		Code string `json:"code"`
 	}
@@ -326,6 +356,10 @@ func (e *entry) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := e.submitCode(r.Context(), body.Code); err != nil {
+		if errors.Is(err, errCodeInFlight) || errors.Is(err, errCodeAlreadySubmitted) {
+			http.Error(w, "verification submission is unavailable", http.StatusConflict)
+			return
+		}
 		if errors.Is(err, errTooManyAttempts) {
 			http.Error(w, "too many attempts", http.StatusTooManyRequests)
 			return
@@ -340,9 +374,61 @@ func (e *entry) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"accepted": true})
 }
 
-var errTooManyAttempts = errors.New("too many verification attempts")
+func (e *entry) handleAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !sameOriginJSONRequest(r, "X-WeChatCopilot-Action", "user-confirmed") {
+		http.Error(w, "cross-origin authentication action rejected", http.StatusForbidden)
+		return
+	}
+	var body struct {
+		ActionID  string `json:"action_id"`
+		Confirmed bool   `json:"confirmed"`
+	}
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 4096))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&body); err != nil || strings.TrimSpace(body.ActionID) == "" {
+		http.Error(w, "invalid authentication action", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid authentication action", http.StatusBadRequest)
+		return
+	}
+	if err := e.performAuthAction(r.Context(), body.ActionID, body.Confirmed); err != nil {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			http.Error(w, "authentication challenge expired or completed", http.StatusGone)
+		case errors.Is(err, errTooManyActionAttempts):
+			http.Error(w, "too many action attempts", http.StatusTooManyRequests)
+		case errors.Is(err, errActionInFlight):
+			http.Error(w, "authentication action already in progress", http.StatusConflict)
+		case errors.Is(err, errConfirmationRequired):
+			http.Error(w, "explicit confirmation is required", http.StatusBadRequest)
+		default:
+			http.Error(w, "authentication action is unavailable", http.StatusConflict)
+		}
+		return
+	}
+	writeJSON(w, map[string]bool{"accepted": true})
+}
 
-func (e *entry) submitCode(ctx context.Context, code string) error {
+var (
+	errTooManyAttempts      = errors.New("too many verification attempts")
+	errCodeInFlight         = errors.New("verification submission is already in progress")
+	errCodeAlreadySubmitted = errors.New("verification code was already submitted for this challenge")
+)
+
+var (
+	errTooManyActionAttempts = errors.New("too many authentication action attempts")
+	errActionInFlight        = errors.New("authentication action is already in progress")
+	errConfirmationRequired  = errors.New("explicit user confirmation is required")
+	errActionUnavailable     = errors.New("authentication action is unavailable")
+)
+
+func (e *entry) submitCode(ctx context.Context, code string) (err error) {
 	if !verificationCodePattern.MatchString(code) {
 		return errors.New("invalid verification code")
 	}
@@ -351,13 +437,112 @@ func (e *entry) submitCode(ctx context.Context, code string) error {
 		e.mu.Unlock()
 		return os.ErrNotExist
 	}
-	e.attempts++
-	attempts := e.attempts
-	e.mu.Unlock()
+	if e.codeInFlight {
+		e.mu.Unlock()
+		return errCodeInFlight
+	}
+	if e.codeSubmitted {
+		e.mu.Unlock()
+		return errCodeAlreadySubmitted
+	}
+	e.codeAttempts++
+	attempts := e.codeAttempts
 	if attempts > 8 {
+		e.mu.Unlock()
 		return errTooManyAttempts
 	}
+	e.codeInFlight = true
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		e.codeInFlight = false
+		if err == nil {
+			e.codeSubmitted = true
+		}
+		e.mu.Unlock()
+	}()
+
+	snapshot, err := e.driver.AuthSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if snapshot.State != driver.StateAuthRequired || snapshot.Kind != driver.AuthSMS || !snapshot.CanSubmitCode {
+		return errors.New("verification code input is not available on the current official login screen")
+	}
 	return e.driver.SubmitAuthCode(ctx, code)
+}
+
+func (e *entry) performAuthAction(ctx context.Context, actionID string, confirmed bool) (err error) {
+	actionID = strings.TrimSpace(actionID)
+	e.mu.Lock()
+	if e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.public.CompletedAt != nil || e.public.State == driver.StateOnline {
+		e.mu.Unlock()
+		return os.ErrNotExist
+	}
+	if e.actionInFlight {
+		e.mu.Unlock()
+		return errActionInFlight
+	}
+	if e.performedActions[actionID] {
+		e.mu.Unlock()
+		return errActionUnavailable
+	}
+	e.actionAttempts++
+	if e.actionAttempts > 4 {
+		e.mu.Unlock()
+		return errTooManyActionAttempts
+	}
+	e.actionInFlight = true
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		e.actionInFlight = false
+		if err == nil {
+			if e.performedActions == nil {
+				e.performedActions = make(map[string]bool)
+			}
+			e.performedActions[actionID] = true
+		}
+		e.mu.Unlock()
+	}()
+
+	snapshot, err := e.driver.AuthSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if snapshot.State == driver.StateOnline {
+		return os.ErrNotExist
+	}
+	var advertised *driver.AuthAction
+	for index := range snapshot.Actions {
+		if snapshot.Actions[index].ID != actionID {
+			continue
+		}
+		if advertised != nil {
+			return errActionUnavailable
+		}
+		advertised = &snapshot.Actions[index]
+	}
+	if advertised == nil {
+		return errActionUnavailable
+	}
+	if !confirmed {
+		return errConfirmationRequired
+	}
+	actor, ok := e.driver.(driver.AuthActionDriver)
+	if !ok {
+		return errActionUnavailable
+	}
+	return actor.PerformAuthAction(ctx, driver.AuthActionRequest{ActionID: actionID, Confirmed: confirmed})
+}
+
+func sameOriginJSONRequest(r *http.Request, markerHeader, markerValue string) bool {
+	mediaType := strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0])
+	if !strings.EqualFold(mediaType, "application/json") || r.Header.Get(markerHeader) != markerValue {
+		return false
+	}
+	origin, err := url.Parse(r.Header.Get("Origin"))
+	return err == nil && origin.Scheme == "http" && origin.Host == r.Host && origin.Path == "" && origin.RawQuery == "" && origin.Fragment == ""
 }
 
 func (e *entry) close() {
@@ -594,7 +779,90 @@ func writeJSON(w http.ResponseWriter, value any) {
 var pageTemplate = template.Must(template.New("auth").Parse(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>wechatcopilot login</title><style>
-:root{color-scheme:light;background:#f2efe8;color:#17211d;font-family:ui-sans-serif,system-ui,sans-serif}body{margin:0;display:grid;min-height:100vh;place-items:center}.card{width:min(92vw,520px);background:#fff;border:1px solid #d7d1c5;border-radius:20px;padding:28px;box-shadow:0 20px 60px #263a3020}h1{margin:0 0 8px;font-size:26px}p{color:#59645f}.screen{display:block;width:min(100%,420px);max-height:460px;object-fit:contain;margin:20px auto;border-radius:12px;background:#e7e4dc}form{display:flex;gap:10px}input,button{font:inherit;padding:12px;border-radius:10px;border:1px solid #b8beb9}input{flex:1}button{background:#087f5b;color:#fff;border:0;font-weight:700}.meta{font-family:ui-monospace,monospace;font-size:12px}</style></head>
-<body><main class="card"><h1>完成账号登录</h1><p id="prompt">{{.Prompt}}</p><img class="screen" src="{{.BasePath}}/image" alt="Login QR or client screen" onerror="this.style.display='none'">
-<form id="code"><input name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="手机验证码"><button>提交</button></form><p class="meta">Challenge {{.ID}} · 页面只在当前登录挑战期间有效</p></main>
-<script>const base=location.pathname;const prompt=document.querySelector('#prompt');const form=document.querySelector('#code');const poll=setInterval(async()=>{const r=await fetch(base+'/state',{cache:'no-store'});if(r.ok){const x=await r.json();prompt.textContent=x.prompt||x.state;if(x.state==='ONLINE'){clearInterval(poll);prompt.textContent='登录完成，可以关闭此页面';form.hidden=true}}},1500);form.addEventListener('submit',async e=>{e.preventDefault();const code=new FormData(e.target).get('code');const r=await fetch(base+'/submit',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({code})});prompt.textContent=r.ok?'验证码已提交，请在手机上完成确认':'验证码无效或已过期'});</script></body></html>`))
+:root{color-scheme:light;background:#f2efe8;color:#17211d;font-family:ui-sans-serif,system-ui,sans-serif}*{box-sizing:border-box}body{margin:0;display:grid;min-height:100vh;place-items:center;padding:16px}.card{width:min(100%,576px);background:#fff;border:1px solid #d7d1c5;border-radius:20px;padding:28px;box-shadow:0 20px 60px #263a3020}h1{margin:0 0 8px;font-size:26px}p{color:#59645f}.screen-link{display:flex;width:100%;max-width:420px;max-height:70vh;margin:20px auto;border-radius:12px;background:#e7e4dc}.screen{display:block;width:auto;height:auto;max-width:100%;max-height:70vh;object-fit:contain;margin:auto;border-radius:12px}.actions{display:grid;gap:10px;margin:14px 0}.actions p{margin:0;font-size:13px}.auth-action{background:#9a5b00}form{display:flex;gap:10px}input,button{font:inherit;padding:12px;border-radius:10px;border:1px solid #b8beb9}input{min-width:0;flex:1}button{background:#087f5b;color:#fff;border:0;font-weight:700;cursor:pointer}button:disabled{cursor:wait;opacity:.6}[hidden]{display:none!important}@media(max-width:420px){.card{padding:20px}form{flex-wrap:wrap}button{width:100%}}.meta{font-family:ui-monospace,monospace;font-size:12px;overflow-wrap:anywhere}</style></head>
+<body><main class="card"><h1>完成账号登录</h1><p id="prompt">{{.Prompt}}</p><a class="screen-link" href="{{.BasePath}}/image" target="_blank" rel="noopener" aria-label="Open login image at full size"><img class="screen" src="{{.BasePath}}/image" alt="Login QR or client screen"></a>
+<section id="actions" class="actions" hidden><p>以下操作必须由你本人明确确认：</p><div id="action-buttons"></div></section>
+<form id="code" hidden><input name="code" inputmode="numeric" autocomplete="one-time-code" placeholder="手机验证码"><button>提交</button></form><p class="meta">Challenge {{.ID}} · 页面只在当前登录挑战期间有效</p></main>
+<script>
+const base=location.pathname;
+const prompt=document.querySelector('#prompt');
+const form=document.querySelector('#code');
+const codeButton=form.querySelector('button');
+const actions=document.querySelector('#actions');
+const actionButtons=document.querySelector('#action-buttons');
+let screen=document.querySelector('.screen');
+const screenLink=document.querySelector('.screen-link');
+let actionSignature='';
+let imageRefreshes=0;
+let imageGeneration=0;
+let uiGeneration=0;
+let stateInFlight=false;
+let pollTimer=0;
+let completed=false;
+function refreshImage(){
+  if(completed)return;
+  const generation=++imageGeneration;
+  const source=base+'/image?v='+Date.now();
+  const candidate=new Image();
+  candidate.className='screen';
+  candidate.alt=screen.alt;
+  candidate.onload=()=>{if(completed||generation!==imageGeneration)return;screen.replaceWith(candidate);screen=candidate;screenLink.href=source;screenLink.hidden=false};
+  candidate.onerror=()=>{};
+  candidate.src=source;
+}
+function scheduleState(delay=1500){if(completed)return;clearTimeout(pollTimer);pollTimer=setTimeout(refreshState,delay)}
+async function performAction(action,button){
+  if(action.requires_confirmation&&!window.confirm(action.confirmation||'请确认后继续。'))return;
+  const generation=++uiGeneration;
+  button.disabled=true;
+  try{
+    const response=await fetch(base+'/action',{method:'POST',headers:{'content-type':'application/json','X-WeChatCopilot-Action':'user-confirmed'},body:JSON.stringify({action_id:action.id,confirmed:true})});
+    if(completed||generation!==uiGeneration)return;
+    prompt.textContent=response.ok?'操作已提交，正在刷新官方客户端画面':'操作不可用；请确认页面未变化后重试';
+    if(response.ok){actionSignature='';refreshImage();scheduleState(0)}else{button.disabled=false}
+  }catch(_error){if(!completed&&generation===uiGeneration){prompt.textContent='无法连接登录服务，请稍后重试';button.disabled=false;scheduleState(0)}}
+}
+function renderActions(values){
+  const available=Array.isArray(values)?values:[];
+  const signature=JSON.stringify(available);
+  if(signature===actionSignature)return;
+  actionSignature=signature;
+  actionButtons.replaceChildren();
+  for(const action of available){const button=document.createElement('button');button.type='button';button.className='auth-action';button.textContent=action.label;button.addEventListener('click',()=>performAction(action,button));actionButtons.append(button)}
+  actions.hidden=available.length===0;
+}
+async function refreshState(){
+  if(completed||stateInFlight)return;
+  stateInFlight=true;
+  const generation=uiGeneration;
+  try{
+    const response=await fetch(base+'/state',{cache:'no-store'});
+    if(!response.ok||completed||generation!==uiGeneration)return;
+    const state=await response.json();
+    if(completed||generation!==uiGeneration)return;
+    if(state.state==='ONLINE'){
+      completed=true;
+      imageGeneration++;
+      clearTimeout(pollTimer);
+      prompt.textContent='登录完成，可以关闭此页面';
+      form.hidden=true;
+      renderActions([]);
+      screenLink.hidden=true;
+      return;
+    }
+    prompt.textContent=state.prompt||state.state;
+    form.hidden=!state.can_submit_code;
+    codeButton.disabled=!state.can_submit_code;
+    renderActions(state.actions);
+    imageRefreshes++;
+    if(imageRefreshes%3===0)refreshImage();
+  }catch(_error){
+    if(!completed&&generation===uiGeneration)prompt.textContent='登录服务暂时不可用，正在重试';
+  }finally{
+    stateInFlight=false;
+    scheduleState();
+  }
+}
+form.addEventListener('submit',async event=>{event.preventDefault();if(codeButton.disabled)return;const generation=++uiGeneration;const code=new FormData(event.target).get('code');codeButton.disabled=true;try{const response=await fetch(base+'/submit',{method:'POST',headers:{'content-type':'application/json','X-WeChatCopilot-Code':'user-entered'},body:JSON.stringify({code})});if(completed||generation!==uiGeneration)return;prompt.textContent=response.ok?'验证码已提交，请在手机上完成确认':'验证码无效、当前页面不接受验证码或挑战已过期';if(response.ok){form.hidden=true}else{codeButton.disabled=false}}catch(_error){if(!completed&&generation===uiGeneration){prompt.textContent='无法提交验证码，请稍后重试';codeButton.disabled=false}}finally{scheduleState(0)}});
+refreshState();
+</script></body></html>`))

@@ -12,7 +12,7 @@ Do not place the server behind a public remote MCP gateway. MCP does not carry v
 
 Tools are grouped around accounts, capabilities, conversations, messages, send transactions, and webpage/mini-program surfaces. Inspect the running server's tool schemas rather than assuming a development snapshot.
 
-All account-scoped tools require an opaque `account_id` when more than one account exists. Message tools use opaque `conversation_id` and `message_id` values. Open a message-backed surface with that message's separate opaque `surface_ref`; do not substitute its `message_id`. Surface actions use a short-lived semantic `action_id` from the most recent snapshot.
+All account-scoped tools always require an exact opaque `account_id`, including when only one account exists. Message tools use opaque `conversation_id` and `message_id` values. Open a message-backed surface with that message's separate opaque `surface_ref`; do not substitute its `message_id`. Surface actions use a short-lived semantic `action_id` from the most recent snapshot.
 
 Read tools return provenance, completeness, and confidence. Consumers must preserve these fields when they affect interpretation.
 

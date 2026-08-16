@@ -119,8 +119,10 @@ output contains a one-time bearer URL:
 The login command prints a one-time loopback URL. Use `--lan` only on a trusted
 private network when the page must be opened from another device; an optional
 `--lan-address` must be an RFC1918 address actually assigned to an eligible
-local interface. QR images and verification codes stay outside MCP and model
-context.
+local interface. The page shows the complete official-client image and
+conditionally offers only the current SMS input or a narrowly allowlisted,
+user-confirmed onboarding consent. QR images, verification codes, and those
+consent actions stay outside MCP and model context.
 
 After login, inspect real support before an operation:
 

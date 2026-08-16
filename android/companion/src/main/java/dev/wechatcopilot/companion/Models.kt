@@ -31,6 +31,7 @@ internal data class UiNodeModel(
     val scrollable: Boolean,
     val enabled: Boolean,
     val focused: Boolean,
+    val visibleToUser: Boolean,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("id", id)
@@ -45,6 +46,7 @@ internal data class UiNodeModel(
         .put("scrollable", scrollable)
         .put("enabled", enabled)
         .put("focused", focused)
+        .put("visible_to_user", visibleToUser)
 }
 
 internal data class UiSnapshotModel(

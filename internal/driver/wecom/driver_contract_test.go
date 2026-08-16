@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -87,6 +88,7 @@ func TestClassifyLoginUsesObservedWeComWindowClass(t *testing.T) {
 		want        core.RuntimeState
 	}{
 		{name: "login", windowClass: weComLoginWxAuthActivity, want: core.StateAuthRequired},
+		{name: "sms verification", windowClass: weComSMSVerifyActivity, want: core.StateAuthRequired},
 		{name: "splash", windowClass: weComLaunchActivity, want: core.StateStarting},
 		{name: "post-login scanner", windowClass: "com.tencent.wework.login.controller.LoginScannerActivity", want: core.StateDegraded},
 		{name: "gesture settings", windowClass: "com.tencent.wework.login.controller.SettingGestureActivity", want: core.StateDegraded},
@@ -99,6 +101,225 @@ func TestClassifyLoginUsesObservedWeComWindowClass(t *testing.T) {
 				t.Fatalf("classifyLogin(%q) = %s, want %s", test.windowClass, state, test.want)
 			}
 		})
+	}
+
+	chat := UISnapshot{
+		Sequence:    32,
+		PackageName: DefaultWeComPackage,
+		WindowClass: "com.tencent.wework.msg.controller.ConversationActivity",
+		Nodes: []Node{
+			{ID: "0/0", Text: "你的短信验证码是 123456", VisibleToUser: true},
+			{ID: "0/1", Editable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 100, Right: 300, Bottom: 160}},
+		},
+	}
+	if validSMSAuthSnapshot(chat) {
+		t.Fatal("post-login chat text was accepted as an SMS authentication screen")
+	}
+	state, _ := classifyLogin(chat)
+	if state == core.StateAuthRequired {
+		t.Fatal("post-login chat text was classified as authentication required")
+	}
+}
+
+func TestPrivacyConsentActionRequiresExactOfficialScreenAndUniqueTarget(t *testing.T) {
+	base := UISnapshot{
+		Sequence: 17, PackageName: DefaultWeComPackage, WindowClass: weComLoginWxAuthActivity,
+		Nodes: []Node{
+			{ID: "0/0", Text: "Privacy Policy", Enabled: true, VisibleToUser: true},
+			{ID: "0/1", Text: "Welcome to WeCom!", Enabled: true, VisibleToUser: true},
+			{ID: "0/2", Text: "Agree", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 10, Top: 10, Right: 100, Bottom: 50}},
+			{ID: "0/3", Text: "Disagree", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 10, Top: 60, Right: 100, Bottom: 100}},
+		},
+	}
+	actions := privacyConsentActions(base)
+	if len(actions) != 1 || actions[0].ID != acceptPrivacyPolicyAction || !actions[0].RequiresConfirmation || actions[0].Risk != "high" {
+		t.Fatalf("privacy actions = %#v", actions)
+	}
+
+	chinese := base
+	chinese.WindowClass = weComLaunchActivity
+	chinese.Nodes = []Node{
+		{ID: "0/0", Text: "隐私政策", Enabled: true, VisibleToUser: true},
+		{ID: "0/1", Text: "欢迎使用企业微信", Enabled: true, VisibleToUser: true},
+		{ID: "0/2", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 10, Top: 10, Right: 100, Bottom: 50}},
+		{ID: "0/2/0", ParentID: "0/2", Text: "同意", Enabled: true, VisibleToUser: true},
+		{ID: "0/3", Text: "不同意", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 10, Top: 60, Right: 100, Bottom: 100}},
+	}
+	target, err := uniquePrivacyConsentTarget(chinese)
+	if err != nil || target.ID != "0/2" {
+		t.Fatalf("nested Chinese consent target = %#v err=%v", target, err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*UISnapshot)
+	}{
+		{name: "wrong package", mutate: func(value *UISnapshot) { value.PackageName = "example.invalid" }},
+		{name: "unapproved activity", mutate: func(value *UISnapshot) { value.WindowClass = "com.tencent.wework.settings.SettingsActivity" }},
+		{name: "missing welcome marker", mutate: func(value *UISnapshot) { value.Nodes[1].Text = "" }},
+		{name: "hidden privacy marker", mutate: func(value *UISnapshot) { value.Nodes[0].VisibleToUser = false }},
+		{name: "missing disagree control", mutate: func(value *UISnapshot) { value.Nodes[3].Text = "" }},
+		{name: "disabled disagree control", mutate: func(value *UISnapshot) { value.Nodes[3].Enabled = false }},
+		{name: "hidden disagree control", mutate: func(value *UISnapshot) { value.Nodes[3].VisibleToUser = false }},
+		{name: "offscreen disagree control", mutate: func(value *UISnapshot) { value.Nodes[3].Bounds = Bounds{} }},
+		{name: "zero sequence", mutate: func(value *UISnapshot) { value.Sequence = 0 }},
+		{name: "disabled button", mutate: func(value *UISnapshot) { value.Nodes[2].Enabled = false }},
+		{name: "hidden button", mutate: func(value *UISnapshot) { value.Nodes[2].VisibleToUser = false }},
+		{name: "negative offscreen button", mutate: func(value *UISnapshot) {
+			value.Nodes[2].Bounds = Bounds{Left: -100, Top: -50, Right: -10, Bottom: -5}
+		}},
+		{name: "offscreen button", mutate: func(value *UISnapshot) { value.Nodes[2].Bounds = Bounds{} }},
+		{name: "device verification overlay", mutate: func(value *UISnapshot) {
+			value.Nodes = append(value.Nodes, Node{ID: "0/4", Text: "Device verification", Enabled: true})
+		}},
+		{name: "ambiguous buttons", mutate: func(value *UISnapshot) {
+			value.Nodes = append(value.Nodes, Node{ID: "0/4", Text: "Agree", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 110, Top: 10, Right: 200, Bottom: 50}})
+		}},
+		{name: "ambiguous disagree controls", mutate: func(value *UISnapshot) {
+			value.Nodes = append(value.Nodes, Node{ID: "0/4", Text: "Disagree", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 110, Top: 60, Right: 200, Bottom: 100}})
+		}},
+		{name: "shared clickable branch", mutate: func(value *UISnapshot) {
+			value.Nodes[2] = Node{ID: "0/4/0", ParentID: "0/4", Text: "Agree", Enabled: true, VisibleToUser: true}
+			value.Nodes[3] = Node{ID: "0/4/1", ParentID: "0/4", Text: "Disagree", Enabled: true, VisibleToUser: true}
+			value.Nodes = append(value.Nodes, Node{ID: "0/4", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 10, Top: 10, Right: 200, Bottom: 100}})
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := base
+			value.Nodes = append([]Node(nil), base.Nodes...)
+			test.mutate(&value)
+			if actions := privacyConsentActions(value); len(actions) != 0 {
+				t.Fatalf("unsafe screen advertised actions: %#v", actions)
+			}
+		})
+	}
+}
+
+func TestSMSAuthInputRequiresFreshVisibleOfficialLoginScreen(t *testing.T) {
+	base := UISnapshot{
+		Sequence:    31,
+		PackageName: DefaultWeComPackage,
+		WindowClass: "com.tencent.wework.login.controller.LoginVeryfyStep2Activity",
+		Nodes: []Node{
+			{ID: "0/0", Text: "Verification code", Enabled: true, VisibleToUser: true},
+			{ID: "0/1", Editable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 100, Right: 300, Bottom: 160}},
+		},
+	}
+	if !validSMSAuthSnapshot(base) {
+		t.Fatal("valid official SMS screen was rejected")
+	}
+	tests := []struct {
+		name   string
+		mutate func(*UISnapshot)
+	}{
+		{name: "wrong package", mutate: func(value *UISnapshot) { value.PackageName = "example.invalid" }},
+		{name: "missing authoritative activity", mutate: func(value *UISnapshot) { value.WindowClass = "" }},
+		{name: "wrong activity package", mutate: func(value *UISnapshot) { value.WindowClass = "com.android.settings.Settings" }},
+		{name: "missing code marker", mutate: func(value *UISnapshot) { value.Nodes[0].Text = "Enter value" }},
+		{name: "hidden code marker", mutate: func(value *UISnapshot) { value.Nodes[0].VisibleToUser = false }},
+		{name: "hidden input", mutate: func(value *UISnapshot) { value.Nodes[1].VisibleToUser = false }},
+		{name: "offscreen input", mutate: func(value *UISnapshot) { value.Nodes[1].Bounds = Bounds{} }},
+		{name: "multiple inputs", mutate: func(value *UISnapshot) {
+			value.Nodes = append(value.Nodes, Node{ID: "0/2", Editable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 180, Right: 300, Bottom: 240}})
+		}},
+		{name: "risk warning", mutate: func(value *UISnapshot) {
+			value.Nodes = append(value.Nodes, Node{ID: "0/2", Text: "Device verification", VisibleToUser: true})
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := base
+			value.Nodes = append([]Node(nil), base.Nodes...)
+			test.mutate(&value)
+			if validSMSAuthSnapshot(value) {
+				t.Fatal("unsafe SMS screen was accepted")
+			}
+		})
+	}
+}
+
+func TestPerformPrivacyConsentUsesFreshSemanticTargetAndConfirmation(t *testing.T) {
+	const token = "abcdefghijklmnopqrstuvwxyzABCDEFGH0123456789"
+	snapshot := UISnapshot{
+		Sequence: 23, PackageName: DefaultWeComPackage, WindowClass: weComLoginWxAuthActivity,
+		Nodes: []Node{
+			{ID: "0/0", Text: "Privacy Policy", Enabled: true, VisibleToUser: true},
+			{ID: "0/1", Text: "Welcome to WeCom!", Enabled: true, VisibleToUser: true},
+			{ID: "0/2", Text: "Agree", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 10, Top: 10, Right: 100, Bottom: 50}},
+			{ID: "0/3", Text: "Disagree", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 10, Top: 60, Right: 100, Bottom: 100}},
+		},
+	}
+	actions := make(chan CompanionAction, 1)
+	var sequence atomic.Int64
+	var acted atomic.Bool
+	var readsAfterAction atomic.Int32
+	sequence.Store(snapshot.Sequence)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/v1/snapshot":
+			current := snapshot
+			current.Sequence = sequence.Load()
+			if acted.Load() {
+				read := readsAfterAction.Add(1)
+				if read >= 2 {
+					current.Sequence = snapshot.Sequence + 2
+					current.Nodes = []Node{{ID: "0/0", Text: "Log in to WeCom", Enabled: true, VisibleToUser: true}}
+				}
+			}
+			_ = json.NewEncoder(writer).Encode(current)
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/actions":
+			var action CompanionAction
+			if err := json.NewDecoder(request.Body).Decode(&action); err != nil {
+				http.Error(writer, "bad action", http.StatusBadRequest)
+				return
+			}
+			actions <- action
+			sequence.Store(snapshot.Sequence + 1)
+			acted.Store(true)
+			_ = json.NewEncoder(writer).Encode(ActionResult{Accepted: true, Sequence: snapshot.Sequence + 1})
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	client, err := newCompanionClientForURL(server.URL, token, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &Runtime{
+		config: DefaultConfig(), companion: client, running: true,
+		android: AndroidContainer{
+			DockerBinary: "docker", Container: "synthetic",
+			Executor: functionExecutor(func(context.Context, string, ...string) ([]byte, error) {
+				return []byte("topResumedActivity=ActivityRecord{x u0 " + DefaultWeComPackage + "/.login.controller.LoginWxAuthActivity}\n"), nil
+			}),
+			Verify: func(context.Context) error { return nil },
+		},
+	}
+	driverInstance := &Driver{runtime: runtime, surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo)}
+	if err := driverInstance.PerformAuthAction(context.Background(), core.AuthActionRequest{ActionID: acceptPrivacyPolicyAction}); !errors.Is(err, ErrUserActionRequired) {
+		t.Fatalf("unconfirmed consent error = %v", err)
+	}
+	select {
+	case action := <-actions:
+		t.Fatalf("unconfirmed consent reached companion: %#v", action)
+	default:
+	}
+	if err := driverInstance.PerformAuthAction(context.Background(), core.AuthActionRequest{ActionID: acceptPrivacyPolicyAction, Confirmed: true}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case action := <-actions:
+		if action.Kind != ActionClick || action.NodeID != "0/2" || action.ExpectedSequence != snapshot.Sequence || action.Text != "" {
+			t.Fatalf("privacy action = %#v", action)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("confirmed consent did not reach companion")
+	}
+	if readsAfterAction.Load() < 3 {
+		t.Fatalf("consent returned before observing stable modal dismissal: reads=%d", readsAfterAction.Load())
 	}
 }
 

@@ -74,11 +74,12 @@ class WeComAccessibilityService : AccessibilityService() {
         val node = findNode(action.nodeId)
             ?: return ActionResult(false, CompanionRuntime.currentSequence(), "semantic node is stale or missing")
         val accepted = when (action.kind) {
-            "click" -> node.isEnabled && node.isClickable && node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            "click" -> node.isVisibleToUser && node.isEnabled && node.isClickable &&
+                node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             "set_text" -> setText(node, action.text)
-            "scroll_forward" -> node.isEnabled && node.isScrollable &&
+            "scroll_forward" -> node.isVisibleToUser && node.isEnabled && node.isScrollable &&
                 node.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
-            "scroll_backward" -> node.isEnabled && node.isScrollable &&
+            "scroll_backward" -> node.isVisibleToUser && node.isEnabled && node.isScrollable &&
                 node.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD)
             else -> false
         }
@@ -90,7 +91,7 @@ class WeComAccessibilityService : AccessibilityService() {
     }
 
     private fun setText(node: AccessibilityNodeInfo, text: String): Boolean {
-        if (!node.isEnabled || !node.isEditable || text.length > 32 * 1024) return false
+        if (!node.isVisibleToUser || !node.isEnabled || !node.isEditable || text.length > 32 * 1024) return false
         val arguments = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
@@ -133,6 +134,7 @@ class WeComAccessibilityService : AccessibilityService() {
                 scrollable = node.isScrollable,
                 enabled = node.isEnabled,
                 focused = node.isFocused,
+                visibleToUser = node.isVisibleToUser,
             ),
         )
         for (index in 0 until node.childCount) {

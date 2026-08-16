@@ -46,6 +46,8 @@ Localhost is the default. Private-LAN access requires an explicit `--lan` reques
 
 Each challenge uses at least 96 random bits, expires within ten minutes, and succeeds once. The server limits attempts, uses `Cache-Control: no-store`, and serves no external resources. A completed result remains available for about 60 seconds so the user can observe success; the listener then closes. It is not a VNC console and provides no raw input controls.
 
+The page may advertise a fixed, high-risk onboarding action such as accepting the privacy policy displayed by the official WeCom client. Only that bearer-scoped page can invoke it, and only after the user confirms it there. Before clicking, the driver rechecks the official package, an allowlisted foreground Activity, multiple page markers, one exact semantic target, and the current accessibility sequence. The action exposes neither coordinates nor node IDs and is absent from the daemon API, CLI, and MCP. Verification-code submission is likewise accepted only while the current official screen advertises one SMS input. Account-risk and device-verification screens never expose an onboarding action.
+
 The one-time URL is a bearer secret. Run `accounts login` and every low-level `auth` command yourself in a separate trusted terminal; never invoke them through an agent tool or ask an agent to capture their input or output. Do not paste the URL into an agent conversation, public terminal transcript, or third-party URL scanner. Use a trusted private network; the LAN page is not intended to be exposed through port forwarding, a reverse proxy, or the public Internet.
 
 ## Agent write policy

@@ -15,7 +15,7 @@ The MCP server delegates to the same local daemon and policy layer as the CLI. I
 - Message tools read history, poll incrementally, prepare a send, and commit an authorized send.
 - Surface tools open a message's opaque `surface_ref`, snapshot, act on current semantic actions (including an offered back action), and close webpage or mini-program surfaces. Never pass `message_id` as the reference; prepare sharing through the send transaction tools.
 
-Tool names and schemas are discoverable from the running server. Prefer discovery over hard-coding a tool revision. Every account-scoped tool requires `account_id` when multiple accounts exist.
+Tool names and schemas are discoverable from the running server. Prefer discovery over hard-coding a tool revision. Every account-scoped tool always requires an exact `account_id`, even when only one account exists.
 
 For a bounded initial history read, call `messages_list` with `latest:true` and a limit. The daemon applies the message filters, selects the newest matching window, and returns that window in ascending local sequence order. Do not combine latest mode with a nonzero `after_sequence`; the daemon rejects that ambiguous request. Without latest mode, `after_sequence` reads forward from the cursor.
 

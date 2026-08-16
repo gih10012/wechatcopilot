@@ -23,11 +23,11 @@ Create an annotated `vMAJOR.MINOR.PATCH` tag only from the reviewed `main` commi
 
 The workflow publishes:
 
-- Linux amd64 and arm64 `wechatcopilot` archives, each including the installable `wechatcopilot` Skill.
+- Linux amd64 and arm64 `wechatcopilot` archives, each including the installable `wechatcopilot` Skill, complete operator documentation, the project-owned WeChat runtime build context, and the encrypted-state provisioning script.
 - A signed project-owned Android companion APK.
 - SPDX JSON SBOM, SHA-256 checksums, and GitHub build-provenance attestations.
 - MIT and third-party dependency notices inside each Go archive.
 
-The workflow constructs archives from an explicit allowlist and rejects an unexpected filename or archive member. It does not build or publish an image containing WeChat or WeCom. Runtime base images and official clients remain operator-side inputs pinned by digest or SHA-256.
+The workflow constructs archives from an explicit allowlist and rejects an unexpected filename, archive member, member type, or duplicate path. It does not build or publish an image containing WeChat or WeCom. Runtime base images and official clients remain operator-side inputs pinned by digest or SHA-256.
 
 After publication, download the release into a clean directory, verify checksums and attestations, inspect the APK signing certificate, and perform a fresh install smoke test before announcing compatibility.

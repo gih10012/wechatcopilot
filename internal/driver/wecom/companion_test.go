@@ -18,6 +18,7 @@ func TestCompanionClientAuthenticatesAndDecodesSnapshot(t *testing.T) {
 		_ = json.NewEncoder(writer).Encode(UISnapshot{
 			Sequence: 7, PackageName: DefaultWeComPackage,
 			WindowClass: "com.tencent.wework.login.controller.LoginWxAuthActivity",
+			Nodes:       []Node{{ID: "0/1", Text: "Agree", VisibleToUser: true}},
 		})
 	}))
 	defer server.Close()
@@ -30,7 +31,8 @@ func TestCompanionClientAuthenticatesAndDecodesSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if snapshot.Sequence != 7 || snapshot.PackageName != DefaultWeComPackage ||
-		snapshot.WindowClass != "com.tencent.wework.login.controller.LoginWxAuthActivity" {
+		snapshot.WindowClass != "com.tencent.wework.login.controller.LoginWxAuthActivity" ||
+		len(snapshot.Nodes) != 1 || !snapshot.Nodes[0].VisibleToUser {
 		t.Fatalf("unexpected snapshot: %+v", snapshot)
 	}
 }

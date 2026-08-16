@@ -37,6 +37,28 @@ class ProtocolTest {
     }
 
     @Test
+    fun nodeProtocolCarriesVisibilityToTheHost() {
+        val node = UiNodeModel(
+            id = "0/1",
+            parentId = "0",
+            className = "android.widget.Button",
+            viewId = "",
+            text = "Agree",
+            contentDescription = "",
+            bounds = BoundsModel(10, 20, 100, 60),
+            clickable = true,
+            editable = false,
+            scrollable = false,
+            enabled = true,
+            focused = false,
+            visibleToUser = true,
+        )
+        // android.jar's JSONObject is a stub in local JVM tests; Go protocol tests
+        // cover the serialized field name and decoding.
+        assertTrue(node.visibleToUser)
+    }
+
+    @Test
     fun tokenPolicyRequiresStrongUrlSafeToken() {
         assertTrue(TokenPolicy.isValid("abcdefghijklmnopqrstuvwxyzABCDEFGH0123456789"))
         assertFalse(TokenPolicy.isValid("short"))

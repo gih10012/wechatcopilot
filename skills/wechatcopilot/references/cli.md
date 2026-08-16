@@ -30,7 +30,7 @@ wechatcopilot accounts login --account ACCOUNT_ID --wait
 wechatcopilot accounts login --account ACCOUNT_ID --lan --lan-address RFC1918_IP --wait
 ```
 
-The user must open the one-time URL and complete the challenge directly. Do not pass a verification code in an argument or environment variable.
+The user must open the one-time URL and complete the challenge directly. The page may require the user to explicitly confirm a narrowly allowlisted official-client onboarding consent; an agent must never click it or call its private page endpoint. Do not pass a verification code in an argument or environment variable.
 
 Omit `--lan` for loopback-only login. With `--lan`, omit `--lan-address` to prefer the default-route interface or provide an exact RFC1918 IPv4 assigned to an eligible local interface. Never use a public, wildcard, loopback, container-bridge, or unassigned address.
 

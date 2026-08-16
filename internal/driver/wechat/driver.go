@@ -3,15 +3,12 @@
 package wechat
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"image"
-	"image/png"
 	"io"
 	"io/fs"
 	"os"
@@ -219,12 +216,10 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (shared.AuthSnapshot, error) 
 	}
 	var qrCode []byte
 	if probe.State == shared.StateAuthRequired && (probe.AuthKind == "" || probe.AuthKind == shared.AuthQR) {
+		// Accessibility bounds identify a likely QR node, but they are not a
+		// reliable pixel boundary. Keep the complete screenshot so scaled or
+		// overflowing QR rendering is never clipped at the reported node edge.
 		qrCode = screenshot
-	}
-	if len(qrCode) > 0 && probe.QRBounds != nil {
-		if cropped, cropErr := cropPNG(screenshot, *probe.QRBounds); cropErr == nil {
-			qrCode = cropped
-		}
 	}
 	kind := probe.AuthKind
 	if kind == "" {
@@ -670,31 +665,6 @@ func sanitizeFilename(value string) string {
 		return "attachment"
 	}
 	return value
-}
-
-func cropPNG(data []byte, rectangle Rectangle) ([]byte, error) {
-	imageValue, err := png.Decode(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	if rectangle.Width <= 0 || rectangle.Height <= 0 {
-		return nil, errors.New("invalid QR bounds")
-	}
-	bounds := image.Rect(rectangle.X, rectangle.Y, rectangle.X+rectangle.Width, rectangle.Y+rectangle.Height).Intersect(imageValue.Bounds())
-	if bounds.Empty() {
-		return nil, errors.New("QR bounds are outside screenshot")
-	}
-	cropped := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
-	for y := 0; y < bounds.Dy(); y++ {
-		for x := 0; x < bounds.Dx(); x++ {
-			cropped.Set(x, y, imageValue.At(bounds.Min.X+x, bounds.Min.Y+y))
-		}
-	}
-	var output bytes.Buffer
-	if err := png.Encode(&output, cropped); err != nil {
-		return nil, err
-	}
-	return output.Bytes(), nil
 }
 
 func randomOpaqueID(prefix string) (string, error) {

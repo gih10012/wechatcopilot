@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -217,6 +219,234 @@ func TestChallengeAuthActionRequiresSameOriginExplicitConfirmationAndCannotRepla
 		t.Fatalf("replayed action status=%d calls=%d", response.StatusCode, driverInstance.actions.Load())
 	}
 	_ = response.Body.Close()
+}
+
+func TestChallengeAuthActionsRunSequentiallyAndRejectSuccessfulReplay(t *testing.T) {
+	driverInstance := &sequentialAuthActionDriver{Driver: fake.New(driver.PlatformWeCom)}
+	item := newAuthActionEntry(driverInstance)
+
+	if err := item.performAuthAction(context.Background(), "accept_login_agreements", true); err != nil {
+		t.Fatalf("perform first action: %v", err)
+	}
+	if err := item.performAuthAction(context.Background(), "accept_login_agreements", true); !errors.Is(err, errActionUnavailable) {
+		t.Fatalf("replayed first action error = %v, want unavailable", err)
+	}
+	if err := item.performAuthAction(context.Background(), "continue_with_wechat", true); err != nil {
+		t.Fatalf("perform second action: %v", err)
+	}
+	if err := item.performAuthAction(context.Background(), "continue_with_wechat", true); !errors.Is(err, errActionUnavailable) {
+		t.Fatalf("replayed second action error = %v, want unavailable", err)
+	}
+
+	calls := driverInstance.actionCalls()
+	if fmt.Sprint(calls) != "[accept_login_agreements continue_with_wechat]" {
+		t.Fatalf("driver action calls = %v", calls)
+	}
+	if item.totalActionAttempts != 2 || item.actionAttempts["accept_login_agreements"] != 1 || item.actionAttempts["continue_with_wechat"] != 1 {
+		t.Fatalf("action attempt accounting = total %d per-action %#v", item.totalActionAttempts, item.actionAttempts)
+	}
+}
+
+func TestChallengeAuthActionsSerializeDifferentIDsAndHideInflightControls(t *testing.T) {
+	base := &sequentialAuthActionDriver{Driver: fake.New(driver.PlatformWeCom)}
+	driverInstance := &blockingSequentialAuthActionDriver{
+		sequentialAuthActionDriver: base,
+		started:                    make(chan struct{}),
+		release:                    make(chan struct{}),
+	}
+	item := newAuthActionEntry(driverInstance)
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- item.performAuthAction(context.Background(), "accept_login_agreements", true)
+	}()
+	select {
+	case <-driverInstance.started:
+	case <-time.After(time.Second):
+		close(driverInstance.release)
+		t.Fatal("first action did not reach the driver")
+	}
+
+	state := readChallengeState(t, item)
+	if state.CanSubmitCode || len(state.Actions) != 0 {
+		close(driverInstance.release)
+		t.Fatalf("in-flight state exposed controls: %#v", state)
+	}
+	if err := item.performAuthAction(context.Background(), "continue_with_wechat", true); !errors.Is(err, errActionInFlight) {
+		close(driverInstance.release)
+		t.Fatalf("concurrent second action error = %v, want in-flight", err)
+	}
+
+	close(driverInstance.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first action: %v", err)
+	}
+	if err := item.performAuthAction(context.Background(), "continue_with_wechat", true); err != nil {
+		t.Fatalf("sequential second action: %v", err)
+	}
+	if calls := driverInstance.actionCalls(); fmt.Sprint(calls) != "[accept_login_agreements continue_with_wechat]" {
+		t.Fatalf("serialized driver action calls = %v", calls)
+	}
+}
+
+func TestConsumedAuthActionErrorPreservesCauseAndRejectsReplay(t *testing.T) {
+	postconditionErr := errors.New("post-action verification timed out")
+	driverInstance := &fixedAuthActionDriver{
+		Driver:  fake.New(driver.PlatformWeCom),
+		actions: []driver.AuthAction{{ID: "accept_login_agreements", Label: "accept"}},
+		results: map[string][]error{
+			"accept_login_agreements": {fmt.Errorf("verify accepted action: %w", driver.MarkAuthActionConsumed(postconditionErr))},
+		},
+	}
+	item := newAuthActionEntry(driverInstance)
+
+	err := item.performAuthAction(context.Background(), "accept_login_agreements", true)
+	if !errors.Is(err, postconditionErr) || !driver.AuthActionWasConsumed(err) {
+		t.Fatalf("consumed error = %v, cause/consumed marker was lost", err)
+	}
+	if err := item.performAuthAction(context.Background(), "accept_login_agreements", true); !errors.Is(err, errActionUnavailable) {
+		t.Fatalf("uncertain action replay error = %v, want unavailable", err)
+	}
+	if calls := driverInstance.callCount("accept_login_agreements"); calls != 1 {
+		t.Fatalf("consumed action reached driver %d times", calls)
+	}
+	state := readChallengeState(t, item)
+	if len(state.Actions) != 0 {
+		t.Fatalf("consumed action was advertised again: %#v", state.Actions)
+	}
+}
+
+func TestAuthActionAttemptsCountOnlyFreshAdvertisedDispatches(t *testing.T) {
+	dispatchErr := errors.New("driver rejected before dispatch")
+	driverInstance := &fixedAuthActionDriver{
+		Driver: fake.New(driver.PlatformWeCom),
+		actions: []driver.AuthAction{
+			{ID: "action-a", Label: "A"},
+			{ID: "action-b", Label: "B"},
+		},
+		results: map[string][]error{
+			"action-a": {dispatchErr, dispatchErr},
+		},
+	}
+	item := newAuthActionEntry(driverInstance)
+
+	if err := item.performAuthAction(context.Background(), "action-a", false); !errors.Is(err, errConfirmationRequired) {
+		t.Fatalf("unconfirmed action error = %v", err)
+	}
+	if err := item.performAuthAction(context.Background(), "not-advertised", true); !errors.Is(err, errActionUnavailable) {
+		t.Fatalf("unadvertised action error = %v", err)
+	}
+	if item.totalActionAttempts != 0 {
+		t.Fatalf("non-dispatched requests consumed %d attempts", item.totalActionAttempts)
+	}
+	for attempt := 0; attempt < maxAuthActionAttemptsPerAction; attempt++ {
+		if err := item.performAuthAction(context.Background(), "action-a", true); !errors.Is(err, dispatchErr) {
+			t.Fatalf("action-a attempt %d error = %v", attempt+1, err)
+		}
+	}
+	if err := item.performAuthAction(context.Background(), "action-a", true); !errors.Is(err, errTooManyActionAttempts) {
+		t.Fatalf("action-a over-limit error = %v", err)
+	}
+	state := readChallengeState(t, item)
+	if len(state.Actions) != 1 || state.Actions[0].ID != "action-b" {
+		t.Fatalf("per-action limit did not filter exhausted action: %#v", state.Actions)
+	}
+	if err := item.performAuthAction(context.Background(), "action-b", true); err != nil {
+		t.Fatalf("action-b was starved by action-a failures: %v", err)
+	}
+	if item.totalActionAttempts != maxAuthActionAttemptsPerAction+1 || driverInstance.callCount("action-a") != maxAuthActionAttemptsPerAction {
+		t.Fatalf("dispatch accounting = total %d action-a calls %d", item.totalActionAttempts, driverInstance.callCount("action-a"))
+	}
+}
+
+func TestAuthActionTotalAttemptLimitBoundsDistinctFailures(t *testing.T) {
+	actions := make([]driver.AuthAction, 0, maxAuthActionAttemptsPerChallenge+1)
+	results := make(map[string][]error, maxAuthActionAttemptsPerChallenge+1)
+	for index := 0; index <= maxAuthActionAttemptsPerChallenge; index++ {
+		id := fmt.Sprintf("action-%d", index)
+		actions = append(actions, driver.AuthAction{ID: id, Label: id})
+		results[id] = []error{errors.New("synthetic dispatch failure")}
+	}
+	driverInstance := &fixedAuthActionDriver{Driver: fake.New(driver.PlatformWeCom), actions: actions, results: results}
+	item := newAuthActionEntry(driverInstance)
+	for index := 0; index < maxAuthActionAttemptsPerChallenge; index++ {
+		if err := item.performAuthAction(context.Background(), fmt.Sprintf("action-%d", index), true); err == nil || errors.Is(err, errTooManyActionAttempts) {
+			t.Fatalf("bounded failure %d = %v", index, err)
+		}
+	}
+	if err := item.performAuthAction(context.Background(), fmt.Sprintf("action-%d", maxAuthActionAttemptsPerChallenge), true); !errors.Is(err, errTooManyActionAttempts) {
+		t.Fatalf("total over-limit error = %v", err)
+	}
+	if item.totalActionAttempts != maxAuthActionAttemptsPerChallenge {
+		t.Fatalf("total action attempts = %d", item.totalActionAttempts)
+	}
+	state := readChallengeState(t, item)
+	if len(state.Actions) != 0 {
+		t.Fatalf("total attempt limit still advertised actions: %#v", state.Actions)
+	}
+}
+
+func TestChallengeStateLatchesOnlineAndNeverReexposesControls(t *testing.T) {
+	driverInstance := &mutableAuthStateDriver{
+		Driver: fake.New(driver.PlatformWeCom),
+		snapshot: driver.AuthSnapshot{
+			State: driver.StateOnline, Kind: driver.AuthSMS, CanSubmitCode: true,
+			Actions: []driver.AuthAction{{ID: "stale-action", Label: "stale"}}, ObservedAt: time.Now().UTC(),
+		},
+	}
+	item := newAuthActionEntry(driverInstance)
+	state := readChallengeState(t, item)
+	if state.State != driver.StateOnline || state.CompletedAt == nil || state.CanSubmitCode || len(state.Actions) != 0 {
+		t.Fatalf("online state was not terminal: %#v", state)
+	}
+
+	driverInstance.setSnapshot(driver.AuthSnapshot{
+		State: driver.StateAuthRequired, Kind: driver.AuthSMS, CanSubmitCode: true,
+		Actions: []driver.AuthAction{{ID: "stale-action", Label: "stale"}}, ObservedAt: time.Now().UTC(),
+	})
+	state = readChallengeState(t, item)
+	if state.State != driver.StateOnline || state.CompletedAt == nil || state.CanSubmitCode || len(state.Actions) != 0 {
+		t.Fatalf("terminal state regressed after stale snapshot: %#v", state)
+	}
+	if calls := driverInstance.snapshotCalls.Load(); calls != 1 {
+		t.Fatalf("terminal state queried driver again: calls=%d", calls)
+	}
+}
+
+func TestDelayedStateSnapshotCannotOverwriteConcurrentCompletion(t *testing.T) {
+	driverInstance := &delayedAuthStateDriver{
+		Driver:  fake.New(driver.PlatformWeCom),
+		started: make(chan struct{}), release: make(chan struct{}),
+	}
+	item := newAuthActionEntry(driverInstance)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		item.handleState(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/state", nil))
+		close(done)
+	}()
+	select {
+	case <-driverInstance.started:
+	case <-time.After(time.Second):
+		close(driverInstance.release)
+		t.Fatal("state request did not reach delayed snapshot")
+	}
+	item.mu.Lock()
+	item.markCompletedLocked(time.Now().UTC())
+	item.mu.Unlock()
+	close(driverInstance.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("delayed state request did not finish")
+	}
+
+	var state challengeStatePayload
+	if err := json.Unmarshal(response.Body.Bytes(), &state); err != nil {
+		t.Fatalf("decode delayed state: %v body=%q", err, response.Body.String())
+	}
+	if state.State != driver.StateOnline || state.CompletedAt == nil || state.CanSubmitCode || len(state.Actions) != 0 {
+		t.Fatalf("delayed snapshot regressed completion: %#v", state)
+	}
 }
 
 func TestVerificationCodeRequiresCurrentAdvertisedSMSInput(t *testing.T) {
@@ -517,4 +747,176 @@ func performActionRequest(t *testing.T, challengeURL string, confirmed bool) *ht
 		t.Fatal(err)
 	}
 	return response
+}
+
+type challengeStatePayload struct {
+	Challenge
+	CanSubmitCode bool                `json:"can_submit_code"`
+	Actions       []driver.AuthAction `json:"actions"`
+}
+
+func newAuthActionEntry(instance driver.Driver) *entry {
+	return &entry{
+		public: Challenge{
+			State: driver.StateAuthRequired, ExpiresAt: time.Now().UTC().Add(time.Minute),
+		},
+		driver: instance, actionAttempts: make(map[string]int), performedActions: make(map[string]bool),
+	}
+}
+
+func readChallengeState(t *testing.T, item *entry) challengeStatePayload {
+	t.Helper()
+	response := httptest.NewRecorder()
+	item.handleState(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/state", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("state status=%d body=%q", response.Code, response.Body.String())
+	}
+	var state challengeStatePayload
+	if err := json.Unmarshal(response.Body.Bytes(), &state); err != nil {
+		t.Fatalf("decode state: %v body=%q", err, response.Body.String())
+	}
+	return state
+}
+
+type sequentialAuthActionDriver struct {
+	*fake.Driver
+	mu    sync.Mutex
+	phase int
+	calls []string
+}
+
+func (d *sequentialAuthActionDriver) AuthSnapshot(context.Context) (driver.AuthSnapshot, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	actions := []driver.AuthAction(nil)
+	switch d.phase {
+	case 0:
+		actions = []driver.AuthAction{{ID: "accept_login_agreements", Label: "accept"}}
+	case 1:
+		actions = []driver.AuthAction{{ID: "continue_with_wechat", Label: "continue"}}
+	}
+	return driver.AuthSnapshot{
+		State: driver.StateAuthRequired, Kind: driver.AuthPhoneConfirm,
+		Actions: actions, ObservedAt: time.Now().UTC(),
+	}, nil
+}
+
+func (d *sequentialAuthActionDriver) PerformAuthAction(_ context.Context, request driver.AuthActionRequest) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	want := ""
+	switch d.phase {
+	case 0:
+		want = "accept_login_agreements"
+	case 1:
+		want = "continue_with_wechat"
+	}
+	if !request.Confirmed || request.ActionID != want {
+		return errors.New("unexpected authentication action")
+	}
+	d.calls = append(d.calls, request.ActionID)
+	d.phase++
+	return nil
+}
+
+func (d *sequentialAuthActionDriver) actionCalls() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.calls...)
+}
+
+type blockingSequentialAuthActionDriver struct {
+	*sequentialAuthActionDriver
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (d *blockingSequentialAuthActionDriver) PerformAuthAction(ctx context.Context, request driver.AuthActionRequest) error {
+	if request.ActionID == "accept_login_agreements" {
+		d.once.Do(func() { close(d.started) })
+		select {
+		case <-d.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return d.sequentialAuthActionDriver.PerformAuthAction(ctx, request)
+}
+
+type fixedAuthActionDriver struct {
+	*fake.Driver
+	mu      sync.Mutex
+	actions []driver.AuthAction
+	results map[string][]error
+	calls   map[string]int
+}
+
+func (d *fixedAuthActionDriver) AuthSnapshot(context.Context) (driver.AuthSnapshot, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return driver.AuthSnapshot{
+		State: driver.StateAuthRequired, Kind: driver.AuthPhoneConfirm,
+		Actions: append([]driver.AuthAction(nil), d.actions...), ObservedAt: time.Now().UTC(),
+	}, nil
+}
+
+func (d *fixedAuthActionDriver) PerformAuthAction(_ context.Context, request driver.AuthActionRequest) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.calls == nil {
+		d.calls = make(map[string]int)
+	}
+	index := d.calls[request.ActionID]
+	d.calls[request.ActionID] = index + 1
+	if values := d.results[request.ActionID]; index < len(values) {
+		return values[index]
+	}
+	return nil
+}
+
+func (d *fixedAuthActionDriver) callCount(actionID string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.calls[actionID]
+}
+
+type mutableAuthStateDriver struct {
+	*fake.Driver
+	mu            sync.Mutex
+	snapshot      driver.AuthSnapshot
+	snapshotCalls atomic.Int32
+}
+
+func (d *mutableAuthStateDriver) AuthSnapshot(context.Context) (driver.AuthSnapshot, error) {
+	d.snapshotCalls.Add(1)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.snapshot, nil
+}
+
+func (d *mutableAuthStateDriver) setSnapshot(snapshot driver.AuthSnapshot) {
+	d.mu.Lock()
+	d.snapshot = snapshot
+	d.mu.Unlock()
+}
+
+type delayedAuthStateDriver struct {
+	*fake.Driver
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (d *delayedAuthStateDriver) AuthSnapshot(ctx context.Context) (driver.AuthSnapshot, error) {
+	d.once.Do(func() { close(d.started) })
+	select {
+	case <-d.release:
+	case <-ctx.Done():
+		return driver.AuthSnapshot{}, ctx.Err()
+	}
+	return driver.AuthSnapshot{
+		State: driver.StateAuthRequired, Kind: driver.AuthSMS, CanSubmitCode: true,
+		Actions: []driver.AuthAction{{ID: "stale-action", Label: "stale"}}, ObservedAt: time.Now().UTC(),
+	}, nil
 }

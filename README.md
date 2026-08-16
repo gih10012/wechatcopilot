@@ -121,8 +121,9 @@ private network when the page must be opened from another device; an optional
 `--lan-address` must be an RFC1918 address actually assigned to an eligible
 local interface. The page shows the complete official-client image and
 conditionally offers only the current SMS input or a narrowly allowlisted,
-user-confirmed onboarding consent. QR images, verification codes, and those
-consent actions stay outside MCP and model context.
+user-confirmed onboarding action. Multi-step WeCom onboarding advertises only
+one freshly validated confirmation at a time. QR images, verification codes,
+and those actions stay outside MCP and model context.
 
 After login, inspect real support before an operation:
 

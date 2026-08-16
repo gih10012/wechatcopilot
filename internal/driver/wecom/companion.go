@@ -10,9 +10,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,6 +34,8 @@ type Node struct {
 	ContentDescription string `json:"content_description,omitempty"`
 	Bounds             Bounds `json:"bounds"`
 	Clickable          bool   `json:"clickable"`
+	Checkable          bool   `json:"checkable"`
+	Checked            bool   `json:"checked"`
 	Editable           bool   `json:"editable"`
 	Scrollable         bool   `json:"scrollable"`
 	Enabled            bool   `json:"enabled"`
@@ -76,6 +80,7 @@ type CompanionAction struct {
 
 const (
 	ActionClick            = "click"
+	ActionCheck            = "check"
 	ActionSetText          = "set_text"
 	ActionScrollForward    = "scroll_forward"
 	ActionScrollBackward   = "scroll_backward"
@@ -88,6 +93,11 @@ type ActionResult struct {
 	Sequence int64  `json:"sequence"`
 	Detail   string `json:"detail,omitempty"`
 }
+
+// ErrActionOutcomeUncertain means the companion may have executed an action,
+// but no explicit, decodable acceptance result reached the daemon. Retrying
+// such an action could repeat or reverse a user-confirmed operation.
+var ErrActionOutcomeUncertain = errors.New("companion action outcome is uncertain")
 
 type CompanionClient struct {
 	baseURL string
@@ -162,6 +172,11 @@ func (t *containerRoundTripper) RoundTrip(request *http.Request) (*http.Response
 	if wire.Len() > 128<<10 {
 		return nil, errors.New("companion wire request exceeds 128 KiB")
 	}
+	if trace := httptrace.ContextClientTrace(request.Context()); trace != nil && trace.WroteRequest != nil {
+		// The opaque container invocation may deliver the request even when it
+		// later returns no response, so report dispatch before entering it.
+		trace.WroteRequest(httptrace.WroteRequestInfo{})
+	}
 	rawResponse, err := t.android.CompanionRequest(request.Context(), t.devicePort, wire.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("execute companion request inside Redroid: %w", err)
@@ -210,9 +225,35 @@ func (c *CompanionClient) Act(ctx context.Context, action CompanionAction) (Acti
 	if err := validateCompanionAction(action); err != nil {
 		return ActionResult{}, err
 	}
-	var result ActionResult
-	err := c.request(ctx, http.MethodPost, "/v1/actions", action, &result)
-	if err == nil && !result.Accepted {
+	var requestWritten atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			// Even a partial-write error cannot prove that the small action body
+			// was not delivered and acted on.
+			requestWritten.Store(true)
+		},
+	})
+	var wireResult struct {
+		Accepted *bool  `json:"accepted"`
+		Sequence int64  `json:"sequence"`
+		Detail   string `json:"detail,omitempty"`
+	}
+	err := c.request(ctx, http.MethodPost, "/v1/actions", action, &wireResult)
+	if err != nil {
+		if requestWritten.Load() {
+			return ActionResult{}, fmt.Errorf("%w: %w", ErrActionOutcomeUncertain, err)
+		}
+		return ActionResult{}, err
+	}
+	if wireResult.Accepted == nil {
+		return ActionResult{}, fmt.Errorf("%w: companion response omitted accepted", ErrActionOutcomeUncertain)
+	}
+	result := ActionResult{
+		Accepted: *wireResult.Accepted,
+		Sequence: wireResult.Sequence,
+		Detail:   wireResult.Detail,
+	}
+	if !result.Accepted {
 		if containsAny(result.Detail, "stale", "missing", "no longer") {
 			err = fmt.Errorf("%w: companion rejected action: %s", ErrStale, result.Detail)
 		} else {
@@ -224,7 +265,7 @@ func (c *CompanionClient) Act(ctx context.Context, action CompanionAction) (Acti
 
 func validateCompanionAction(action CompanionAction) error {
 	switch action.Kind {
-	case ActionClick, ActionScrollForward, ActionScrollBackward:
+	case ActionClick, ActionCheck, ActionScrollForward, ActionScrollBackward:
 		if action.NodeID == "" || action.Text != "" || action.ExpectedSequence <= 0 {
 			return errors.New("node action requires node_id, expected_sequence, and no text")
 		}

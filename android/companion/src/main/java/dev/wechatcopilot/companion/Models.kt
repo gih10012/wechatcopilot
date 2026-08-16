@@ -27,6 +27,8 @@ internal data class UiNodeModel(
     val contentDescription: String,
     val bounds: BoundsModel,
     val clickable: Boolean,
+    val checkable: Boolean,
+    val checked: Boolean,
     val editable: Boolean,
     val scrollable: Boolean,
     val enabled: Boolean,
@@ -42,6 +44,8 @@ internal data class UiNodeModel(
         .put("content_description", contentDescription)
         .put("bounds", bounds.toJson())
         .put("clickable", clickable)
+        .put("checkable", checkable)
+        .put("checked", checked)
         .put("editable", editable)
         .put("scrollable", scrollable)
         .put("enabled", enabled)

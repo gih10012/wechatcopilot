@@ -128,6 +128,37 @@ type AuthActionRequest struct {
 	Confirmed bool
 }
 
+// AuthActionOutcomeError reports that an authentication action reached the
+// official client even though its post-action verification failed. Callers
+// must preserve the underlying error while treating the action as consumed so
+// a retry cannot repeat or reverse the user-confirmed operation.
+type AuthActionOutcomeError interface {
+	error
+	AuthActionConsumed() bool
+}
+
+type consumedAuthActionError struct{ err error }
+
+func (e consumedAuthActionError) Error() string            { return e.err.Error() }
+func (e consumedAuthActionError) Unwrap() error            { return e.err }
+func (e consumedAuthActionError) AuthActionConsumed() bool { return true }
+
+// MarkAuthActionConsumed preserves err's errors.Is/errors.As chain while
+// marking the associated authentication action as unsafe to retry.
+func MarkAuthActionConsumed(err error) error {
+	if err == nil || AuthActionWasConsumed(err) {
+		return err
+	}
+	return consumedAuthActionError{err: err}
+}
+
+// AuthActionWasConsumed detects a dispatched authentication action through
+// arbitrarily wrapped errors.
+func AuthActionWasConsumed(err error) bool {
+	var outcome AuthActionOutcomeError
+	return errors.As(err, &outcome) && outcome.AuthActionConsumed()
+}
+
 type Conversation struct {
 	ID            string    `json:"id"`
 	ExternalID    string    `json:"-"`

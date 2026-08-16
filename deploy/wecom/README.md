@@ -52,8 +52,10 @@ Docker inspection record, or host listening socket.
 
 Available endpoints are `GET /v1/health`, `GET /v1/snapshot`,
 `GET /v1/events`, and `POST /v1/actions`. Actions are restricted to semantic
-click, text entry, forward/backward scroll, Android Back, and opening a stored
-notification PendingIntent. There is no arbitrary ADB, shell, coordinate,
+click, check-if-unchecked, text entry, forward/backward scroll, Android Back,
+and opening a stored notification PendingIntent. The check-only action requires
+a fresh visible, enabled, clickable, checkable node and rejects an already
+checked node. There is no arbitrary ADB, shell, coordinate,
 filesystem, WebView debugging, or network proxy method.
 
 Before every exec or copy, the daemon rechecks the exact container name,

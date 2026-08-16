@@ -30,10 +30,12 @@ var (
 )
 
 const (
-	weComLoginWxAuthActivity  = "com.tencent.wework.login.controller.LoginWxAuthActivity"
-	weComSMSVerifyActivity    = "com.tencent.wework.login.controller.LoginVeryfyStep2Activity"
-	weComLaunchActivity       = "com.tencent.wework.launch.LaunchSplashActivity"
-	acceptPrivacyPolicyAction = "accept_privacy_policy"
+	weComLoginWxAuthActivity      = "com.tencent.wework.login.controller.LoginWxAuthActivity"
+	weComSMSVerifyActivity        = "com.tencent.wework.login.controller.LoginVeryfyStep2Activity"
+	weComLaunchActivity           = "com.tencent.wework.launch.LaunchSplashActivity"
+	acceptPrivacyPolicyAction     = "accept_privacy_policy"
+	acceptWeComLoginTermsAction   = "accept_wecom_login_terms"
+	continueWeComWithWechatAction = "continue_wecom_with_wechat"
 )
 
 type surfaceState struct {
@@ -315,10 +317,10 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (core.AuthSnapshot, error) {
 	state, prompt := classifyLogin(snapshot)
 	kind := core.AuthPhoneConfirm
 	canSubmit := false
-	actions := privacyConsentActions(snapshot)
+	actions, actionPrompt := authenticationActions(snapshot)
 	if len(actions) != 0 {
 		state = core.StateAuthRequired
-		prompt = "Review and accept the official WeCom privacy policy to continue"
+		prompt = actionPrompt
 	}
 	text := snapshotText(snapshot)
 	if validSMSAuthSnapshot(snapshot) {
@@ -345,11 +347,13 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (core.AuthSnapshot, error) {
 }
 
 func (d *Driver) PerformAuthAction(ctx context.Context, request core.AuthActionRequest) error {
-	if request.ActionID != acceptPrivacyPolicyAction {
+	switch request.ActionID {
+	case acceptPrivacyPolicyAction, acceptWeComLoginTermsAction, continueWeComWithWechatAction:
+	default:
 		return fmt.Errorf("%w: authentication action is not advertised", ErrStale)
 	}
 	if !request.Confirmed {
-		return fmt.Errorf("%w: privacy consent requires explicit user confirmation", ErrUserActionRequired)
+		return fmt.Errorf("%w: authentication action requires explicit user confirmation", ErrUserActionRequired)
 	}
 	d.operationMu.Lock()
 	defer d.operationMu.Unlock()
@@ -369,18 +373,65 @@ func (d *Driver) PerformAuthAction(ctx context.Context, request core.AuthActionR
 	if snapshotRequiresUserAction(snapshot) {
 		return ErrUserActionRequired
 	}
-	target, err := uniquePrivacyConsentTarget(snapshot)
-	if err != nil {
-		return err
+	switch request.ActionID {
+	case acceptPrivacyPolicyAction:
+		target, targetErr := uniquePrivacyConsentTarget(snapshot)
+		if targetErr != nil {
+			return targetErr
+		}
+		if _, err = client.Act(ctx, CompanionAction{
+			Kind: ActionClick, NodeID: target.ID, ExpectedSequence: snapshot.Sequence,
+		}); err != nil {
+			return markUncertainAuthActionConsumed(err)
+		}
+		if waitErr := waitForPrivacyConsentDismissal(ctx, client, android, snapshot.Sequence); waitErr != nil {
+			return core.MarkAuthActionConsumed(waitErr)
+		}
+		return nil
+	case acceptWeComLoginTermsAction:
+		targets, targetErr := weComLoginMethodTargets(snapshot)
+		if targetErr != nil {
+			return targetErr
+		}
+		if targets.terms.Checked {
+			return fmt.Errorf("%w: official WeCom login terms are already accepted", ErrStale)
+		}
+		if _, err = client.Act(ctx, CompanionAction{
+			Kind: ActionCheck, NodeID: targets.terms.ID, ExpectedSequence: snapshot.Sequence,
+		}); err != nil {
+			return markUncertainAuthActionConsumed(err)
+		}
+		if waitErr := waitForWeComLoginTermsChecked(ctx, client, android, snapshot.Sequence); waitErr != nil {
+			return core.MarkAuthActionConsumed(waitErr)
+		}
+		return nil
+	case continueWeComWithWechatAction:
+		targets, targetErr := weComLoginMethodTargets(snapshot)
+		if targetErr != nil {
+			return targetErr
+		}
+		if !targets.terms.Checked {
+			return fmt.Errorf("%w: official WeCom login terms are not accepted", ErrStale)
+		}
+		if _, err = client.Act(ctx, CompanionAction{
+			Kind: ActionClick, NodeID: targets.wechat.ID, ExpectedSequence: snapshot.Sequence,
+		}); err != nil {
+			return markUncertainAuthActionConsumed(err)
+		}
+		if waitErr := waitForWeComLoginMethodDismissal(ctx, client, android, snapshot.Sequence); waitErr != nil {
+			return core.MarkAuthActionConsumed(waitErr)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: authentication action is not advertised", ErrStale)
 	}
-	if _, err = client.Act(ctx, CompanionAction{
-		Kind:             ActionClick,
-		NodeID:           target.ID,
-		ExpectedSequence: snapshot.Sequence,
-	}); err != nil {
-		return err
+}
+
+func markUncertainAuthActionConsumed(err error) error {
+	if errors.Is(err, ErrActionOutcomeUncertain) {
+		return core.MarkAuthActionConsumed(err)
 	}
-	return waitForPrivacyConsentDismissal(ctx, client, android, snapshot.Sequence)
+	return err
 }
 
 func (d *Driver) withForegroundActivity(ctx context.Context, snapshot UISnapshot) UISnapshot {
@@ -974,6 +1025,165 @@ func privacyConsentActions(snapshot UISnapshot) []core.AuthAction {
 	}}
 }
 
+type weComLoginTargets struct {
+	terms  Node
+	wechat Node
+	email  Node
+	phone  Node
+}
+
+func authenticationActions(snapshot UISnapshot) ([]core.AuthAction, string) {
+	if snapshotRequiresUserAction(snapshot) {
+		return nil, ""
+	}
+	if actions := privacyConsentActions(snapshot); len(actions) != 0 {
+		return actions, "Review and accept the official WeCom privacy policy to continue"
+	}
+	// Never fall through to controls behind a complete or partially observed
+	// first-run privacy modal.
+	if hasPrivacyConsentModalMarker(snapshot) {
+		return nil, ""
+	}
+	targets, err := weComLoginMethodTargets(snapshot)
+	if err != nil {
+		return nil, ""
+	}
+	if !targets.terms.Checked {
+		return []core.AuthAction{{
+			ID:                   acceptWeComLoginTermsAction,
+			Label:                "阅读并同意企业微信登录协议",
+			Risk:                 "high",
+			Confirmation:         "请确认你已阅读官方企业微信客户端中显示的软件许可及服务协议与隐私政策，并同意后继续。",
+			RequiresConfirmation: true,
+		}}, "Review and accept the official WeCom login agreements to continue"
+	}
+	return []core.AuthAction{{
+		ID:                   continueWeComWithWechatAction,
+		Label:                "使用微信继续登录企业微信",
+		Risk:                 "high",
+		Confirmation:         "请确认使用当前微信身份继续登录企业微信；后续扫码、手机确认或验证码仍由你本人完成。",
+		RequiresConfirmation: true,
+	}}, "Confirm that you want to continue with the current WeChat identity"
+}
+
+func weComLoginMethodTargets(snapshot UISnapshot) (weComLoginTargets, error) {
+	if snapshot.Sequence <= 0 || !isWeComActivity(snapshot, weComLoginWxAuthActivity) ||
+		snapshotRequiresUserAction(snapshot) || hasPrivacyConsentModalMarker(snapshot) {
+		return weComLoginTargets{}, fmt.Errorf("%w: official WeCom login method screen is not active", ErrStale)
+	}
+	visible := visibleSnapshotText(snapshot)
+	if !containsAny(visible, "read and agree") ||
+		!containsAny(visible, "software licensing and service agreements") ||
+		!containsAny(visible, "privacy policy") {
+		return weComLoginTargets{}, fmt.Errorf("%w: official WeCom login agreement markers are incomplete", ErrStale)
+	}
+
+	wechat, err := uniqueVisibleNormalizedLabelTarget(snapshot, "Continue with WeChat")
+	if err != nil {
+		return weComLoginTargets{}, fmt.Errorf("WeChat login method target: %w", err)
+	}
+	email, err := uniqueVisibleNormalizedLabelTarget(snapshot, "Continue with Email")
+	if err != nil {
+		return weComLoginTargets{}, fmt.Errorf("email login method target: %w", err)
+	}
+	phone, err := uniqueVisibleNormalizedLabelTarget(snapshot, "Continue with Phone")
+	if err != nil {
+		return weComLoginTargets{}, fmt.Errorf("phone login method target: %w", err)
+	}
+	if wechat.ID == email.ID || wechat.ID == phone.ID || email.ID == phone.ID {
+		return weComLoginTargets{}, fmt.Errorf("%w: WeCom login methods share one clickable target", ErrTargetAmbiguous)
+	}
+
+	checkable := matchingNodes(snapshot, func(node Node) bool { return node.Checkable })
+	if len(checkable) == 0 {
+		return weComLoginTargets{}, fmt.Errorf("%w: WeCom login agreement checkbox is unavailable", ErrStale)
+	}
+	if len(checkable) != 1 {
+		return weComLoginTargets{}, fmt.Errorf("%w: multiple WeCom login agreement checkboxes", ErrTargetAmbiguous)
+	}
+	terms := checkable[0]
+	if terms.ID == "" || !terms.VisibleToUser || !terms.Enabled || !terms.Clickable || !usableBounds(terms.Bounds) {
+		return weComLoginTargets{}, fmt.Errorf("%w: WeCom login agreement checkbox is not safely actionable", ErrStale)
+	}
+	if terms.ID == wechat.ID || terms.ID == email.ID || terms.ID == phone.ID {
+		return weComLoginTargets{}, fmt.Errorf("%w: WeCom agreement and login method share one target", ErrTargetAmbiguous)
+	}
+	return weComLoginTargets{terms: terms, wechat: wechat, email: email, phone: phone}, nil
+}
+
+func uniqueVisibleNormalizedLabelTarget(snapshot UISnapshot, label string) (Node, error) {
+	byID := make(map[string]Node, len(snapshot.Nodes))
+	for _, node := range snapshot.Nodes {
+		byID[node.ID] = node
+	}
+	want := normalizedVisibleLabel(label)
+	candidates := make(map[string]Node)
+	for _, node := range snapshot.Nodes {
+		if node.ID == "" || !node.VisibleToUser || normalizedVisibleLabel(nodeLabel(node)) != want {
+			continue
+		}
+		current := node
+		for depth := 0; depth <= len(snapshot.Nodes); depth++ {
+			if current.Enabled && current.Clickable && current.VisibleToUser && usableBounds(current.Bounds) {
+				candidates[current.ID] = current
+				break
+			}
+			if current.ParentID == "" {
+				break
+			}
+			parent, ok := byID[current.ParentID]
+			if !ok || parent.ID == current.ID {
+				break
+			}
+			current = parent
+		}
+	}
+	if len(candidates) == 0 {
+		return Node{}, fmt.Errorf("%w: matching visible clickable target is unavailable", ErrStale)
+	}
+	if len(candidates) != 1 {
+		return Node{}, fmt.Errorf("%w: multiple matching visible clickable targets", ErrTargetAmbiguous)
+	}
+	for _, candidate := range candidates {
+		return candidate, nil
+	}
+	return Node{}, fmt.Errorf("%w: matching visible clickable target is unavailable", ErrStale)
+}
+
+func normalizedVisibleLabel(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
+}
+
+func hasPrivacyConsentModalMarker(snapshot UISnapshot) bool {
+	visible := visibleSnapshotText(snapshot)
+	if containsAny(visible, "welcome to wecom", "欢迎使用企业微信") {
+		return true
+	}
+	for _, node := range snapshot.Nodes {
+		if node.VisibleToUser && matchesAny(nodeLabel(node), "Agree", "Disagree", "同意", "不同意") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasWeComLoginMethodMarker(snapshot UISnapshot) bool {
+	visible := visibleSnapshotText(snapshot)
+	if containsAny(visible, "read and agree", "software licensing and service agreements") {
+		return true
+	}
+	for _, node := range snapshot.Nodes {
+		if !node.VisibleToUser {
+			continue
+		}
+		switch normalizedVisibleLabel(nodeLabel(node)) {
+		case "continue with wechat", "continue with email", "continue with phone":
+			return true
+		}
+	}
+	return false
+}
+
 func uniquePrivacyConsentTarget(snapshot UISnapshot) (Node, error) {
 	if !privacyConsentPage(snapshot) || snapshot.Sequence <= 0 {
 		return Node{}, fmt.Errorf("%w: official privacy consent screen is not active", ErrStale)
@@ -1094,6 +1304,90 @@ func waitForPrivacyConsentDismissal(ctx context.Context, client *CompanionClient
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("%w: privacy consent screen did not close", ErrStale)
+		}
+		timer := time.NewTimer(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func waitForWeComLoginTermsChecked(ctx context.Context, client *CompanionClient, android AndroidContainer, previous int64) error {
+	deadline := time.Now().Add(10 * time.Second)
+	changed := false
+	checkedObservations := 0
+	for {
+		snapshot, err := client.Snapshot(ctx)
+		if err == nil {
+			if snapshot.Sequence > previous {
+				changed = true
+			}
+			if changed {
+				snapshot = withForegroundActivity(ctx, android, snapshot)
+				if snapshotHasHardAuthRisk(snapshot) {
+					return ErrUserActionRequired
+				}
+				targets, targetErr := weComLoginMethodTargets(snapshot)
+				if targetErr == nil && targets.terms.Checked {
+					checkedObservations++
+					if checkedObservations >= 2 {
+						return nil
+					}
+				} else {
+					checkedObservations = 0
+				}
+			}
+		} else {
+			checkedObservations = 0
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: WeCom login agreement checkbox did not become stably checked", ErrStale)
+		}
+		timer := time.NewTimer(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func waitForWeComLoginMethodDismissal(ctx context.Context, client *CompanionClient, android AndroidContainer, previous int64) error {
+	deadline := time.Now().Add(10 * time.Second)
+	changed := false
+	dismissedObservations := 0
+	for {
+		snapshot, err := client.Snapshot(ctx)
+		if err == nil {
+			if snapshot.Sequence > previous {
+				changed = true
+			}
+			if changed {
+				snapshot = withForegroundActivity(ctx, android, snapshot)
+				if snapshotHasHardAuthRisk(snapshot) {
+					return ErrUserActionRequired
+				}
+				activity := strings.TrimSpace(snapshot.WindowClass)
+				if snapshot.PackageName == DefaultWeComPackage &&
+					strings.HasPrefix(activity, DefaultWeComPackage+".") &&
+					!hasWeComLoginMethodMarker(snapshot) {
+					dismissedObservations++
+					if dismissedObservations >= 2 {
+						return nil
+					}
+				} else {
+					dismissedObservations = 0
+				}
+			}
+		} else {
+			dismissedObservations = 0
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: WeCom login method screen did not close safely", ErrStale)
 		}
 		timer := time.NewTimer(200 * time.Millisecond)
 		select {
@@ -1346,6 +1640,14 @@ func snapshotRequiresUserAction(snapshot UISnapshot) bool {
 		snapshotText(snapshot),
 		"账号存在风险", "账户存在风险", "设备验证", "安全验证", "异常登录", "确认本人操作",
 		"account risk", "device verification", "security verification", "unusual login", "confirm on your phone",
+	)
+}
+
+func snapshotHasHardAuthRisk(snapshot UISnapshot) bool {
+	return containsAny(
+		snapshotText(snapshot),
+		"账号存在风险", "账户存在风险", "设备验证", "安全验证", "异常登录",
+		"account risk", "device verification", "security verification", "unusual login",
 	)
 }
 

@@ -107,34 +107,10 @@ internal class LocalRpcServer(
                     text = json.optString("text"),
 					expectedSequence = json.optLong("expected_sequence", 0),
                 )
-                validateAction(action)
+                validateLocalAction(action)
                 writeJson(output, 200, CompanionRuntime.perform(action).toJson())
             }
             else -> writeJson(output, 404, JSONObject().put("error", "not found"))
-        }
-    }
-
-    private fun validateAction(action: CompanionAction) {
-        when (action.kind) {
-            "click", "scroll_forward", "scroll_backward", "open_notification" -> {
-                if (action.nodeId.isBlank() || action.text.isNotEmpty()) {
-                    throw RequestException(400, "node action requires node_id and no text")
-                }
-				if (action.kind != "open_notification" && action.expectedSequence <= 0) {
-					throw RequestException(400, "node action requires expected_sequence")
-				}
-            }
-            "set_text" -> {
-				if (action.nodeId.isBlank() || action.text.length > 32 * 1024 || action.expectedSequence <= 0) {
-                    throw RequestException(400, "invalid set_text action")
-                }
-            }
-            "global_back" -> {
-                if (action.nodeId.isNotEmpty() || action.text.isNotEmpty()) {
-                    throw RequestException(400, "global_back accepts no parameters")
-                }
-            }
-            else -> throw RequestException(400, "unsupported action")
         }
     }
 
@@ -145,6 +121,7 @@ internal class LocalRpcServer(
             400 -> "Bad Request"
             401 -> "Unauthorized"
             404 -> "Not Found"
+            503 -> "Service Unavailable"
             else -> "Internal Server Error"
         }
         val headers = buildString {
@@ -157,6 +134,30 @@ internal class LocalRpcServer(
         output.write(headers)
         output.write(bytes)
         output.flush()
+    }
+}
+
+internal fun validateLocalAction(action: CompanionAction) {
+    when (action.kind) {
+        "click", "check", "scroll_forward", "scroll_backward", "open_notification" -> {
+            if (action.nodeId.isBlank() || action.text.isNotEmpty()) {
+                throw RequestException(400, "node action requires node_id and no text")
+            }
+            if (action.kind != "open_notification" && action.expectedSequence <= 0) {
+                throw RequestException(400, "node action requires expected_sequence")
+            }
+        }
+        "set_text" -> {
+            if (action.nodeId.isBlank() || action.text.length > 32 * 1024 || action.expectedSequence <= 0) {
+                throw RequestException(400, "invalid set_text action")
+            }
+        }
+        "global_back" -> {
+            if (action.nodeId.isNotEmpty() || action.text.isNotEmpty()) {
+                throw RequestException(400, "global_back accepts no parameters")
+            }
+        }
+        else -> throw RequestException(400, "unsupported action")
     }
 }
 

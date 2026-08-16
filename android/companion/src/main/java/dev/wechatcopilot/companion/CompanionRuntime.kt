@@ -63,6 +63,14 @@ internal object CompanionRuntime {
 
     fun currentSequence(): Long = sequence.get()
 
+    fun advanceSequenceIfCurrent(expected: Long): Long? {
+        if (expected <= 0 || expected == Long.MAX_VALUE) return null
+        val advanced = expected + 1
+        return advanced.takeIf { sequence.compareAndSet(expected, advanced) }
+    }
+
+    fun isAttached(service: WeComAccessibilityService): Boolean = accessibility.get() === service
+
     fun currentWindowClass(packageName: String, windowId: Int): String {
         if (packageName != WECOM_PACKAGE || windowId < 0) return ""
         val observed = observedWindow.get() ?: return ""

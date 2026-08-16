@@ -31,6 +31,10 @@ import (
 const (
 	challengeTTL       = 10 * time.Minute
 	completedRetention = 60 * time.Second
+	// Three onboarding stages may each make one bounded retry before the
+	// challenge fails closed.
+	maxAuthActionAttemptsPerAction    = 2
+	maxAuthActionAttemptsPerChallenge = 6
 )
 
 var verificationCodePattern = regexp.MustCompile(`^[0-9A-Za-z-]{4,16}$`)
@@ -51,20 +55,22 @@ type Challenge struct {
 }
 
 type entry struct {
-	mu               sync.Mutex
-	public           Challenge
-	token            string
-	driver           driver.Driver
-	server           *http.Server
-	listener         net.Listener
-	codeAttempts     int
-	codeInFlight     bool
-	codeSubmitted    bool
-	actionAttempts   int
-	actionInFlight   bool
-	performedActions map[string]bool
-	closed           bool
-	done             chan struct{}
+	mu                  sync.Mutex
+	public              Challenge
+	token               string
+	driver              driver.Driver
+	server              *http.Server
+	listener            net.Listener
+	codeAttempts        int
+	codeInFlight        bool
+	codeSubmitted       bool
+	actionAttempts      map[string]int
+	totalActionAttempts int
+	actionInFlight      bool
+	performedActions    map[string]bool
+	lastObservedAt      time.Time
+	closed              bool
+	done                chan struct{}
 }
 
 type Manager struct {
@@ -127,9 +133,14 @@ func (m *Manager) Begin(ctx context.Context, accountID string, instance driver.D
 		LinkQRPath: qrPath, State: snapshot.State, Kind: snapshot.Kind, Prompt: snapshot.Prompt,
 		ExpiresAt: time.Now().UTC().Add(challengeTTL),
 	}
+	if snapshot.State == driver.StateOnline {
+		now := time.Now().UTC()
+		public.CompletedAt = &now
+	}
 	item := &entry{
 		public: public, token: token, driver: instance, listener: listener,
-		performedActions: make(map[string]bool), done: make(chan struct{}),
+		actionAttempts: make(map[string]int), performedActions: make(map[string]bool),
+		lastObservedAt: snapshot.ObservedAt, done: make(chan struct{}),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, item.handlePage)
@@ -170,7 +181,14 @@ func (m *Manager) Status(id string) (Challenge, error) {
 	}
 	item.mu.Lock()
 	defer item.mu.Unlock()
-	if time.Now().UTC().After(item.public.ExpiresAt) && item.public.CompletedAt == nil {
+	if item.closed {
+		return Challenge{}, os.ErrNotExist
+	}
+	now := time.Now().UTC()
+	if item.completedLocked() {
+		item.markCompletedLocked(now)
+	}
+	if now.After(item.public.ExpiresAt) && !item.completedLocked() {
 		return Challenge{}, os.ErrNotExist
 	}
 	return item.public, nil
@@ -213,8 +231,20 @@ func (m *Manager) monitor(id string, item *entry) {
 			return
 		case <-ticker.C:
 		}
+		now := time.Now().UTC()
 		item.mu.Lock()
-		if time.Now().UTC().After(item.public.ExpiresAt) {
+		if item.closed {
+			item.mu.Unlock()
+			return
+		}
+		if item.completedLocked() {
+			item.markCompletedLocked(now)
+			completedAt := *item.public.CompletedAt
+			item.mu.Unlock()
+			item.waitForCompletedRetention(completedAt)
+			return
+		}
+		if now.After(item.public.ExpiresAt) {
 			item.public.State = driver.StateOffline
 			item.public.Prompt = "authentication challenge expired"
 			item.mu.Unlock()
@@ -227,23 +257,62 @@ func (m *Manager) monitor(id string, item *entry) {
 		if err != nil {
 			continue
 		}
+		now = time.Now().UTC()
 		item.mu.Lock()
+		if item.closed {
+			item.mu.Unlock()
+			return
+		}
+		if item.completedLocked() {
+			item.markCompletedLocked(now)
+			completedAt := *item.public.CompletedAt
+			item.mu.Unlock()
+			item.waitForCompletedRetention(completedAt)
+			return
+		}
+		if now.After(item.public.ExpiresAt) {
+			item.public.State = driver.StateOffline
+			item.public.Prompt = "authentication challenge expired"
+			item.mu.Unlock()
+			return
+		}
 		item.public.State = snapshot.State
 		item.public.Kind = snapshot.Kind
 		item.public.Prompt = snapshot.Prompt
+		item.lastObservedAt = snapshot.ObservedAt
 		if snapshot.State == driver.StateOnline {
-			now := time.Now().UTC()
-			item.public.CompletedAt = &now
+			item.markCompletedLocked(now)
+			completedAt := *item.public.CompletedAt
 			item.mu.Unlock()
-			timer := time.NewTimer(completedRetention)
-			select {
-			case <-item.done:
-				timer.Stop()
-			case <-timer.C:
-			}
+			item.waitForCompletedRetention(completedAt)
 			return
 		}
 		item.mu.Unlock()
+	}
+}
+
+func (e *entry) completedLocked() bool {
+	return e.public.CompletedAt != nil || e.public.State == driver.StateOnline
+}
+
+func (e *entry) markCompletedLocked(now time.Time) {
+	e.public.State = driver.StateOnline
+	if e.public.CompletedAt == nil {
+		completedAt := now.UTC()
+		e.public.CompletedAt = &completedAt
+	}
+}
+
+func (e *entry) waitForCompletedRetention(completedAt time.Time) {
+	remaining := time.Until(completedAt.Add(completedRetention))
+	if remaining <= 0 {
+		return
+	}
+	timer := time.NewTimer(remaining)
+	select {
+	case <-e.done:
+		timer.Stop()
+	case <-timer.C:
 	}
 }
 
@@ -253,7 +322,15 @@ func (e *entry) handlePage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	e.mu.Lock()
-	if time.Now().UTC().After(e.public.ExpiresAt) {
+	now := time.Now().UTC()
+	if e.closed {
+		e.mu.Unlock()
+		http.Error(w, "authentication challenge expired or completed", http.StatusGone)
+		return
+	}
+	if e.completedLocked() {
+		e.markCompletedLocked(now)
+	} else if now.After(e.public.ExpiresAt) {
 		e.mu.Unlock()
 		http.Error(w, "authentication challenge expired", http.StatusGone)
 		return
@@ -273,34 +350,120 @@ func (e *entry) handleState(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	now := time.Now().UTC()
 	e.mu.Lock()
-	expired := time.Now().UTC().After(e.public.ExpiresAt)
-	e.mu.Unlock()
-	if expired {
+	if e.closed {
+		e.mu.Unlock()
+		http.Error(w, "authentication challenge expired or completed", http.StatusGone)
+		return
+	}
+	if e.completedLocked() {
+		e.markCompletedLocked(now)
+		data := e.public
+		observedAt := e.lastObservedAt
+		e.mu.Unlock()
+		writeChallengeState(w, data, false, nil, observedAt)
+		return
+	}
+	if now.After(e.public.ExpiresAt) {
+		e.mu.Unlock()
 		http.Error(w, "authentication challenge expired", http.StatusGone)
 		return
 	}
+	if e.actionInFlight {
+		data := e.public
+		observedAt := e.lastObservedAt
+		e.mu.Unlock()
+		writeChallengeState(w, data, false, nil, observedAt)
+		return
+	}
+	e.mu.Unlock()
+
 	snapshot, err := e.driver.AuthSnapshot(r.Context())
 	if err != nil {
 		http.Error(w, "driver unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	now = time.Now().UTC()
 	e.mu.Lock()
-	e.public.State = snapshot.State
+	if e.closed {
+		e.mu.Unlock()
+		http.Error(w, "authentication challenge expired or completed", http.StatusGone)
+		return
+	}
+	if e.completedLocked() {
+		e.markCompletedLocked(now)
+		data := e.public
+		observedAt := e.lastObservedAt
+		e.mu.Unlock()
+		writeChallengeState(w, data, false, nil, observedAt)
+		return
+	}
+	if now.After(e.public.ExpiresAt) {
+		e.mu.Unlock()
+		http.Error(w, "authentication challenge expired", http.StatusGone)
+		return
+	}
+	if e.actionInFlight {
+		data := e.public
+		observedAt := e.lastObservedAt
+		e.mu.Unlock()
+		writeChallengeState(w, data, false, nil, observedAt)
+		return
+	}
 	e.public.Kind = snapshot.Kind
 	e.public.Prompt = snapshot.Prompt
+	e.lastObservedAt = snapshot.ObservedAt
+	if snapshot.State == driver.StateOnline {
+		e.markCompletedLocked(now)
+		data := e.public
+		observedAt := e.lastObservedAt
+		e.mu.Unlock()
+		writeChallengeState(w, data, false, nil, observedAt)
+		return
+	}
+	e.public.State = snapshot.State
 	data := e.public
-	canSubmitCode := snapshot.CanSubmitCode && !e.codeInFlight && !e.codeSubmitted
+	canSubmitCode := snapshot.State == driver.StateAuthRequired && snapshot.Kind == driver.AuthSMS &&
+		snapshot.CanSubmitCode && !e.codeInFlight && !e.codeSubmitted && !e.actionInFlight
+	actions := e.availableAuthActionsLocked(snapshot)
+	observedAt := e.lastObservedAt
 	e.mu.Unlock()
+	writeChallengeState(w, data, canSubmitCode, actions, observedAt)
+}
+
+func writeChallengeState(w http.ResponseWriter, challenge Challenge, canSubmitCode bool, actions []driver.AuthAction, observedAt time.Time) {
 	writeJSON(w, struct {
 		Challenge
 		CanSubmitCode bool                `json:"can_submit_code"`
 		Actions       []driver.AuthAction `json:"actions,omitempty"`
 		ObservedAt    time.Time           `json:"observed_at"`
 	}{
-		Challenge: data, CanSubmitCode: canSubmitCode,
-		Actions: snapshot.Actions, ObservedAt: snapshot.ObservedAt,
+		Challenge: challenge, CanSubmitCode: canSubmitCode,
+		Actions: actions, ObservedAt: observedAt,
 	})
+}
+
+func (e *entry) availableAuthActionsLocked(snapshot driver.AuthSnapshot) []driver.AuthAction {
+	if e.actionInFlight || e.completedLocked() || snapshot.State != driver.StateAuthRequired {
+		return nil
+	}
+	if e.totalActionAttempts >= maxAuthActionAttemptsPerChallenge {
+		return nil
+	}
+	counts := make(map[string]int, len(snapshot.Actions))
+	for _, action := range snapshot.Actions {
+		counts[action.ID]++
+	}
+	result := make([]driver.AuthAction, 0, len(snapshot.Actions))
+	for _, action := range snapshot.Actions {
+		if action.ID == "" || strings.TrimSpace(action.ID) != action.ID || counts[action.ID] != 1 ||
+			e.performedActions[action.ID] || e.actionAttempts[action.ID] >= maxAuthActionAttemptsPerAction {
+			continue
+		}
+		result = append(result, action)
+	}
+	return result
 }
 
 func (e *entry) handleImage(w http.ResponseWriter, r *http.Request) {
@@ -309,7 +472,7 @@ func (e *entry) handleImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	e.mu.Lock()
-	unavailable := time.Now().UTC().After(e.public.ExpiresAt) || e.public.CompletedAt != nil || e.public.State == driver.StateOnline
+	unavailable := e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.completedLocked()
 	e.mu.Unlock()
 	if unavailable {
 		http.Error(w, "login image is no longer available", http.StatusGone)
@@ -320,10 +483,13 @@ func (e *entry) handleImage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "driver unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	e.mu.Lock()
 	if snapshot.State == driver.StateOnline {
-		e.mu.Lock()
-		e.public.State = driver.StateOnline
-		e.mu.Unlock()
+		e.markCompletedLocked(time.Now().UTC())
+	}
+	unavailable = e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.completedLocked()
+	e.mu.Unlock()
+	if unavailable {
 		http.Error(w, "login image is no longer available", http.StatusGone)
 		return
 	}
@@ -433,7 +599,7 @@ func (e *entry) submitCode(ctx context.Context, code string) (err error) {
 		return errors.New("invalid verification code")
 	}
 	e.mu.Lock()
-	if e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.public.CompletedAt != nil || e.public.State == driver.StateOnline {
+	if e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.completedLocked() {
 		e.mu.Unlock()
 		return os.ErrNotExist
 	}
@@ -475,7 +641,7 @@ func (e *entry) submitCode(ctx context.Context, code string) (err error) {
 func (e *entry) performAuthAction(ctx context.Context, actionID string, confirmed bool) (err error) {
 	actionID = strings.TrimSpace(actionID)
 	e.mu.Lock()
-	if e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.public.CompletedAt != nil || e.public.State == driver.StateOnline {
+	if e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.completedLocked() {
 		e.mu.Unlock()
 		return os.ErrNotExist
 	}
@@ -487,17 +653,16 @@ func (e *entry) performAuthAction(ctx context.Context, actionID string, confirme
 		e.mu.Unlock()
 		return errActionUnavailable
 	}
-	e.actionAttempts++
-	if e.actionAttempts > 4 {
+	if !confirmed {
 		e.mu.Unlock()
-		return errTooManyActionAttempts
+		return errConfirmationRequired
 	}
 	e.actionInFlight = true
 	e.mu.Unlock()
 	defer func() {
 		e.mu.Lock()
 		e.actionInFlight = false
-		if err == nil {
+		if err == nil || driver.AuthActionWasConsumed(err) {
 			if e.performedActions == nil {
 				e.performedActions = make(map[string]bool)
 			}
@@ -513,6 +678,9 @@ func (e *entry) performAuthAction(ctx context.Context, actionID string, confirme
 	if snapshot.State == driver.StateOnline {
 		return os.ErrNotExist
 	}
+	if snapshot.State != driver.StateAuthRequired {
+		return errActionUnavailable
+	}
 	var advertised *driver.AuthAction
 	for index := range snapshot.Actions {
 		if snapshot.Actions[index].ID != actionID {
@@ -526,13 +694,26 @@ func (e *entry) performAuthAction(ctx context.Context, actionID string, confirme
 	if advertised == nil {
 		return errActionUnavailable
 	}
-	if !confirmed {
-		return errConfirmationRequired
-	}
 	actor, ok := e.driver.(driver.AuthActionDriver)
 	if !ok {
 		return errActionUnavailable
 	}
+	e.mu.Lock()
+	if e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.completedLocked() {
+		e.mu.Unlock()
+		return os.ErrNotExist
+	}
+	if e.actionAttempts == nil {
+		e.actionAttempts = make(map[string]int)
+	}
+	if e.actionAttempts[actionID] >= maxAuthActionAttemptsPerAction ||
+		e.totalActionAttempts >= maxAuthActionAttemptsPerChallenge {
+		e.mu.Unlock()
+		return errTooManyActionAttempts
+	}
+	e.actionAttempts[actionID]++
+	e.totalActionAttempts++
+	e.mu.Unlock()
 	return actor.PerformAuthAction(ctx, driver.AuthActionRequest{ActionID: actionID, Confirmed: confirmed})
 }
 

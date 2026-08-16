@@ -37,7 +37,7 @@ class ProtocolTest {
     }
 
     @Test
-    fun nodeProtocolCarriesVisibilityToTheHost() {
+    fun nodeProtocolCarriesVisibilityAndCheckedStateToTheHost() {
         val node = UiNodeModel(
             id = "0/1",
             parentId = "0",
@@ -47,6 +47,8 @@ class ProtocolTest {
             contentDescription = "",
             bounds = BoundsModel(10, 20, 100, 60),
             clickable = true,
+            checkable = true,
+            checked = true,
             editable = false,
             scrollable = false,
             enabled = true,
@@ -56,6 +58,40 @@ class ProtocolTest {
         // android.jar's JSONObject is a stub in local JVM tests; Go protocol tests
         // cover the serialized field name and decoding.
         assertTrue(node.visibleToUser)
+        assertTrue(node.checkable)
+        assertTrue(node.checked)
+    }
+
+    @Test
+    fun checkActionGateFailsClosed() {
+        assertTrue(canRequestCheck(true, true, true, true, false))
+        assertFalse(canRequestCheck(false, true, true, true, false))
+        assertFalse(canRequestCheck(true, false, true, true, false))
+        assertFalse(canRequestCheck(true, true, false, true, false))
+        assertFalse(canRequestCheck(true, true, true, false, false))
+        assertFalse(canRequestCheck(true, true, true, true, true))
+    }
+
+    @Test
+    fun localActionValidatorAllowsOnlyConstrainedCheckRequests() {
+        validateLocalAction(
+            CompanionAction(
+                kind = "check",
+                nodeId = "0/1",
+                text = "",
+                expectedSequence = 7,
+            ),
+        )
+
+        val invalid = listOf(
+            CompanionAction("check", "", "", 7),
+            CompanionAction("check", "0/1", "unexpected", 7),
+            CompanionAction("check", "0/1", "", 0),
+            CompanionAction("toggle", "0/1", "", 7),
+        )
+        invalid.forEach { action ->
+            assertFailsWith<RequestException> { validateLocalAction(action) }
+        }
     }
 
     @Test

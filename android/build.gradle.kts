@@ -1,5 +1,5 @@
 plugins {
-    id("com.android.application") version "8.7.3" apply false
-    id("org.jetbrains.kotlin.android") version "2.1.10" apply false
-    id("app.cash.licensee") version "1.13.0" apply false
+    id("com.android.application") version "9.3.1" apply false
+    id("org.jetbrains.kotlin.android") version "2.4.10" apply false
+    id("app.cash.licensee") version "1.14.1" apply false
 }

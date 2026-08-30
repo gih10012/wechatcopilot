@@ -7,6 +7,23 @@ import (
 	shared "github.com/gih10012/wechatcopilot/internal/driver"
 )
 
+const (
+	continueSavedAccountLoginOperation = "continue_saved_account_login"
+	savedAccountLoginActionPrefix      = continueSavedAccountLoginOperation + "."
+)
+
+func savedAccountLoginAction(generation string) shared.AuthAction {
+	return shared.AuthAction{
+		ID:                   savedAccountLoginActionPrefix + generation,
+		Label:                "\u767b\u5f55\u5f53\u524d\u5fae\u4fe1\u8d26\u53f7",
+		Risk:                 "high",
+		Confirmation:         "\u8bf7\u786e\u8ba4\u4f7f\u7528\u5b98\u65b9\u5fae\u4fe1\u5ba2\u6237\u7aef\u663e\u793a\u7684\u5f53\u524d\u8d26\u53f7\u7ee7\u7eed\u767b\u5f55\u3002",
+		RequiresConfirmation: true,
+		ImageBound:           true,
+		ReplayKey:            continueSavedAccountLoginOperation,
+	}
+}
+
 type ProbeResult struct {
 	State         shared.RuntimeState
 	Identity      *shared.Identity
@@ -15,6 +32,8 @@ type ProbeResult struct {
 	AuthKind      shared.AuthKind
 	Prompt        string
 	CanSubmitCode bool
+	Actions       []shared.AuthAction
+	ScreenshotPNG []byte
 	ObservedAt    time.Time
 	QRBounds      *Rectangle
 }
@@ -50,6 +69,7 @@ type VisibleMessage struct {
 	Outgoing        bool
 	AccessibleLabel string
 	SurfaceKind     string
+	SurfaceLocator  string
 	Confidence      float64
 }
 
@@ -66,21 +86,29 @@ type SurfaceTarget struct {
 	ConversationLocator string
 	AccessibleLabel     string
 	Kind                string
+	SurfaceLocator      string
 }
 
 type BackendAction struct {
-	Action  shared.Action
-	Locator string
+	Action   shared.Action
+	ReplayID string
+	Locator  string
 }
 
 type BackendSurface struct {
-	Kind         string
-	Title        string
-	URL          string
-	AppID        string
-	SemanticText string
-	Screenshot   []byte
-	Actions      []BackendAction
+	Kind             string
+	Title            string
+	URL              string
+	AppID            string
+	Generation       string
+	ScreenshotSHA256 string
+	WindowIdentity   string
+	SemanticText     string
+	Screenshot       []byte
+	Elements         []shared.SurfaceElement
+	Assets           []shared.SurfaceAsset
+	Viewport         *shared.SurfaceViewport
+	Actions          []BackendAction
 }
 
 // Backend is the narrow privileged boundary around the official desktop
@@ -91,13 +119,15 @@ type Backend interface {
 	Probe(context.Context) (ProbeResult, error)
 	Screenshot(context.Context) ([]byte, error)
 	SubmitAuthCode(context.Context, string) error
+	ContinueSavedAccountLogin(context.Context, string) error
 	ListVisibleConversations(context.Context) ([]VisibleConversation, error)
 	ReadVisibleMessages(context.Context, string, string) (VisibleMessages, error)
 	Send(context.Context, UISendRequest) error
 	OpenSurface(context.Context, SurfaceTarget) (BackendSurface, error)
-	SnapshotSurface(context.Context) (BackendSurface, error)
-	ActSurface(context.Context, string, string) (BackendSurface, error)
-	CloseSurface(context.Context) error
+	OpenNamedSurface(context.Context, string, string) (BackendSurface, error)
+	SnapshotSurface(context.Context, string) (BackendSurface, error)
+	ActSurface(context.Context, string, string, string) (BackendSurface, error)
+	CloseSurface(context.Context, string) error
 }
 
 // MessageIndex is populated by a version-specific, read-only WCDB adapter.

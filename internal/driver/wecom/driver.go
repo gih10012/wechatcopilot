@@ -7,22 +7,25 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	core "github.com/gih10012/wechatcopilot/internal/driver"
 )
 
 var (
+	ErrInvalidArgument       = core.NewFailure(core.FailureInvalidArgument, "WeCom operation arguments are invalid")
 	ErrAuthRequired          = core.NewFailure(core.FailureAuthRequired, "WeCom authentication is required")
 	ErrTargetAmbiguous       = core.NewFailure(core.FailureTargetAmbiguous, "WeCom conversation target is ambiguous")
 	ErrUnsupportedCapability = core.NewFailure(core.FailureUnsupported, "WeCom driver capability is unsupported")
 	ErrSendUncertain         = core.NewFailure(core.FailureSendUncertain, "WeCom send result is uncertain")
+	ErrConfirmationRequired  = core.NewFailure(core.FailureConfirmationRequired, "WeCom surface action requires explicit confirmation")
 	ErrUserActionRequired    = core.NewFailure(core.FailureUserActionRequired, "direct user interaction is required")
 	ErrNotFound              = core.NewFailure(core.FailureNotFound, "requested WeCom object was not found")
 	ErrStale                 = core.NewFailure(core.FailureStale, "WeCom UI state is stale")
@@ -33,15 +36,40 @@ const (
 	weComLoginWxAuthActivity      = "com.tencent.wework.login.controller.LoginWxAuthActivity"
 	weComSMSVerifyActivity        = "com.tencent.wework.login.controller.LoginVeryfyStep2Activity"
 	weComLaunchActivity           = "com.tencent.wework.launch.LaunchSplashActivity"
+	weComLoginAgreementViewID     = DefaultWeComPackage + ":id/ow"
+	androidImageViewClass         = "android.widget.ImageView"
 	acceptPrivacyPolicyAction     = "accept_privacy_policy"
 	acceptWeComLoginTermsAction   = "accept_wecom_login_terms"
 	continueWeComWithWechatAction = "continue_wecom_with_wechat"
 )
 
+const authActionGenerationHexLength = sha256.Size * 2
+
 type surfaceState struct {
-	surface  core.Surface
-	actions  map[string]CompanionAction
-	sequence int64
+	surface          core.Surface
+	actions          map[string]surfaceActionState
+	consumedActions  map[string]struct{}
+	replayTombstones map[string]struct{}
+	sequence         int64
+	identity         surfaceIdentity
+}
+
+type surfaceActionState struct {
+	advertised    core.Action
+	companion     CompanionAction
+	replayID      string
+	nodeSignature string
+	contextDigest string
+	label         string
+	bounds        Bounds
+	sequence      int64
+	identity      surfaceIdentity
+}
+
+type surfaceIdentity struct {
+	packageName string
+	windowID    int
+	windowClass string
 }
 
 type sendMemo struct {
@@ -115,9 +143,11 @@ func (d *Driver) Stop(ctx context.Context) error {
 func (d *Driver) Purge(ctx context.Context, account core.AccountRuntime) error {
 	d.operationMu.Lock()
 	defer d.operationMu.Unlock()
-	if err := validateAccountID(account.AccountID); err != nil {
+	stateDir, err := validateAccountStateDir(account.StateDir, account.AccountID)
+	if err != nil {
 		return err
 	}
+	account.StateDir = stateDir
 	if active, running := d.runtime.Account(); running {
 		if active.AccountID == account.AccountID {
 			return errors.New("cannot purge an active WeCom account")
@@ -131,102 +161,167 @@ func (d *Driver) Purge(ctx context.Context, account core.AccountRuntime) error {
 	if strings.Contains(dataDir, ",") {
 		return errors.New("account data path cannot contain a comma")
 	}
+	accountDir := filepath.Dir(dataDir)
+	if err := ensureManagedDirectory(accountDir); err != nil {
+		return fmt.Errorf("prepare WeCom account directory lock before purge: %w", err)
+	}
+	lock, err := acquireAccountLock(filepath.Join(accountDir, ".runtime.lock"))
+	if err != nil {
+		return fmt.Errorf("lock inactive WeCom account before purge: %w", err)
+	}
+	defer releaseAccountLock(lock)
+	dataInfo, dataExists, err := inspectRealDirectory(dataDir)
+	if err != nil {
+		return fmt.Errorf("inspect WeCom Android data before purge: %w", err)
+	}
+	var data *profileDirectoryAnchor
+	if dataExists {
+		data, err = openProfileDirectoryWithoutSymlinks(dataDir)
+		if err != nil {
+			return fmt.Errorf("pin WeCom Android data before purge: %w", err)
+		}
+		defer data.close()
+		expectedDevice, expectedInode, err := directoryIdentity(dataInfo)
+		if err != nil {
+			return err
+		}
+		actualDevice, actualInode, err := directoryIdentity(data.info)
+		if err != nil || actualDevice != expectedDevice || actualInode != expectedInode {
+			return errors.New("WeCom Android data changed before it could be pinned for purge")
+		}
+	}
+	metadata, metadataExists, err := readWeComProfileMetadata(profileMetadataPath(account.StateDir))
+	if err != nil {
+		return fmt.Errorf("read WeCom profile metadata before purge: %w", err)
+	}
+	if metadataExists && data != nil {
+		if err := validateWeComProfileMetadata(metadata, account.AccountID, data.info); err != nil {
+			return fmt.Errorf("verify WeCom profile metadata before purge: %w", err)
+		}
+	}
 	network := networkName(account.AccountID)
-	if _, err := inspectAccountNetwork(ctx, d.runtime.executor, d.runtime.config.DockerBinary, network, account.AccountID); err != nil {
+	networkID, networkExists, err := inspectAccountNetworkIdentity(
+		ctx, d.runtime.executor, d.runtime.config.DockerBinary, network, account.AccountID,
+	)
+	if err != nil {
 		return fmt.Errorf("verify isolated account network before purge: %w", err)
 	}
 	name := containerName(account.AccountID)
-	out, inspectErr := d.runtime.executor.Run(ctx, d.runtime.config.DockerBinary, "container", "inspect", name)
-	if inspectErr != nil {
-		listed, listErr := d.runtime.executor.Run(
-			ctx,
-			d.runtime.config.DockerBinary,
-			"container", "ls", "--all", "--filter", "name=^/"+name+"$", "--format", "{{.Names}}",
-		)
-		if listErr != nil {
-			return fmt.Errorf("inspect account container before purge: %w", inspectErr)
-		}
-		if strings.TrimSpace(string(listed)) == "" {
-			if err := os.RemoveAll(dataDir); err != nil {
-				return fmt.Errorf("remove account data without a remaining container: %w", err)
-			}
-			return removeAccountNetwork(ctx, d.runtime.executor, d.runtime.config.DockerBinary, network, account.AccountID)
-		}
-		return fmt.Errorf("inspect existing account container before purge: %w", inspectErr)
-	}
-	if err := verifyPurgeContainer(out, name, account.AccountID, d.runtime.config.RedroidImage, dataDir); err != nil {
+	containerEpoch, containerExists, err := inspectPurgeContainer(
+		ctx, d.runtime.executor, d.runtime.config.DockerBinary,
+		name, account.AccountID, d.runtime.config.RedroidImage, dataDir,
+	)
+	if err != nil {
 		return err
 	}
-	cleanupName := name + "-purge"
-	cleanupArgs := []string{
-		"container", "run", "--rm",
-		"--pull", "never",
-		"--name", cleanupName,
-		"--network", "none",
-		"--read-only",
-		"--security-opt", "no-new-privileges:true",
-		"--cap-drop", "ALL",
-		"--cap-add", "DAC_OVERRIDE",
-		"--cap-add", "FOWNER",
-		"--label", labelDriver + "=wecom-purge",
-		"--label", labelAccount + "=" + account.AccountID,
-		"--mount", "type=bind,src=" + dataDir + ",dst=/account-data",
-		"--entrypoint", "/system/bin/sh",
-		d.runtime.config.RedroidImage,
-		"-c", `rm -rf -- /account-data/* /account-data/.[!.]* /account-data/..?*`,
-	}
-	if _, err := d.runtime.executor.Run(ctx, d.runtime.config.DockerBinary, cleanupArgs...); err != nil {
-		return fmt.Errorf("clear root-owned account data in restricted cleanup container: %w", err)
-	}
-	entries, err := os.ReadDir(dataDir)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("verify cleared account data: %w", err)
-	}
-	if len(entries) != 0 {
-		return errors.New("restricted cleanup container left account data behind")
-	}
-	if err == nil {
-		if err := os.Remove(dataDir); err != nil {
-			return fmt.Errorf("remove cleared account data directory: %w", err)
+	if data != nil {
+		device, inode, err := directoryIdentity(data.info)
+		if err != nil {
+			return err
+		}
+		if _, err := d.runtime.executor.RunInput(
+			ctx, nil, 4096,
+			d.runtime.config.DockerBinary,
+			weComPurgeCleanupArgs(
+				d.runtime.config.RedroidImage, dataDir, account.AccountID, device, inode,
+			)...,
+		); err != nil {
+			return fmt.Errorf("clear root-owned account data in restricted cleanup container: %w", err)
+		}
+		entries, err := readPinnedProfileDirectoryAt(data)
+		if err != nil {
+			return fmt.Errorf("verify pinned cleared account data: %w", err)
+		}
+		if len(entries) != 0 {
+			return errors.New("restricted cleanup container left pinned account data behind")
+		}
+		if err := verifyPinnedDirectoryCanonical(
+			dataDir, data, "WeCom Android data changed during purge",
+		); err != nil {
+			return err
 		}
 	}
-	if _, err := d.runtime.executor.Run(ctx, d.runtime.config.DockerBinary, "container", "rm", name); err != nil {
-		return fmt.Errorf("remove inactive WeCom container: %w", err)
+	if containerExists {
+		verifiedEpoch, stillExists, err := inspectPurgeContainer(
+			ctx, d.runtime.executor, d.runtime.config.DockerBinary,
+			name, account.AccountID, d.runtime.config.RedroidImage, dataDir,
+		)
+		if err != nil || !stillExists {
+			return fmt.Errorf("revalidate exact stopped WeCom container before purge removal: %w", err)
+		}
+		if !verifiedEpoch.equal(containerEpoch) {
+			return errors.New("exact stopped WeCom container changed during purge")
+		}
+		if _, err := d.runtime.executor.Run(
+			ctx, d.runtime.config.DockerBinary, "container", "rm", containerEpoch.ID,
+		); err != nil {
+			return fmt.Errorf("remove inactive WeCom container: %w", err)
+		}
+		_, remains, err := inspectPurgeContainer(
+			ctx, d.runtime.executor, d.runtime.config.DockerBinary,
+			name, account.AccountID, d.runtime.config.RedroidImage, dataDir,
+		)
+		if err != nil {
+			return fmt.Errorf("verify exact WeCom container name after purge removal: %w", err)
+		}
+		if remains {
+			return errors.New("WeCom container name changed during purge removal")
+		}
 	}
-	return removeAccountNetwork(ctx, d.runtime.executor, d.runtime.config.DockerBinary, network, account.AccountID)
+	if !networkExists {
+		networkID = ""
+	}
+	return removeAccountNetwork(
+		ctx, d.runtime.executor, d.runtime.config.DockerBinary,
+		network, account.AccountID, networkID,
+	)
 }
 
-type dockerContainerInspection struct {
-	Name   string `json:"Name"`
-	Config struct {
-		Image  string            `json:"Image"`
-		Labels map[string]string `json:"Labels"`
-	} `json:"Config"`
-	State struct {
-		Running bool `json:"Running"`
-	} `json:"State"`
-	Mounts []struct {
-		Type        string `json:"Type"`
-		Source      string `json:"Source"`
-		Destination string `json:"Destination"`
-		RW          bool   `json:"RW"`
-	} `json:"Mounts"`
+func inspectPurgeContainer(
+	ctx context.Context,
+	executor Executor,
+	dockerBinary, expectedName, accountID, image, dataDir string,
+) (containerExecutionEpoch, bool, error) {
+	out, inspectErr := executor.Run(ctx, dockerBinary, "container", "inspect", expectedName)
+	if inspectErr != nil {
+		listed, listErr := executor.Run(
+			ctx, dockerBinary,
+			"container", "ls", "--all", "--filter", "name=^/"+expectedName+"$", "--format", "{{.Names}}",
+		)
+		if listErr != nil {
+			return containerExecutionEpoch{}, false, fmt.Errorf("inspect account container before purge: %w", inspectErr)
+		}
+		if strings.TrimSpace(string(listed)) == "" {
+			return containerExecutionEpoch{}, false, nil
+		}
+		return containerExecutionEpoch{}, true, fmt.Errorf("inspect existing account container before purge: %w", inspectErr)
+	}
+	inspection, err := verifyPurgeContainer(out, expectedName, accountID, image, dataDir)
+	if err != nil {
+		return containerExecutionEpoch{}, true, err
+	}
+	epoch, err := stoppedContainerExecutionEpoch(inspection)
+	if err != nil {
+		return containerExecutionEpoch{}, true, fmt.Errorf("refusing to purge a container that is not exactly stopped: %w", err)
+	}
+	return epoch, true, nil
 }
 
-func verifyPurgeContainer(raw []byte, expectedName, accountID, image, dataDir string) error {
-	var inspections []dockerContainerInspection
+func verifyPurgeContainer(
+	raw []byte,
+	expectedName, accountID, image, dataDir string,
+) (runtimeContainerInspection, error) {
+	var inspections []runtimeContainerInspection
 	if err := json.Unmarshal(raw, &inspections); err != nil || len(inspections) != 1 {
-		return errors.New("cannot decode a unique container inspection before purge")
+		return runtimeContainerInspection{}, errors.New("cannot decode a unique container inspection before purge")
 	}
 	inspection := inspections[0]
 	if inspection.Name != "/"+expectedName ||
 		inspection.Config.Labels[labelDriver] != "wecom" ||
 		inspection.Config.Labels[labelAccount] != accountID ||
-		inspection.Config.Image != image {
-		return errors.New("refusing to purge a container without exact WeCom account ownership, name, and image")
-	}
-	if inspection.State.Running {
-		return errors.New("refusing to purge a running WeCom container")
+		inspection.Config.Image != image ||
+		inspection.Config.Hostname != containerHostname(accountID) {
+		return runtimeContainerInspection{}, errors.New("refusing to purge a container without exact WeCom account ownership, name, image, and hostname")
 	}
 	expectedSource := canonicalPath(dataDir)
 	matched := 0
@@ -236,13 +331,33 @@ func verifyPurgeContainer(raw []byte, expectedName, accountID, image, dataDir st
 		}
 		matched++
 		if mount.Type != "bind" || !mount.RW || canonicalPath(mount.Source) != expectedSource {
-			return errors.New("refusing to purge a container whose /data bind mount does not exactly match the account")
+			return runtimeContainerInspection{}, errors.New("refusing to purge a container whose /data bind mount does not exactly match the account")
 		}
 	}
 	if matched != 1 {
-		return errors.New("refusing to purge a container without exactly one verified /data bind mount")
+		return runtimeContainerInspection{}, errors.New("refusing to purge a container without exactly one verified /data bind mount")
 	}
-	return nil
+	return inspection, nil
+}
+
+func weComPurgeCleanupArgs(
+	image, dataDir, accountID string,
+	expectedDevice, expectedInode uint64,
+) []string {
+	const verifyAndClear = `actual=$(/system/bin/toybox stat -Lc %d:%i /account-data) || exit 71
+[ "$actual" = "$1:$2" ] || exit 72
+/system/bin/toybox rm -rf /account-data/* /account-data/.[!.]* /account-data/..?*`
+	return []string{
+		"container", "run", "--rm", "--pull", "never",
+		"--network", "none", "--read-only", "--pids-limit", "32", "--memory", "64m",
+		"--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+		"--security-opt", "no-new-privileges=true", "--user", "0:0",
+		"--label", labelDriver + "=wecom-purge", "--label", labelAccount + "=" + accountID,
+		"--mount", "type=bind,src=" + dataDir + ",dst=/account-data",
+		"--entrypoint", "/system/bin/toybox",
+		image, "sh", "-c", verifyAndClear, "wechatcopilot-purge",
+		strconv.FormatUint(expectedDevice, 10), strconv.FormatUint(expectedInode, 10),
+	}
 }
 
 func canonicalPath(path string) string {
@@ -301,55 +416,108 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (core.AuthSnapshot, error) {
 	if err != nil {
 		return core.AuthSnapshot{}, err
 	}
-	snapshot, err := client.Snapshot(ctx)
-	if err != nil {
-		return core.AuthSnapshot{}, err
-	}
 	android, err := d.runtime.Android()
 	if err != nil {
 		return core.AuthSnapshot{}, err
 	}
+	_, result, err := d.captureAuthSnapshot(ctx, client, android)
+	return result, err
+}
+
+// captureAuthSnapshot sandwiches one screenshot between two observations of
+// the same official window. Any advertised action is derived from the second
+// observation and the exact PNG returned with it.
+func (d *Driver) captureAuthSnapshot(
+	ctx context.Context,
+	client *CompanionClient,
+	android AndroidContainer,
+) (UISnapshot, core.AuthSnapshot, error) {
+	snapshot, err := client.Snapshot(ctx)
+	if err != nil {
+		return UISnapshot{}, core.AuthSnapshot{}, err
+	}
 	snapshot = withForegroundActivity(ctx, android, snapshot)
+	d.mu.Lock()
+	accountID := d.account.AccountID
+	d.mu.Unlock()
+	result := describeAuthSnapshot(snapshot, nil, accountID)
+	if !authScreenshotWindow(snapshot) {
+		return snapshot, result, nil
+	}
 	png, err := android.Screenshot(ctx)
 	if err != nil {
-		return core.AuthSnapshot{}, err
+		return UISnapshot{}, core.AuthSnapshot{}, err
 	}
+	verified, err := client.Snapshot(ctx)
+	if err != nil {
+		return UISnapshot{}, core.AuthSnapshot{}, err
+	}
+	verified = withForegroundActivity(ctx, android, verified)
+	verifiedResult := describeAuthSnapshot(verified, nil, accountID)
+	if !authScreenshotWindow(verified) {
+		if verifiedResult.State == core.StateOnline {
+			return verified, verifiedResult, nil
+		}
+		if verified.PackageName != DefaultWeComPackage {
+			return UISnapshot{}, core.AuthSnapshot{}, fmt.Errorf("%w: authentication image left the official WeCom package", ErrTargetAmbiguous)
+		}
+		return UISnapshot{}, core.AuthSnapshot{}, fmt.Errorf("%w: authentication image window changed before verification", ErrStale)
+	}
+	if !sameAuthenticationObservation(snapshot, verified) {
+		return UISnapshot{}, core.AuthSnapshot{}, fmt.Errorf("%w: authentication image changed during capture", ErrStale)
+	}
+	verifiedResult = describeAuthSnapshot(verified, png, accountID)
+	verifiedResult.ScreenshotPNG = png
+	if verifiedResult.Kind == core.AuthQR {
+		// The full login frame is deliberate: cropping an unverified visual
+		// region could present the wrong QR code to the user.
+		verifiedResult.QRCodePNG = png
+	}
+	return verified, verifiedResult, nil
+}
+
+func describeAuthSnapshot(snapshot UISnapshot, screenshotPNG []byte, accountID string) core.AuthSnapshot {
 	state, prompt := classifyLogin(snapshot)
 	kind := core.AuthPhoneConfirm
 	canSubmit := false
-	actions, actionPrompt := authenticationActions(snapshot)
+	var actions []core.AuthAction
+	actionPrompt := ""
+	if authScreenshotWindow(snapshot) {
+		actions, actionPrompt = authenticationActions(snapshot, screenshotPNG, accountID)
+	}
 	if len(actions) != 0 {
 		state = core.StateAuthRequired
 		prompt = actionPrompt
 	}
 	text := snapshotText(snapshot)
-	if validSMSAuthSnapshot(snapshot) {
+	if authScreenshotWindow(snapshot) && validSMSAuthSnapshot(snapshot) {
 		kind = core.AuthSMS
 		canSubmit = true
 	} else if state == core.StateAuthRequired && containsAny(text, "二维码", "扫码", "scan") {
 		kind = core.AuthQR
 	}
-	result := core.AuthSnapshot{
+	return core.AuthSnapshot{
 		Kind:          kind,
 		State:         state,
 		Prompt:        prompt,
-		ScreenshotPNG: png,
 		CanSubmitCode: canSubmit,
 		Actions:       actions,
 		ObservedAt:    time.Now().UTC(),
 	}
-	if kind == core.AuthQR {
-		// The full login frame is deliberate: cropping an unverified visual
-		// region could present the wrong QR code to the user.
-		result.QRCodePNG = png
+}
+
+func authScreenshotWindow(snapshot UISnapshot) bool {
+	if snapshot.PackageName != DefaultWeComPackage || snapshot.Sequence <= 0 || snapshot.WindowID < 0 ||
+		strings.TrimSpace(snapshot.WindowClass) == "" || !authenticationSurface(snapshot) {
+		return false
 	}
-	return result, nil
+	return isWeComActivity(snapshot, weComLoginWxAuthActivity) ||
+		isWeComActivity(snapshot, weComSMSVerifyActivity) || isWeComActivity(snapshot, weComLaunchActivity)
 }
 
 func (d *Driver) PerformAuthAction(ctx context.Context, request core.AuthActionRequest) error {
-	switch request.ActionID {
-	case acceptPrivacyPolicyAction, acceptWeComLoginTermsAction, continueWeComWithWechatAction:
-	default:
+	operation, ok := parseAuthActionID(request.ActionID)
+	if !ok {
 		return fmt.Errorf("%w: authentication action is not advertised", ErrStale)
 	}
 	if !request.Confirmed {
@@ -361,19 +529,21 @@ func (d *Driver) PerformAuthAction(ctx context.Context, request core.AuthActionR
 	if err != nil {
 		return err
 	}
-	snapshot, err := client.Snapshot(ctx)
-	if err != nil {
-		return err
-	}
 	android, err := d.runtime.Android()
 	if err != nil {
 		return err
 	}
-	snapshot = withForegroundActivity(ctx, android, snapshot)
+	snapshot, auth, err := d.captureAuthSnapshot(ctx, client, android)
+	if err != nil {
+		return err
+	}
+	if !exactImageBoundAuthAction(auth, request.ActionID) {
+		return fmt.Errorf("%w: authentication action generation is stale", ErrStale)
+	}
 	if snapshotRequiresUserAction(snapshot) {
 		return ErrUserActionRequired
 	}
-	switch request.ActionID {
+	switch operation {
 	case acceptPrivacyPolicyAction:
 		target, targetErr := uniquePrivacyConsentTarget(snapshot)
 		if targetErr != nil {
@@ -393,7 +563,7 @@ func (d *Driver) PerformAuthAction(ctx context.Context, request core.AuthActionR
 		if targetErr != nil {
 			return targetErr
 		}
-		if targets.terms.Checked {
+		if weComLoginTermsAccepted(targets.terms) {
 			return fmt.Errorf("%w: official WeCom login terms are already accepted", ErrStale)
 		}
 		if _, err = client.Act(ctx, CompanionAction{
@@ -401,7 +571,7 @@ func (d *Driver) PerformAuthAction(ctx context.Context, request core.AuthActionR
 		}); err != nil {
 			return markUncertainAuthActionConsumed(err)
 		}
-		if waitErr := waitForWeComLoginTermsChecked(ctx, client, android, snapshot.Sequence); waitErr != nil {
+		if waitErr := waitForWeComLoginTermsAccepted(ctx, client, android, snapshot.Sequence); waitErr != nil {
 			return core.MarkAuthActionConsumed(waitErr)
 		}
 		return nil
@@ -410,7 +580,7 @@ func (d *Driver) PerformAuthAction(ctx context.Context, request core.AuthActionR
 		if targetErr != nil {
 			return targetErr
 		}
-		if !targets.terms.Checked {
+		if !weComLoginTermsAccepted(targets.terms) {
 			return fmt.Errorf("%w: official WeCom login terms are not accepted", ErrStale)
 		}
 		if _, err = client.Act(ctx, CompanionAction{
@@ -425,6 +595,11 @@ func (d *Driver) PerformAuthAction(ctx context.Context, request core.AuthActionR
 	default:
 		return fmt.Errorf("%w: authentication action is not advertised", ErrStale)
 	}
+}
+
+func exactImageBoundAuthAction(snapshot core.AuthSnapshot, actionID string) bool {
+	return snapshot.State == core.StateAuthRequired && len(snapshot.Actions) == 1 &&
+		snapshot.Actions[0].ID == actionID && snapshot.Actions[0].ImageBound
 }
 
 func markUncertainAuthActionConsumed(err error) error {
@@ -514,7 +689,7 @@ func (d *Driver) ListConversations(ctx context.Context, query core.ConversationQ
 	if err != nil {
 		return nil, err
 	}
-	events, err := allEvents(ctx, client)
+	history, err := allEvents(ctx, client)
 	if err != nil {
 		return nil, err
 	}
@@ -522,7 +697,7 @@ func (d *Driver) ListConversations(ctx context.Context, query core.ConversationQ
 	accountID := d.account.AccountID
 	d.mu.Unlock()
 	byID := make(map[string]core.Conversation)
-	for _, event := range events {
+	for _, event := range history.Events {
 		title := event.Conversation
 		if title == "" {
 			title = event.Title
@@ -588,6 +763,12 @@ func (d *Driver) ReadMessages(ctx context.Context, query core.MessageQuery) ([]c
 	accountID := d.account.AccountID
 	d.mu.Unlock()
 	messages := make([]core.Message, 0, len(page.Events))
+	// An older companion or a page whose global cursor predates the ring cannot
+	// prove continuity for any conversation first observed on this page. New
+	// companions additionally carry event.GapBefore so the boundary survives
+	// later global pages and conversation filtering.
+	pageBoundaryApplied := make(map[string]bool)
+	pendingConversationGap := make(map[string]bool)
 	for _, event := range page.Events {
 		if event.PackageName != d.runtime.config.WeComPackage {
 			continue
@@ -600,6 +781,9 @@ func (d *Driver) ReadMessages(ctx context.Context, query core.MessageQuery) ([]c
 			title = event.Title
 		}
 		conversation := conversationID(accountID, event.ConversationKey)
+		if event.GapBefore {
+			pendingConversationGap[conversation] = true
+		}
 		if query.ConversationID != "" && query.ConversationID != conversation {
 			continue
 		}
@@ -609,7 +793,15 @@ func (d *Driver) ReadMessages(ctx context.Context, query core.MessageQuery) ([]c
 		id := messageID(accountID, event.Sequence)
 		surfaceRef := ""
 		if event.Openable {
-			surfaceRef = "wecom-notification:" + strconv.FormatInt(event.Sequence, 10)
+			surfaceRef = notificationSurfaceReference(accountID, event.Sequence)
+		}
+		gapBefore := pendingConversationGap[conversation]
+		if !page.Complete && !pageBoundaryApplied[conversation] {
+			gapBefore = true
+			pageBoundaryApplied[conversation] = true
+		}
+		if gapBefore {
+			delete(pendingConversationGap, conversation)
 		}
 		messages = append(messages, core.Message{
 			ID:             id,
@@ -624,6 +816,7 @@ func (d *Driver) ReadMessages(ctx context.Context, query core.MessageQuery) ([]c
 			Complete:       false,
 			Confidence:     0.7,
 			Sequence:       event.Sequence,
+			GapBefore:      gapBefore,
 		})
 	}
 	return messages, nil
@@ -656,37 +849,68 @@ func (d *Driver) Send(ctx context.Context, request core.SendRequest) (core.SendR
 	if err != nil {
 		return core.SendResult{}, err
 	}
-	if err := d.openNotificationConversation(ctx, client, event); err != nil {
-		return core.SendResult{}, err
-	}
-	snapshot, err := client.Snapshot(ctx)
+	frame, err := d.openNotificationConversation(ctx, client, event)
 	if err != nil {
 		return core.SendResult{}, err
 	}
-	baseline := countNodeText(snapshot, request.Text)
-	input, err := uniqueNode(snapshot, func(node Node) bool { return node.Editable && node.Enabled })
-	if err != nil {
-		return core.SendResult{}, fmt.Errorf("locate message input: %w", err)
-	}
-	if _, err := client.Act(ctx, CompanionAction{Kind: ActionSetText, NodeID: input.ID, Text: request.Text, ExpectedSequence: snapshot.Sequence}); err != nil {
+	baseline := len(outgoingBubbleEvidence(frame.snapshot, request.Text, frame.binding))
+	if _, err := client.Act(ctx, CompanionAction{
+		Kind: ActionSetText, NodeID: frame.composer.ID, Text: request.Text,
+		ExpectedSequence: frame.snapshot.Sequence,
+	}); err != nil {
 		return core.SendResult{}, err
 	}
-	updated, err := waitForSnapshotChange(ctx, client, snapshot.Sequence)
+	updated, err := waitForSnapshotChange(ctx, client, frame.snapshot.Sequence)
 	if err != nil {
 		return core.SendResult{}, err
 	}
-	button, err := uniqueNode(updated, func(node Node) bool {
-		return node.Clickable && matchesAny(nodeLabel(node), "发送", "send")
-	})
+	android, err := d.runtime.Android()
 	if err != nil {
-		return core.SendResult{}, fmt.Errorf("locate send button: %w", err)
+		return core.SendResult{}, err
 	}
-	if _, err := client.Act(ctx, CompanionAction{Kind: ActionClick, NodeID: button.ID, ExpectedSequence: updated.Sequence}); err != nil {
+	updated = withForegroundActivity(ctx, android, updated)
+	prepared, err := validateChatFrame(updated, eventConversationTitle(event), &frame.binding, true)
+	if err != nil {
+		return core.SendResult{}, fmt.Errorf("revalidate message composer after setting text: %w", err)
+	}
+	if prepared.composer.Text != request.Text {
+		return core.SendResult{}, fmt.Errorf("%w: message composer did not contain the exact requested text", ErrStale)
+	}
+
+	// Capture the exact semantic tree a second time immediately before the
+	// external write. This also arms the companion's one-shot snapshot guard
+	// for this precise sequence and prevents a stale prepared frame from being
+	// used if a dialog, conversation, or control changed in the meantime.
+	verified, err := client.Snapshot(ctx)
+	if err != nil {
+		return core.SendResult{}, err
+	}
+	verified = withForegroundActivity(ctx, android, verified)
+	preparedAgain, err := validateChatFrame(verified, eventConversationTitle(event), &frame.binding, true)
+	if err != nil {
+		return core.SendResult{}, fmt.Errorf("revalidate message composer before send: %w", err)
+	}
+	if preparedAgain.snapshot.Sequence != prepared.snapshot.Sequence ||
+		surfaceContextDigest(preparedAgain.snapshot) != surfaceContextDigest(prepared.snapshot) ||
+		preparedAgain.composer.Text != request.Text || preparedAgain.send != prepared.send {
+		return core.SendResult{}, fmt.Errorf("%w: prepared message frame changed before send", ErrStale)
+	}
+
+	if _, err := client.Act(ctx, CompanionAction{
+		Kind: ActionClick, NodeID: preparedAgain.send.ID,
+		ExpectedSequence: preparedAgain.snapshot.Sequence,
+	}); err != nil {
+		if !errors.Is(err, ErrActionOutcomeUncertain) {
+			return core.SendResult{}, err
+		}
 		result := core.SendResult{Uncertain: true, Detail: "send action may have reached the official client, but its result was not observed"}
 		d.rememberSend(request.IdempotencyKey, digest, result)
 		return result, nil
 	}
-	confirmed, verifyErr := waitForNodeTextIncrease(ctx, client, request.Text, baseline, 8*time.Second)
+	confirmed, verifyErr := waitForDirectionalOutgoingBubble(
+		ctx, client, android, eventConversationTitle(event), frame.binding,
+		request.Text, baseline, preparedAgain.snapshot.Sequence, 8*time.Second,
+	)
 	if verifyErr != nil || !confirmed {
 		result := core.SendResult{Uncertain: true, Detail: ErrSendUncertain.Error()}
 		d.rememberSend(request.IdempotencyKey, digest, result)
@@ -695,7 +919,7 @@ func (d *Driver) Send(ctx context.Context, request core.SendRequest) (core.SendR
 	result := core.SendResult{
 		MessageID: "wecom-ui-" + digestID(request.IdempotencyKey),
 		Verified:  true,
-		Detail:    "outbound bubble observed in the official client",
+		Detail:    "a stable new right-aligned outbound bubble was observed in the bound official conversation",
 	}
 	d.rememberSend(request.IdempotencyKey, digest, result)
 	return result, nil
@@ -721,13 +945,19 @@ func (d *Driver) OpenSurface(ctx context.Context, reference string) (core.Surfac
 	if reference == "" {
 		return core.Surface{}, errors.New("surface reference is required")
 	}
-	sequenceText, ok := strings.CutPrefix(reference, "wecom-notification:")
+	payload, ok := strings.CutPrefix(reference, "wecom-notification:")
 	if !ok {
 		return core.Surface{}, fmt.Errorf("%w: v0 opens only message-backed WeCom notification references", ErrUnsupportedCapability)
 	}
+	d.mu.Lock()
+	accountID := d.account.AccountID
+	d.mu.Unlock()
+	sequenceText, scope, ok := strings.Cut(payload, ":")
 	sequence, err := strconv.ParseInt(sequenceText, 10, 64)
-	if err != nil || sequence <= 0 {
-		return core.Surface{}, fmt.Errorf("%w: notification surface reference is invalid", ErrNotFound)
+	if !ok || strings.Contains(scope, ":") || err != nil || sequence <= 0 ||
+		strconv.FormatInt(sequence, 10) != sequenceText || accountID == "" ||
+		scope != notificationSurfaceScope(accountID, sequence) {
+		return core.Surface{}, fmt.Errorf("%w: notification surface reference is invalid for the active account", ErrNotFound)
 	}
 	client, err := d.runtime.Companion()
 	if err != nil {
@@ -751,30 +981,24 @@ func (d *Driver) OpenSurface(ctx context.Context, reference string) (core.Surfac
 	if err != nil {
 		return core.Surface{}, err
 	}
-	if snapshotShowsAuthRequired(opened) {
-		return core.Surface{}, ErrAuthRequired
-	}
-	if snapshotRequiresUserAction(opened) {
-		return core.Surface{}, ErrUserActionRequired
-	}
-	if opened.PackageName != d.runtime.config.WeComPackage {
-		return core.Surface{}, fmt.Errorf("%w: notification opened outside the verified WeCom package", ErrTargetAmbiguous)
-	}
 	return d.recordSurface(ctx, opened)
 }
 
 func (d *Driver) notificationEvent(ctx context.Context, client *CompanionClient, sequence int64) (CompanionEvent, error) {
-	events, err := allEvents(ctx, client)
+	history, err := allEvents(ctx, client)
 	if err != nil {
 		return CompanionEvent{}, err
 	}
 	var matches []CompanionEvent
-	for _, event := range events {
+	for _, event := range history.Events {
 		if event.Sequence == sequence && event.PackageName == d.runtime.config.WeComPackage {
 			matches = append(matches, event)
 		}
 	}
 	if len(matches) == 0 {
+		if !history.Complete {
+			return CompanionEvent{}, fmt.Errorf("%w: notification sequence may precede a gap in the bounded journal", ErrStale)
+		}
 		return CompanionEvent{}, fmt.Errorf("%w: notification sequence is absent from the bounded journal", ErrNotFound)
 	}
 	if len(matches) != 1 {
@@ -787,7 +1011,7 @@ func (d *Driver) SnapshotSurface(ctx context.Context, surfaceID string) (core.Su
 	d.operationMu.Lock()
 	defer d.operationMu.Unlock()
 	d.mu.Lock()
-	_, exists := d.surfaces[surfaceID]
+	state, exists := d.surfaces[surfaceID]
 	d.mu.Unlock()
 	if !exists {
 		return core.Surface{}, fmt.Errorf("%w: unknown or closed surface", ErrNotFound)
@@ -800,7 +1024,7 @@ func (d *Driver) SnapshotSurface(ctx context.Context, surfaceID string) (core.Su
 	if err != nil {
 		return core.Surface{}, err
 	}
-	return d.updateSurface(ctx, surfaceID, snapshot)
+	return d.updateSurface(ctx, surfaceID, snapshot, state.identity)
 }
 
 func (d *Driver) ActSurface(ctx context.Context, surfaceID string, action core.SurfaceAction) (core.Surface, error) {
@@ -808,7 +1032,7 @@ func (d *Driver) ActSurface(ctx context.Context, surfaceID string, action core.S
 	defer d.operationMu.Unlock()
 	d.mu.Lock()
 	state, exists := d.surfaces[surfaceID]
-	companionAction, allowed := state.actions[action.ActionID]
+	boundAction, allowed := state.actions[action.ActionID]
 	d.mu.Unlock()
 	if !exists {
 		return core.Surface{}, fmt.Errorf("%w: unknown or closed surface", ErrNotFound)
@@ -816,10 +1040,29 @@ func (d *Driver) ActSurface(ctx context.Context, surfaceID string, action core.S
 	if !allowed {
 		return core.Surface{}, fmt.Errorf("%w: surface action was not advertised", ErrStale)
 	}
+	risk := strings.ToLower(strings.TrimSpace(boundAction.advertised.Risk))
+	effect := strings.ToLower(strings.TrimSpace(boundAction.advertised.Effect))
+	if boundAction.advertised.Disabled || risk == "high" || risk == "sensitive" || risk == "destructive" ||
+		effect == "high_risk" || effect == "sensitive" || effect == "destructive" {
+		return core.Surface{}, ErrUserActionRequired
+	}
+	if !action.TextProvided && action.Text != "" {
+		return core.Surface{}, fmt.Errorf("%w: surface action text presence is inconsistent", ErrInvalidArgument)
+	}
+	companionAction := boundAction.companion
 	if companionAction.Kind == ActionSetText {
+		if !action.TextProvided {
+			return core.Surface{}, fmt.Errorf("%w: set-text requires an explicitly provided text value", ErrInvalidArgument)
+		}
 		companionAction.Text = action.Text
-	} else if action.Text != "" {
-		return core.Surface{}, fmt.Errorf("%w: this surface action does not accept text", ErrUnsupportedCapability)
+	} else if action.TextProvided || action.Text != "" {
+		return core.Surface{}, fmt.Errorf("%w: this surface action does not accept text", ErrInvalidArgument)
+	}
+	if action.TextProvided && (utf8.RuneCountInString(action.Text) > 4_096 || strings.ContainsRune(action.Text, '\x00')) {
+		return core.Surface{}, fmt.Errorf("%w: surface input text must not exceed 4096 characters or contain NUL", ErrInvalidArgument)
+	}
+	if (risk != "low" || effect == "external_write") && !action.Confirmed {
+		return core.Surface{}, ErrConfirmationRequired
 	}
 	client, err := d.runtime.Companion()
 	if err != nil {
@@ -829,28 +1072,51 @@ func (d *Driver) ActSurface(ctx context.Context, surfaceID string, action core.S
 	if err != nil {
 		return core.Surface{}, err
 	}
+	before, _, err = d.prepareSurfaceSnapshot(ctx, before)
+	if err != nil {
+		return core.Surface{}, err
+	}
+	if !state.identity.matches(before) {
+		return core.Surface{}, fmt.Errorf("%w: surface window identity changed before action", ErrStale)
+	}
 	if before.Sequence != state.sequence {
 		return core.Surface{}, fmt.Errorf("%w: surface changed since the action was advertised", ErrStale)
 	}
-	if surfaceHighRisk(before) && (companionAction.Kind == ActionClick || companionAction.Kind == ActionSetText) {
-		return core.Surface{}, fmt.Errorf("%w: mutating actions are disabled on a high-risk surface", ErrUserActionRequired)
+	if err := validateSurfaceActionState(surfaceID, before, boundAction); err != nil {
+		return core.Surface{}, err
 	}
 	companionAction.ExpectedSequence = before.Sequence
+	if !d.consumeSurfaceAction(surfaceID, action.ActionID, boundAction) {
+		return core.Surface{}, fmt.Errorf("%w: surface action was already consumed", ErrStale)
+	}
+	if shouldTombstoneSurfaceReplay(effect, true) && effect != "navigate" {
+		d.tombstoneSurfaceReplay(surfaceID, boundAction.replayID)
+	}
 	if _, err := client.Act(ctx, companionAction); err != nil {
+		if shouldTombstoneSurfaceReplay(effect, false) {
+			d.tombstoneSurfaceReplay(surfaceID, boundAction.replayID)
+		}
 		return core.Surface{}, err
 	}
 	after, err := waitForSnapshotChange(ctx, client, before.Sequence)
 	if err != nil {
+		if shouldTombstoneSurfaceReplay(effect, false) {
+			d.tombstoneSurfaceReplay(surfaceID, boundAction.replayID)
+		}
 		return core.Surface{}, err
 	}
-	return d.updateSurface(ctx, surfaceID, after)
+	result, err := d.updateSurface(ctx, surfaceID, after, state.identity)
+	if err != nil && shouldTombstoneSurfaceReplay(effect, false) {
+		d.tombstoneSurfaceReplay(surfaceID, boundAction.replayID)
+	}
+	return result, err
 }
 
 func (d *Driver) CloseSurface(ctx context.Context, surfaceID string) error {
 	d.operationMu.Lock()
 	defer d.operationMu.Unlock()
 	d.mu.Lock()
-	_, exists := d.surfaces[surfaceID]
+	state, exists := d.surfaces[surfaceID]
 	d.mu.Unlock()
 	if !exists {
 		return fmt.Errorf("%w: unknown or closed surface", ErrNotFound)
@@ -859,7 +1125,23 @@ func (d *Driver) CloseSurface(ctx context.Context, surfaceID string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := client.Act(ctx, CompanionAction{Kind: ActionGlobalBack}); err != nil {
+	snapshot, err := client.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	snapshot, _, err = d.prepareSurfaceSnapshot(ctx, snapshot)
+	if err != nil {
+		return err
+	}
+	if !state.identity.matches(snapshot) {
+		return fmt.Errorf("%w: surface window identity changed before close", ErrStale)
+	}
+	if snapshot.Sequence != state.sequence {
+		return fmt.Errorf("%w: surface changed since close was requested", ErrStale)
+	}
+	if _, err := client.Act(ctx, CompanionAction{
+		Kind: ActionGlobalBack, ExpectedSequence: snapshot.Sequence,
+	}); err != nil {
 		return err
 	}
 	d.mu.Lock()
@@ -873,7 +1155,7 @@ func (d *Driver) resolveConversationEvent(ctx context.Context, id string) (Compa
 	if err != nil {
 		return CompanionEvent{}, err
 	}
-	events, err := allEvents(ctx, client)
+	history, err := allEvents(ctx, client)
 	if err != nil {
 		return CompanionEvent{}, err
 	}
@@ -881,12 +1163,15 @@ func (d *Driver) resolveConversationEvent(ctx context.Context, id string) (Compa
 	accountID := d.account.AccountID
 	d.mu.Unlock()
 	var matches []CompanionEvent
-	for _, event := range events {
+	for _, event := range history.Events {
 		if event.PackageName == d.runtime.config.WeComPackage && sha256Pattern.MatchString(event.ConversationKey) && conversationID(accountID, event.ConversationKey) == id {
 			matches = append(matches, event)
 		}
 	}
 	if len(matches) == 0 {
+		if !history.Complete {
+			return CompanionEvent{}, fmt.Errorf("%w: conversation may precede a gap in the bounded notification journal", ErrStale)
+		}
 		return CompanionEvent{}, fmt.Errorf("%w: conversation ID is not present in the bounded notification journal", ErrNotFound)
 	}
 	title := matches[0].Conversation
@@ -912,33 +1197,51 @@ func (d *Driver) resolveConversationEvent(ctx context.Context, id string) (Compa
 	return latest, nil
 }
 
-func (d *Driver) openNotificationConversation(ctx context.Context, client *CompanionClient, event CompanionEvent) error {
+func (d *Driver) openNotificationConversation(ctx context.Context, client *CompanionClient, event CompanionEvent) (chatFrame, error) {
 	snapshot, err := client.Snapshot(ctx)
 	if err != nil {
-		return err
+		return chatFrame{}, err
 	}
 	sequence := strconv.FormatInt(event.Sequence, 10)
 	if _, err := client.Act(ctx, CompanionAction{Kind: ActionOpenNotification, NodeID: sequence}); err != nil {
-		return fmt.Errorf("%w: open verified conversation notification: %w", ErrStale, err)
+		return chatFrame{}, fmt.Errorf("%w: open verified conversation notification: %w", ErrStale, err)
 	}
 	opened, err := waitForSnapshotChange(ctx, client, snapshot.Sequence)
 	if err != nil {
-		return err
+		return chatFrame{}, err
 	}
-	if snapshotShowsAuthRequired(opened) {
-		return ErrAuthRequired
+	android, err := d.runtime.Android()
+	if err != nil {
+		return chatFrame{}, err
 	}
-	if snapshotRequiresUserAction(opened) {
-		return ErrUserActionRequired
+	opened = withForegroundActivity(ctx, android, opened)
+	frame, err := validateChatFrame(opened, eventConversationTitle(event), nil, false)
+	if err != nil {
+		return chatFrame{}, err
 	}
-	title := event.Conversation
-	if title == "" {
-		title = event.Title
+	// Require a second identical semantic observation before returning a frame
+	// that can be used to prepare an external write.
+	stable, err := client.Snapshot(ctx)
+	if err != nil {
+		return chatFrame{}, err
 	}
-	if opened.PackageName != d.runtime.config.WeComPackage || !snapshotConfirmsTitle(opened, title) {
-		return fmt.Errorf("%w: opened notification did not confirm the exact conversation title", ErrTargetAmbiguous)
+	stable = withForegroundActivity(ctx, android, stable)
+	stableFrame, err := validateChatFrame(stable, eventConversationTitle(event), &frame.binding, false)
+	if err != nil {
+		return chatFrame{}, err
 	}
-	return nil
+	if stableFrame.snapshot.Sequence != frame.snapshot.Sequence ||
+		surfaceContextDigest(stableFrame.snapshot) != surfaceContextDigest(frame.snapshot) {
+		return chatFrame{}, fmt.Errorf("%w: opened conversation changed before send preparation", ErrStale)
+	}
+	return stableFrame, nil
+}
+
+func eventConversationTitle(event CompanionEvent) string {
+	if strings.TrimSpace(event.Conversation) != "" {
+		return strings.TrimSpace(event.Conversation)
+	}
+	return strings.TrimSpace(event.Title)
 }
 
 func (d *Driver) recordSurface(ctx context.Context, snapshot UISnapshot) (core.Surface, error) {
@@ -946,11 +1249,23 @@ func (d *Driver) recordSurface(ctx context.Context, snapshot UISnapshot) (core.S
 	accountID := d.account.AccountID
 	d.mu.Unlock()
 	id := "surface-" + digestID(accountID+":"+strconv.FormatInt(time.Now().UnixNano(), 10))
-	return d.updateSurface(ctx, id, snapshot)
+	return d.updateSurface(ctx, id, snapshot, surfaceIdentity{})
 }
 
-func (d *Driver) updateSurface(ctx context.Context, id string, snapshot UISnapshot) (core.Surface, error) {
-	android, err := d.runtime.Android()
+func (d *Driver) updateSurface(
+	ctx context.Context,
+	id string,
+	snapshot UISnapshot,
+	bound surfaceIdentity,
+) (core.Surface, error) {
+	snapshot, android, err := d.prepareSurfaceSnapshot(ctx, snapshot)
+	if err != nil {
+		return core.Surface{}, err
+	}
+	if bound.valid() && !bound.matches(snapshot) {
+		return core.Surface{}, fmt.Errorf("%w: surface window identity changed", ErrStale)
+	}
+	client, err := d.runtime.Companion()
 	if err != nil {
 		return core.Surface{}, err
 	}
@@ -958,13 +1273,39 @@ func (d *Driver) updateSurface(ctx context.Context, id string, snapshot UISnapsh
 	if err != nil {
 		return core.Surface{}, err
 	}
+	verified, err := client.Snapshot(ctx)
+	if err != nil {
+		return core.Surface{}, err
+	}
+	verified, _, err = d.prepareSurfaceSnapshot(ctx, verified)
+	if err != nil {
+		return core.Surface{}, err
+	}
+	if !sameSurfaceObservation(snapshot, verified) {
+		return core.Surface{}, fmt.Errorf("%w: surface changed during screenshot capture", ErrStale)
+	}
+	snapshot = verified
+	identity := identityForSurface(snapshot)
+	contextDigest := surfaceContextDigest(snapshot)
+	d.mu.Lock()
+	previous, hasPrevious := d.surfaces[id]
+	consumedActions := make(map[string]struct{})
+	replayTombstones := make(map[string]struct{})
+	if hasPrevious && previous.identity == identity {
+		for actionID := range previous.consumedActions {
+			consumedActions[actionID] = struct{}{}
+		}
+		for replayID := range previous.replayTombstones {
+			replayTombstones[replayID] = struct{}{}
+		}
+	}
+	d.mu.Unlock()
 	actions := make([]core.Action, 0)
-	allowed := make(map[string]CompanionAction)
-	highRisk := surfaceHighRisk(snapshot)
+	allowed := make(map[string]surfaceActionState)
+	highRisk := surfaceHighRisk(snapshot) || authenticationSurface(snapshot)
 	for _, node := range snapshot.Nodes {
-		label := nodeLabel(node)
-		if label == "" {
-			label = node.ClassName
+		if node.ID == "" || !node.VisibleToUser || !validNodeBounds(node.Bounds) {
+			continue
 		}
 		var kinds []string
 		if node.Editable && node.Enabled {
@@ -977,51 +1318,469 @@ func (d *Driver) updateSurface(ctx context.Context, id string, snapshot UISnapsh
 			kinds = append(kinds, ActionScrollForward, ActionScrollBackward)
 		}
 		for _, kind := range kinds {
-			actionID := "act-" + digestID(id+":"+node.ID+":"+kind)
-			actionLabel := label
-			if kind == ActionScrollForward {
-				actionLabel = "Scroll forward: " + label
-			} else if kind == ActionScrollBackward {
-				actionLabel = "Scroll backward: " + label
+			actionLabel := surfaceActionLabel(snapshot, node, kind)
+			risk, effect := classifySurfaceAction(snapshot, node, kind)
+			agreementClick := kind == ActionClick && isWeComLoginAgreementImage(node)
+			if highRisk || agreementClick {
+				risk, effect = "high", "high_risk"
 			}
-			action := core.Action{ID: actionID, Label: actionLabel, Kind: kind}
-			mutating := kind == ActionClick || kind == ActionSetText
-			if mutating && (highRisk || sensitiveSurfaceLabel(label)) {
-				action.Risk = "high"
-				action.Disabled = true
-			} else {
-				allowed[actionID] = CompanionAction{Kind: kind, NodeID: node.ID}
+			boundAction := bindSurfaceAction(id, snapshot, node, kind, actionLabel, risk, effect, contextDigest)
+			actionID := boundAction.advertised.ID
+			if _, consumed := consumedActions[actionID]; consumed {
+				continue
 			}
+			if _, tombstoned := replayTombstones[boundAction.replayID]; tombstoned {
+				continue
+			}
+			allowed[actionID] = boundAction
+			action := boundAction.advertised
 			actions = append(actions, action)
 		}
 	}
+	screenshotDigest := sha256.Sum256(png)
 	surface := core.Surface{
-		ID:         id,
-		Kind:       classifySurfaceKind(snapshot),
-		Title:      snapshot.WindowTitle,
-		Screenshot: png,
-		Actions:    actions,
-		ObservedAt: time.Now().UTC(),
+		ID: id, Kind: classifySurfaceKind(snapshot), Title: snapshot.WindowTitle,
+		Generation: contextDigest, Screenshot: png, ScreenshotSHA256: hex.EncodeToString(screenshotDigest[:]),
+		Actions: actions, ObservedAt: time.Now().UTC(),
 	}
 	d.mu.Lock()
-	d.surfaces[id] = surfaceState{surface: surface, actions: allowed, sequence: snapshot.Sequence}
+	d.surfaces[id] = surfaceState{
+		surface: surface, actions: allowed, consumedActions: consumedActions,
+		replayTombstones: replayTombstones, sequence: snapshot.Sequence, identity: identity,
+	}
 	d.mu.Unlock()
 	return surface, nil
 }
 
-func privacyConsentActions(snapshot UISnapshot) []core.AuthAction {
+func (d *Driver) prepareSurfaceSnapshot(ctx context.Context, snapshot UISnapshot) (UISnapshot, AndroidContainer, error) {
+	if snapshot.PackageName != d.runtime.config.WeComPackage || snapshot.PackageName != DefaultWeComPackage {
+		return snapshot, AndroidContainer{}, fmt.Errorf("%w: surface left the verified WeCom package", ErrTargetAmbiguous)
+	}
+	android, err := d.runtime.Android()
+	if err != nil {
+		return snapshot, AndroidContainer{}, err
+	}
+	snapshot = withForegroundActivity(ctx, android, snapshot)
+	if err := validateSurfaceSnapshot(snapshot); err != nil {
+		return snapshot, AndroidContainer{}, err
+	}
+	return snapshot, android, nil
+}
+
+func validateSurfaceSnapshot(snapshot UISnapshot) error {
+	if snapshot.PackageName != DefaultWeComPackage {
+		return fmt.Errorf("%w: surface is outside the official WeCom package", ErrTargetAmbiguous)
+	}
+	if snapshotRequiresUserAction(snapshot) || hasPrivacyConsentModalMarker(snapshot) {
+		return fmt.Errorf("%w: sensitive verification or privacy screen is active", ErrUserActionRequired)
+	}
+	if authenticationSurface(snapshot) {
+		return ErrAuthRequired
+	}
+	if surfaceHighRisk(snapshot) {
+		return fmt.Errorf("%w: high-risk surface requires direct user interaction", ErrUserActionRequired)
+	}
+	if snapshot.Sequence <= 0 || snapshot.WindowID < 0 || strings.TrimSpace(snapshot.WindowClass) == "" {
+		return fmt.Errorf("%w: surface window identity is incomplete", ErrStale)
+	}
+	return nil
+}
+
+func identityForSurface(snapshot UISnapshot) surfaceIdentity {
+	return surfaceIdentity{
+		packageName: snapshot.PackageName,
+		windowID:    snapshot.WindowID,
+		windowClass: strings.TrimSpace(snapshot.WindowClass),
+	}
+}
+
+func (identity surfaceIdentity) valid() bool {
+	return identity.packageName != "" && identity.windowID >= 0 && identity.windowClass != ""
+}
+
+func (identity surfaceIdentity) matches(snapshot UISnapshot) bool {
+	return identity.valid() &&
+		identity.packageName == snapshot.PackageName && identity.windowID == snapshot.WindowID &&
+		identity.windowClass == strings.TrimSpace(snapshot.WindowClass)
+}
+
+func sameSurfaceObservation(before, after UISnapshot) bool {
+	return before.Sequence > 0 && before.Sequence == after.Sequence &&
+		identityForSurface(before).valid() && identityForSurface(before).matches(after)
+}
+
+func bindSurfaceAction(
+	surfaceID string,
+	snapshot UISnapshot,
+	node Node,
+	kind, label, risk, effect, contextDigest string,
+) surfaceActionState {
+	identity := identityForSurface(snapshot)
+	nodeSignature := surfaceNodeSignature(node)
+	replayID := "replay-" + digestID(strings.Join([]string{
+		"wecom-surface-replay-v1", identity.packageName, strconv.Itoa(identity.windowID),
+		identity.windowClass, node.ID, kind,
+	}, "\x00"))
+	payload := struct {
+		Domain        string
+		SurfaceID     string
+		Sequence      int64
+		PackageName   string
+		WindowID      int
+		WindowClass   string
+		ContextDigest string
+		NodeID        string
+		NodeSignature string
+		Label         string
+		Bounds        Bounds
+		Kind          string
+		Risk          string
+		Effect        string
+	}{
+		Domain: "wecom-surface-action-v1", SurfaceID: surfaceID, Sequence: snapshot.Sequence,
+		PackageName: identity.packageName, WindowID: identity.windowID, WindowClass: identity.windowClass,
+		ContextDigest: contextDigest, NodeID: node.ID, NodeSignature: nodeSignature,
+		Label: label, Bounds: node.Bounds, Kind: kind, Risk: risk, Effect: effect,
+	}
+	encoded, _ := json.Marshal(payload)
+	actionID := "act-" + digestID(string(encoded))
+	disabled := risk == "high" || risk == "sensitive" || risk == "destructive" ||
+		effect == "high_risk" || effect == "sensitive" || effect == "destructive"
+	return surfaceActionState{
+		advertised: core.Action{
+			ID: actionID, TargetID: "target-" + digestID(replayID+"\x00"+nodeSignature),
+			Label: label, Kind: kind, Risk: risk, Effect: effect, Disabled: disabled,
+		},
+		companion: CompanionAction{Kind: kind, NodeID: node.ID}, replayID: replayID,
+		nodeSignature: nodeSignature, contextDigest: contextDigest, label: label,
+		bounds: node.Bounds, sequence: snapshot.Sequence, identity: identity,
+	}
+}
+
+func surfaceContextDigest(snapshot UISnapshot) string {
+	payload := struct {
+		Domain      string
+		PackageName string
+		WindowID    int
+		WindowTitle string
+		WindowClass string
+		Nodes       []Node
+	}{
+		Domain: "wecom-surface-context-v1", PackageName: snapshot.PackageName,
+		WindowID: snapshot.WindowID, WindowTitle: snapshot.WindowTitle,
+		WindowClass: strings.TrimSpace(snapshot.WindowClass), Nodes: snapshot.Nodes,
+	}
+	encoded, _ := json.Marshal(payload)
+	return digestID(string(encoded))
+}
+
+func surfaceNodeSignature(node Node) string {
+	payload := struct {
+		Domain string
+		Node   Node
+	}{Domain: "wecom-surface-node-v1", Node: node}
+	encoded, _ := json.Marshal(payload)
+	return digestID(string(encoded))
+}
+
+func validNodeBounds(bounds Bounds) bool {
+	return bounds.Right > bounds.Left && bounds.Bottom > bounds.Top
+}
+
+func surfaceActionLabel(snapshot UISnapshot, node Node, kind string) string {
+	labels := nodeUserFacingValues(node)
+	if kind == ActionClick {
+		// Android frequently puts a button's visible label on a child TextView.
+		// Include direct, bounded children in the advertised label so an agent
+		// never sees only a benign parent label while safety classification sees
+		// a destructive child label.
+		for _, candidate := range snapshot.Nodes {
+			if candidate.ParentID != node.ID || !candidate.VisibleToUser ||
+				!usableBounds(candidate.Bounds) || !boundsContains(node.Bounds, candidate.Bounds) {
+				continue
+			}
+			labels = appendDistinctSemanticValues(labels, nodeUserFacingValues(candidate)...)
+		}
+	}
+	label := strings.Join(labels, " — ")
+	if label == "" {
+		label = node.ClassName
+	}
+	switch kind {
+	case ActionScrollForward:
+		return "Scroll forward: " + label
+	case ActionScrollBackward:
+		return "Scroll backward: " + label
+	default:
+		return label
+	}
+}
+
+func classifySurfaceAction(snapshot UISnapshot, node Node, kind string) (risk, effect string) {
+	switch kind {
+	case ActionScrollForward, ActionScrollBackward:
+		return "low", "observe"
+	case ActionSetText:
+		if uniqueSearchInput(snapshot, node) {
+			return "low", "search_input"
+		}
+		return "medium", "unknown"
+	case ActionClick:
+		if destructiveSurfaceAction(snapshot, node) ||
+			(isWeComActivity(snapshot, weComConversationActivity) && sensitiveConversationControl(snapshot, node)) ||
+			(!isWeComActivity(snapshot, weComConversationActivity) && sensitiveSurfaceLabel(actionSemanticEvidence(snapshot, node))) {
+			return "high", "high_risk"
+		}
+		if externalWriteSurfaceAction(snapshot, node) {
+			return "medium", "external_write"
+		}
+		if actionMatchesAny(snapshot, node,
+			"返回", "关闭", "取消", "查看", "详情", "打开", "上一页", "下一页", "首页",
+			"back", "close", "cancel", "view", "details", "open", "previous", "next", "home",
+		) {
+			return "low", "navigate"
+		}
+		return "medium", "unknown"
+	default:
+		return "medium", "unknown"
+	}
+}
+
+func destructiveSurfaceAction(snapshot UISnapshot, target Node) bool {
+	conversation := isWeComActivity(snapshot, weComConversationActivity)
+	for _, node := range actionSemanticNodes(snapshot, target) {
+		for _, value := range nodeUserFacingValues(node) {
+			if (!conversation && destructiveSurfaceLabel(value, "")) ||
+				(conversation && destructiveConversationControlLabel(value)) {
+				return true
+			}
+		}
+		if destructiveSurfaceLabel("", node.ViewID+" "+node.ClassName) {
+			return true
+		}
+	}
+	return false
+}
+
+func destructiveConversationControlLabel(value string) bool {
+	if matchesAny(value,
+		"删除", "移除", "清空数据", "清空记录", "清空历史", "清除数据", "擦除", "销毁",
+		"注销", "永久注销", "格式化", "重置账号", "重置账户", "撤销授权", "取消授权",
+		"delete", "remove", "erase", "clear all", "clear history", "clear data", "wipe",
+		"destroy", "reset account", "revoke access", "revoke authorization", "format",
+		"delete account", "delete message", "delete contact", "remove member",
+	) {
+		return true
+	}
+	folded := semanticFold(value)
+	for _, prefix := range []string{
+		"删除", "移除", "清空", "清除", "擦除", "销毁", "注销", "格式化", "重置", "撤销授权", "取消授权",
+		"delete ", "remove ", "erase ", "clear ", "wipe ", "destroy ", "reset ", "revoke ", "format ",
+	} {
+		if strings.HasPrefix(folded, semanticFold(prefix)) && utf8.RuneCountInString(folded) <= 80 {
+			return true
+		}
+	}
+	return false
+}
+
+func externalWriteSurfaceAction(snapshot UISnapshot, target Node) bool {
+	for _, node := range actionSemanticNodes(snapshot, target) {
+		for _, value := range nodeUserFacingValues(node) {
+			if externalWriteSurfaceLabel(value, "") {
+				return true
+			}
+		}
+		if externalWriteSurfaceLabel("", node.ViewID+" "+node.ClassName) {
+			return true
+		}
+	}
+	return false
+}
+
+func uniqueSearchInput(snapshot UISnapshot, target Node) bool {
+	if !target.Editable || !target.Enabled || !target.VisibleToUser ||
+		!containsAny(nodeLabel(target)+" "+target.ViewID, "搜索", "查找", "search", "find") {
+		return false
+	}
+	matches := 0
+	for _, node := range snapshot.Nodes {
+		if node.Editable && node.Enabled && node.VisibleToUser &&
+			containsAny(nodeLabel(node)+" "+node.ViewID, "搜索", "查找", "search", "find") {
+			matches++
+		}
+	}
+	return matches == 1
+}
+
+func externalWriteSurfaceLabel(label, viewID string) bool {
+	return containsAny(
+		label+" "+viewID,
+		"发送", "发布", "提交", "保存", "确认", "点赞", "评论", "收藏", "关注", "分享", "转发",
+		"报名", "加入", "申请", "send", "publish", "submit", "save", "confirm", "like", "comment",
+		"favorite", "follow", "share", "forward", "join", "apply",
+	)
+}
+
+func destructiveSurfaceLabel(label, viewID string) bool {
+	return hasSemanticMarker(
+		label+" "+viewID,
+		"删除", "移除", "清空数据", "清空记录", "清空历史", "清除数据", "擦除",
+		"抹掉数据", "销毁", "注销", "永久注销", "格式化", "重置账号", "重置账户",
+		"撤销授权", "取消授权",
+		"delete", "remove", "erase", "clear all", "clear history", "clear data", "wipe",
+		"destroy", "reset account", "revoke access", "revoke authorization", "format",
+	)
+}
+
+func navigationSurfaceLabel(label string) bool {
+	return matchesAny(
+		label,
+		"返回", "关闭", "取消", "查看", "详情", "打开", "上一页", "下一页", "首页",
+		"back", "close", "cancel", "view", "details", "open", "previous", "next", "home",
+	)
+}
+
+func nodeSupportsSurfaceAction(node Node, kind string) bool {
+	if node.ID == "" || !node.VisibleToUser || !node.Enabled || !validNodeBounds(node.Bounds) {
+		return false
+	}
+	switch kind {
+	case ActionSetText:
+		return node.Editable
+	case ActionClick:
+		return node.Clickable
+	case ActionScrollForward, ActionScrollBackward:
+		return node.Scrollable
+	default:
+		return false
+	}
+}
+
+func validateSurfaceActionState(surfaceID string, snapshot UISnapshot, expected surfaceActionState) error {
+	if expected.sequence != snapshot.Sequence || !expected.identity.matches(snapshot) ||
+		expected.contextDigest != surfaceContextDigest(snapshot) {
+		return fmt.Errorf("%w: surface action context changed", ErrStale)
+	}
+	var matches []Node
+	for _, node := range snapshot.Nodes {
+		if node.ID == expected.companion.NodeID {
+			matches = append(matches, node)
+		}
+	}
+	if len(matches) > 1 {
+		return fmt.Errorf("%w: surface action node identity is ambiguous", ErrTargetAmbiguous)
+	}
+	if len(matches) != 1 {
+		return fmt.Errorf("%w: surface action node disappeared", ErrStale)
+	}
+	node := matches[0]
+	if !nodeSupportsSurfaceAction(node, expected.companion.Kind) ||
+		surfaceNodeSignature(node) != expected.nodeSignature || node.Bounds != expected.bounds {
+		return fmt.Errorf("%w: surface action node semantics changed", ErrStale)
+	}
+	label := surfaceActionLabel(snapshot, node, expected.companion.Kind)
+	risk, effect := classifySurfaceAction(snapshot, node, expected.companion.Kind)
+	current := bindSurfaceAction(
+		surfaceID, snapshot, node, expected.companion.Kind, label, risk, effect, expected.contextDigest,
+	)
+	if label != expected.label || current.advertised != expected.advertised ||
+		current.replayID != expected.replayID || current.nodeSignature != expected.nodeSignature {
+		return fmt.Errorf("%w: surface action identity changed", ErrStale)
+	}
+	return nil
+}
+
+func (d *Driver) consumeSurfaceAction(surfaceID, actionID string, expected surfaceActionState) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	state, exists := d.surfaces[surfaceID]
+	if !exists {
+		return false
+	}
+	current, exists := state.actions[actionID]
+	if !exists || current.replayID != expected.replayID || current.nodeSignature != expected.nodeSignature ||
+		current.contextDigest != expected.contextDigest || current.sequence != expected.sequence ||
+		current.identity != expected.identity {
+		return false
+	}
+	delete(state.actions, actionID)
+	if state.consumedActions == nil {
+		state.consumedActions = make(map[string]struct{})
+	}
+	state.consumedActions[actionID] = struct{}{}
+	state.surface.Actions = withoutSurfaceActions(state.surface.Actions, map[string]struct{}{actionID: {}})
+	d.surfaces[surfaceID] = state
+	return true
+}
+
+func (d *Driver) tombstoneSurfaceReplay(surfaceID, replayID string) {
+	if replayID == "" {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	state, exists := d.surfaces[surfaceID]
+	if !exists {
+		return
+	}
+	if state.replayTombstones == nil {
+		state.replayTombstones = make(map[string]struct{})
+	}
+	state.replayTombstones[replayID] = struct{}{}
+	removed := make(map[string]struct{})
+	for actionID, action := range state.actions {
+		if action.replayID == replayID {
+			delete(state.actions, actionID)
+			removed[actionID] = struct{}{}
+		}
+	}
+	state.surface.Actions = withoutSurfaceActions(state.surface.Actions, removed)
+	d.surfaces[surfaceID] = state
+}
+
+func withoutSurfaceActions(actions []core.Action, removed map[string]struct{}) []core.Action {
+	if len(removed) == 0 {
+		return actions
+	}
+	result := make([]core.Action, 0, len(actions))
+	for _, action := range actions {
+		if _, drop := removed[action.ID]; !drop {
+			result = append(result, action)
+		}
+	}
+	return result
+}
+
+func shouldTombstoneSurfaceReplay(effect string, succeeded bool) bool {
+	switch strings.ToLower(strings.TrimSpace(effect)) {
+	case "observe", "search_input":
+		return false
+	case "navigate":
+		return !succeeded
+	default:
+		return true
+	}
+}
+
+func privacyConsentActions(snapshot UISnapshot, screenshotPNG []byte, accountID string) []core.AuthAction {
 	if snapshotRequiresUserAction(snapshot) {
 		return nil
 	}
 	if _, err := uniquePrivacyConsentTarget(snapshot); err != nil {
 		return nil
 	}
+	if len(screenshotPNG) == 0 {
+		return nil
+	}
 	return []core.AuthAction{{
-		ID:                   acceptPrivacyPolicyAction,
+		ID:                   bindAuthActionID(acceptPrivacyPolicyAction, snapshot, screenshotPNG, accountID),
+		ReplayKey:            acceptPrivacyPolicyAction,
 		Label:                "同意企业微信隐私政策并继续",
 		Risk:                 "high",
 		Confirmation:         "请确认你已阅读官方企业微信客户端中显示的隐私政策，并同意后继续。",
 		RequiresConfirmation: true,
+		ImageBound:           true,
 	}}
 }
 
@@ -1032,11 +1791,11 @@ type weComLoginTargets struct {
 	phone  Node
 }
 
-func authenticationActions(snapshot UISnapshot) ([]core.AuthAction, string) {
+func authenticationActions(snapshot UISnapshot, screenshotPNG []byte, accountID string) ([]core.AuthAction, string) {
 	if snapshotRequiresUserAction(snapshot) {
 		return nil, ""
 	}
-	if actions := privacyConsentActions(snapshot); len(actions) != 0 {
+	if actions := privacyConsentActions(snapshot, screenshotPNG, accountID); len(actions) != 0 {
 		return actions, "Review and accept the official WeCom privacy policy to continue"
 	}
 	// Never fall through to controls behind a complete or partially observed
@@ -1045,25 +1804,97 @@ func authenticationActions(snapshot UISnapshot) ([]core.AuthAction, string) {
 		return nil, ""
 	}
 	targets, err := weComLoginMethodTargets(snapshot)
-	if err != nil {
+	if err != nil || len(screenshotPNG) == 0 {
 		return nil, ""
 	}
-	if !targets.terms.Checked {
+	if !weComLoginTermsAccepted(targets.terms) {
 		return []core.AuthAction{{
-			ID:                   acceptWeComLoginTermsAction,
+			ID:                   bindAuthActionID(acceptWeComLoginTermsAction, snapshot, screenshotPNG, accountID),
+			ReplayKey:            acceptWeComLoginTermsAction,
 			Label:                "阅读并同意企业微信登录协议",
 			Risk:                 "high",
 			Confirmation:         "请确认你已阅读官方企业微信客户端中显示的软件许可及服务协议与隐私政策，并同意后继续。",
 			RequiresConfirmation: true,
+			ImageBound:           true,
 		}}, "Review and accept the official WeCom login agreements to continue"
 	}
 	return []core.AuthAction{{
-		ID:                   continueWeComWithWechatAction,
+		ID:                   bindAuthActionID(continueWeComWithWechatAction, snapshot, screenshotPNG, accountID),
+		ReplayKey:            continueWeComWithWechatAction,
 		Label:                "使用微信继续登录企业微信",
 		Risk:                 "high",
 		Confirmation:         "请确认使用当前微信身份继续登录企业微信；后续扫码、手机确认或验证码仍由你本人完成。",
 		RequiresConfirmation: true,
+		ImageBound:           true,
 	}}, "Confirm that you want to continue with the current WeChat identity"
+}
+
+func bindAuthActionID(operation string, snapshot UISnapshot, screenshotPNG []byte, accountID string) string {
+	encoded := encodeAuthGenerationFrame(snapshot, accountID)
+	if len(encoded) == 0 || len(screenshotPNG) == 0 {
+		return ""
+	}
+	digest := sha256.New()
+	_, _ = digest.Write([]byte("wechatcopilot/wecom/auth-action/v1\x00"))
+	_, _ = digest.Write(encoded)
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(screenshotPNG)
+	return operation + "." + hex.EncodeToString(digest.Sum(nil))
+}
+
+func encodeAuthGenerationFrame(snapshot UISnapshot, accountID string) []byte {
+	frame := struct {
+		AccountID   string `json:"account_id"`
+		Sequence    int64  `json:"sequence"`
+		PackageName string `json:"package_name"`
+		WindowID    int    `json:"window_id"`
+		WindowTitle string `json:"window_title"`
+		WindowClass string `json:"window_class"`
+		Nodes       []Node `json:"nodes"`
+	}{
+		AccountID: accountID, Sequence: snapshot.Sequence, PackageName: snapshot.PackageName,
+		WindowID: snapshot.WindowID, WindowTitle: snapshot.WindowTitle,
+		WindowClass: strings.TrimSpace(snapshot.WindowClass), Nodes: snapshot.Nodes,
+	}
+	encoded, err := json.Marshal(frame)
+	if err != nil {
+		return nil
+	}
+	return encoded
+}
+
+func sameAuthenticationObservation(before, after UISnapshot) bool {
+	if !sameSurfaceObservation(before, after) {
+		return false
+	}
+	beforeFrame := encodeAuthGenerationFrame(before, "")
+	afterFrame := encodeAuthGenerationFrame(after, "")
+	if len(beforeFrame) == 0 || len(afterFrame) == 0 {
+		return false
+	}
+	beforeDigest := sha256.Sum256(beforeFrame)
+	afterDigest := sha256.Sum256(afterFrame)
+	return beforeDigest == afterDigest
+}
+
+func parseAuthActionID(actionID string) (string, bool) {
+	for _, operation := range []string{
+		acceptPrivacyPolicyAction,
+		acceptWeComLoginTermsAction,
+		continueWeComWithWechatAction,
+	} {
+		prefix := operation + "."
+		if !strings.HasPrefix(actionID, prefix) {
+			continue
+		}
+		generation := strings.TrimPrefix(actionID, prefix)
+		if len(generation) != authActionGenerationHexLength || strings.ToLower(generation) != generation {
+			return "", false
+		}
+		decoded, err := hex.DecodeString(generation)
+		return operation, err == nil && len(decoded) == sha256.Size
+	}
+	return "", false
 }
 
 func weComLoginMethodTargets(snapshot UISnapshot) (weComLoginTargets, error) {
@@ -1094,21 +1925,39 @@ func weComLoginMethodTargets(snapshot UISnapshot) (weComLoginTargets, error) {
 		return weComLoginTargets{}, fmt.Errorf("%w: WeCom login methods share one clickable target", ErrTargetAmbiguous)
 	}
 
-	checkable := matchingNodes(snapshot, func(node Node) bool { return node.Checkable })
-	if len(checkable) == 0 {
-		return weComLoginTargets{}, fmt.Errorf("%w: WeCom login agreement checkbox is unavailable", ErrStale)
+	agreementControls := matchingNodes(snapshot, isWeComLoginAgreementImage)
+	if len(agreementControls) == 0 {
+		return weComLoginTargets{}, fmt.Errorf("%w: WeCom login agreement control is unavailable", ErrStale)
 	}
-	if len(checkable) != 1 {
-		return weComLoginTargets{}, fmt.Errorf("%w: multiple WeCom login agreement checkboxes", ErrTargetAmbiguous)
+	if len(agreementControls) != 1 {
+		return weComLoginTargets{}, fmt.Errorf("%w: multiple WeCom login agreement controls", ErrTargetAmbiguous)
 	}
-	terms := checkable[0]
+	terms := agreementControls[0]
+	if !isWeComLoginTermsControl(terms) {
+		return weComLoginTargets{}, fmt.Errorf("%w: WeCom login agreement state is unavailable or incompatible", ErrStale)
+	}
 	if terms.ID == "" || !terms.VisibleToUser || !terms.Enabled || !terms.Clickable || !usableBounds(terms.Bounds) {
-		return weComLoginTargets{}, fmt.Errorf("%w: WeCom login agreement checkbox is not safely actionable", ErrStale)
+		return weComLoginTargets{}, fmt.Errorf("%w: WeCom login agreement control is not safely actionable", ErrStale)
 	}
 	if terms.ID == wechat.ID || terms.ID == email.ID || terms.ID == phone.ID {
 		return weComLoginTargets{}, fmt.Errorf("%w: WeCom agreement and login method share one target", ErrTargetAmbiguous)
 	}
 	return weComLoginTargets{terms: terms, wechat: wechat, email: email, phone: phone}, nil
+}
+
+func isWeComLoginTermsControl(node Node) bool {
+	return isWeComLoginAgreementImage(node) &&
+		!node.Checkable &&
+		!node.Checked &&
+		node.Selected != nil
+}
+
+func isWeComLoginAgreementImage(node Node) bool {
+	return node.ClassName == androidImageViewClass && node.ViewID == weComLoginAgreementViewID
+}
+
+func weComLoginTermsAccepted(node Node) bool {
+	return isWeComLoginAgreementImage(node) && node.Selected != nil && *node.Selected
 }
 
 func uniqueVisibleNormalizedLabelTarget(snapshot UISnapshot, label string) (Node, error) {
@@ -1151,37 +2000,50 @@ func uniqueVisibleNormalizedLabelTarget(snapshot UISnapshot, label string) (Node
 }
 
 func normalizedVisibleLabel(value string) string {
-	return strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(value)), " "))
+	return semanticFold(value)
 }
 
 func hasPrivacyConsentModalMarker(snapshot UISnapshot) bool {
+	if snapshot.PackageName != DefaultWeComPackage || isWeComActivity(snapshot, weComConversationActivity) {
+		return false
+	}
 	visible := visibleSnapshotText(snapshot)
-	if containsAny(visible, "welcome to wecom", "欢迎使用企业微信") {
+	hasPolicy := containsAny(visible, "privacy policy", "隐私政策", "隐私保护指引")
+	hasWelcome := containsAny(visible, "welcome to wecom", "欢迎使用企业微信")
+	if !hasPolicy || !hasWelcome {
+		return false
+	}
+	_, agreeErr := uniqueVisibleLabelTarget(snapshot, "Agree", "同意")
+	_, disagreeErr := uniqueVisibleLabelTarget(snapshot, "Disagree", "不同意")
+	if agreeErr == nil && disagreeErr == nil {
 		return true
 	}
-	for _, node := range snapshot.Nodes {
-		if node.VisibleToUser && matchesAny(nodeLabel(node), "Agree", "Disagree", "同意", "不同意") {
-			return true
-		}
-	}
-	return false
+	// On an exact first-run Activity, incomplete policy controls still mean the
+	// modal must fail closed rather than leak into generic surface handling.
+	return isWeComActivity(snapshot, weComLoginWxAuthActivity) || isWeComActivity(snapshot, weComLaunchActivity)
 }
 
 func hasWeComLoginMethodMarker(snapshot UISnapshot) bool {
-	visible := visibleSnapshotText(snapshot)
-	if containsAny(visible, "read and agree", "software licensing and service agreements") {
-		return true
+	if snapshot.PackageName != DefaultWeComPackage || isWeComActivity(snapshot, weComConversationActivity) {
+		return false
 	}
+	visible := visibleSnapshotText(snapshot)
+	if !containsAny(visible, "read and agree") ||
+		!containsAny(visible, "software licensing and service agreements") ||
+		!containsAny(visible, "privacy policy") {
+		return false
+	}
+	labels := make(map[string]bool)
 	for _, node := range snapshot.Nodes {
 		if !node.VisibleToUser {
 			continue
 		}
 		switch normalizedVisibleLabel(nodeLabel(node)) {
 		case "continue with wechat", "continue with email", "continue with phone":
-			return true
+			labels[normalizedVisibleLabel(nodeLabel(node))] = true
 		}
 	}
-	return false
+	return len(labels) == 3 && hasWeComLoginAgreementControl(snapshot)
 }
 
 func uniquePrivacyConsentTarget(snapshot UISnapshot) (Node, error) {
@@ -1315,10 +2177,10 @@ func waitForPrivacyConsentDismissal(ctx context.Context, client *CompanionClient
 	}
 }
 
-func waitForWeComLoginTermsChecked(ctx context.Context, client *CompanionClient, android AndroidContainer, previous int64) error {
+func waitForWeComLoginTermsAccepted(ctx context.Context, client *CompanionClient, android AndroidContainer, previous int64) error {
 	deadline := time.Now().Add(10 * time.Second)
 	changed := false
-	checkedObservations := 0
+	acceptedObservations := 0
 	for {
 		snapshot, err := client.Snapshot(ctx)
 		if err == nil {
@@ -1331,20 +2193,20 @@ func waitForWeComLoginTermsChecked(ctx context.Context, client *CompanionClient,
 					return ErrUserActionRequired
 				}
 				targets, targetErr := weComLoginMethodTargets(snapshot)
-				if targetErr == nil && targets.terms.Checked {
-					checkedObservations++
-					if checkedObservations >= 2 {
+				if targetErr == nil && weComLoginTermsAccepted(targets.terms) {
+					acceptedObservations++
+					if acceptedObservations >= 2 {
 						return nil
 					}
 				} else {
-					checkedObservations = 0
+					acceptedObservations = 0
 				}
 			}
 		} else {
-			checkedObservations = 0
+			acceptedObservations = 0
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%w: WeCom login agreement checkbox did not become stably checked", ErrStale)
+			return fmt.Errorf("%w: WeCom login agreement control did not become stably selected", ErrStale)
 		}
 		timer := time.NewTimer(200 * time.Millisecond)
 		select {
@@ -1404,24 +2266,33 @@ func usableBounds(bounds Bounds) bool {
 }
 
 func classifyLogin(snapshot UISnapshot) (core.RuntimeState, string) {
-	text := snapshotText(snapshot)
+	// Security and device-verification challenges take precedence over stale
+	// navigation nodes retained behind an overlay or Activity transition.
+	if snapshotRequiresUserAction(snapshot) || structuredSecurityChallenge(snapshot) {
+		return core.StateAuthRequired, "direct user action is required for the official WeCom security challenge"
+	}
+	if snapshot.PackageName == DefaultWeComPackage {
+		if isWeComActivity(snapshot, weComLoginWxAuthActivity) ||
+			isWeComActivity(snapshot, weComSMSVerifyActivity) ||
+			hasWeComLoginAgreementControl(snapshot) || hasWeComLoginMethodMarker(snapshot) ||
+			hasPrivacyConsentModalMarker(snapshot) {
+			return core.StateAuthRequired, "complete login in the official WeCom client"
+		}
+		if isWeComActivity(snapshot, weComLaunchActivity) {
+			return core.StateStarting, "waiting for the official WeCom login window"
+		}
+	}
 	bottomNav := 0
 	for _, label := range []string{"消息", "邮件", "文档", "工作台", "通讯录"} {
-		if containsAny(text, label) {
-			bottomNav++
+		for _, node := range snapshot.Nodes {
+			if node.VisibleToUser && matchesAny(nodeLabel(node), label) {
+				bottomNav++
+				break
+			}
 		}
 	}
 	if snapshot.PackageName == DefaultWeComPackage && bottomNav >= 2 {
 		return core.StateOnline, ""
-	}
-	if isWeComActivity(snapshot, weComLoginWxAuthActivity) {
-		return core.StateAuthRequired, "complete login in the official WeCom client"
-	}
-	if isWeComActivity(snapshot, weComSMSVerifyActivity) {
-		return core.StateAuthRequired, "complete login in the official WeCom client"
-	}
-	if isWeComActivity(snapshot, weComLaunchActivity) {
-		return core.StateStarting, "waiting for the official WeCom login window"
 	}
 	if snapshot.PackageName == "" {
 		return core.StateStarting, "waiting for an accessibility window"
@@ -1434,7 +2305,7 @@ func classifyLogin(snapshot UISnapshot) (core.RuntimeState, string) {
 
 func isWeComActivity(snapshot UISnapshot, activity string) bool {
 	return snapshot.PackageName == DefaultWeComPackage &&
-		strings.EqualFold(strings.TrimSpace(snapshot.WindowClass), activity)
+		strings.TrimSpace(snapshot.WindowClass) == activity
 }
 
 func classifySurfaceKind(snapshot UISnapshot) string {
@@ -1508,10 +2379,122 @@ func nodeLabel(node Node) string {
 	return strings.TrimSpace(node.ContentDescription)
 }
 
-func containsAny(value string, candidates ...string) bool {
-	value = strings.ToLower(value)
+// nodeSemanticEvidence is deliberately risk-only: exact interaction matching
+// may use the primary visible label, but safety decisions must never let Text
+// hide a conflicting ContentDescription or resource identifier.
+func nodeSemanticEvidence(node Node) string {
+	return strings.Join(nodeSemanticValues(node), " ")
+}
+
+func nodeSemanticValues(node Node) []string {
+	values := nodeUserFacingValues(node)
+	return appendDistinctSemanticValues(values, node.ViewID, node.ClassName)
+}
+
+func nodeUserFacingValues(node Node) []string {
+	return appendDistinctSemanticValues(nil, node.Text, node.ContentDescription)
+}
+
+func appendDistinctSemanticValues(values []string, candidates ...string) []string {
+	seen := make(map[string]struct{}, len(values)+len(candidates))
+	for _, value := range values {
+		seen[semanticFold(value)] = struct{}{}
+	}
 	for _, candidate := range candidates {
-		if strings.Contains(value, strings.ToLower(candidate)) {
+		candidate = strings.TrimSpace(candidate)
+		key := semanticFold(candidate)
+		if candidate == "" || key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		values = append(values, candidate)
+	}
+	return values
+}
+
+// actionSemanticNodes returns only nodes structurally and geometrically bound
+// to the target. This catches labels placed on nested TextViews without
+// treating unrelated page or chat copy as evidence for the action.
+func actionSemanticNodes(snapshot UISnapshot, target Node) []Node {
+	result := []Node{target}
+	byID := make(map[string]Node, len(snapshot.Nodes))
+	for _, node := range snapshot.Nodes {
+		if node.ID != "" {
+			byID[node.ID] = node
+		}
+	}
+	added := map[string]struct{}{target.ID: {}}
+	for _, candidate := range snapshot.Nodes {
+		if candidate.ID == "" || candidate.ID == target.ID || !candidate.VisibleToUser ||
+			!usableBounds(candidate.Bounds) || !boundsContains(target.Bounds, candidate.Bounds) ||
+			!nodeDescendsFrom(candidate, target.ID, byID) {
+			continue
+		}
+		if _, exists := added[candidate.ID]; exists {
+			continue
+		}
+		added[candidate.ID] = struct{}{}
+		result = append(result, candidate)
+	}
+	// Some Android layouts place the semantic description on an equal-bounds
+	// wrapper. Include at most the exact-bounds ancestor chain; never widen to a
+	// page container.
+	current := target
+	for depth := 0; depth < 2 && current.ParentID != ""; depth++ {
+		parent, exists := byID[current.ParentID]
+		if !exists || parent.ID == current.ID || !parent.VisibleToUser || parent.Bounds != target.Bounds {
+			break
+		}
+		if _, exists := added[parent.ID]; !exists {
+			added[parent.ID] = struct{}{}
+			result = append(result, parent)
+		}
+		current = parent
+	}
+	return result
+}
+
+func nodeDescendsFrom(node Node, ancestorID string, byID map[string]Node) bool {
+	current := node
+	for depth := 0; depth <= len(byID) && current.ParentID != ""; depth++ {
+		if current.ParentID == ancestorID {
+			return true
+		}
+		parent, exists := byID[current.ParentID]
+		if !exists || parent.ID == current.ID {
+			return false
+		}
+		current = parent
+	}
+	return false
+}
+
+func actionSemanticEvidence(snapshot UISnapshot, target Node) string {
+	values := make([]string, 0)
+	for _, node := range actionSemanticNodes(snapshot, target) {
+		values = appendDistinctSemanticValues(values, nodeSemanticValues(node)...)
+	}
+	return strings.Join(values, " ")
+}
+
+func actionMatchesAny(snapshot UISnapshot, target Node, candidates ...string) bool {
+	for _, node := range actionSemanticNodes(snapshot, target) {
+		for _, value := range nodeSemanticValues(node) {
+			if matchesAny(value, candidates...) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func containsAny(value string, candidates ...string) bool {
+	value = semanticFold(value)
+	for _, candidate := range candidates {
+		if strings.Contains(value, semanticFold(candidate)) {
 			return true
 		}
 	}
@@ -1519,10 +2502,82 @@ func containsAny(value string, candidates ...string) bool {
 }
 
 func matchesAny(value string, candidates ...string) bool {
-	value = strings.ToLower(strings.TrimSpace(value))
+	value = semanticFold(value)
 	for _, candidate := range candidates {
-		if value == strings.ToLower(strings.TrimSpace(candidate)) {
+		if value == semanticFold(candidate) {
 			return true
+		}
+	}
+	return false
+}
+
+func semanticFold(value string) string {
+	folded := strings.Map(func(character rune) rune {
+		if defaultIgnorableRune(character) {
+			return -1
+		}
+		if character >= 0xff01 && character <= 0xff5e {
+			character -= 0xfee0
+		}
+		if character == 0x3000 {
+			return ' '
+		}
+		return unicode.ToLower(character)
+	}, value)
+	folded = strings.Join(strings.Fields(folded), " ")
+	runes := []rune(folded)
+	result := make([]rune, 0, len(runes))
+	for index, character := range runes {
+		if character == ' ' && index > 0 && index+1 < len(runes) &&
+			unicode.Is(unicode.Han, runes[index-1]) && unicode.Is(unicode.Han, runes[index+1]) {
+			continue
+		}
+		result = append(result, character)
+	}
+	return string(result)
+}
+
+func defaultIgnorableRune(character rune) bool {
+	if unicode.Is(unicode.Cc, character) || unicode.Is(unicode.Cf, character) || unicode.Is(unicode.Cs, character) {
+		return true
+	}
+	return character == 0x034f ||
+		character >= 0x115f && character <= 0x1160 ||
+		character >= 0x17b4 && character <= 0x17b5 ||
+		character >= 0x180b && character <= 0x180f ||
+		character == 0x3164 ||
+		character >= 0xfe00 && character <= 0xfe0f ||
+		character == 0xffa0 ||
+		character >= 0xfff0 && character <= 0xfff8 ||
+		character >= 0xe0100 && character <= 0xe01ef
+}
+
+func hasSemanticMarker(value string, candidates ...string) bool {
+	valueRunes := []rune(semanticFold(value))
+	for _, candidate := range candidates {
+		markerRunes := []rune(semanticFold(candidate))
+		if len(markerRunes) == 0 || len(markerRunes) > len(valueRunes) {
+			continue
+		}
+		asciiMarker := true
+		for _, character := range markerRunes {
+			if character > unicode.MaxASCII {
+				asciiMarker = false
+				break
+			}
+		}
+		for start := 0; start+len(markerRunes) <= len(valueRunes); start++ {
+			if string(valueRunes[start:start+len(markerRunes)]) != string(markerRunes) {
+				continue
+			}
+			end := start + len(markerRunes)
+			beforeBoundary := start == 0 ||
+				(!unicode.IsLetter(valueRunes[start-1]) && !unicode.IsDigit(valueRunes[start-1]))
+			afterBoundary := end == len(valueRunes) ||
+				(!unicode.IsLetter(valueRunes[end]) && !unicode.IsDigit(valueRunes[end]))
+			if !asciiMarker || beforeBoundary && afterBoundary {
+				return true
+			}
 		}
 	}
 	return false
@@ -1548,15 +2603,45 @@ func waitForSnapshotChange(ctx context.Context, client *CompanionClient, previou
 	}
 }
 
-func waitForNodeTextIncrease(ctx context.Context, client *CompanionClient, text string, baseline int, timeout time.Duration) (bool, error) {
+func waitForDirectionalOutgoingBubble(
+	ctx context.Context,
+	client *CompanionClient,
+	android AndroidContainer,
+	title string,
+	binding chatBinding,
+	text string,
+	baseline int,
+	previousSequence int64,
+	timeout time.Duration,
+) (bool, error) {
 	deadline := time.Now().Add(timeout)
+	stableEvidence := ""
+	stableObservations := 0
 	for {
 		snapshot, err := client.Snapshot(ctx)
 		if err != nil {
 			return false, err
 		}
-		if countNodeText(snapshot, text) > baseline {
-			return true, nil
+		snapshot = withForegroundActivity(ctx, android, snapshot)
+		frame, frameErr := validateChatFrame(snapshot, title, &binding, false)
+		if frameErr != nil {
+			return false, frameErr
+		}
+		evidence := outgoingBubbleEvidence(snapshot, text, binding)
+		if snapshot.Sequence > previousSequence && frame.composer.Text != text && len(evidence) == baseline+1 {
+			key := strings.Join(evidence, "\n")
+			if key == stableEvidence {
+				stableObservations++
+			} else {
+				stableEvidence = key
+				stableObservations = 1
+			}
+			if stableObservations >= 2 {
+				return true, nil
+			}
+		} else {
+			stableEvidence = ""
+			stableObservations = 0
 		}
 		if time.Now().After(deadline) {
 			return false, nil
@@ -1571,35 +2656,49 @@ func waitForNodeTextIncrease(ctx context.Context, client *CompanionClient, text 
 	}
 }
 
-func countNodeText(snapshot UISnapshot, text string) int {
-	count := 0
-	for _, node := range snapshot.Nodes {
-		if !node.Editable && node.Text == text {
-			count++
-		}
-	}
-	return count
+type eventHistory struct {
+	Events   []CompanionEvent
+	Complete bool
 }
 
-func allEvents(ctx context.Context, client *CompanionClient) ([]CompanionEvent, error) {
+func allEvents(ctx context.Context, client *CompanionClient) (eventHistory, error) {
 	const maxEvents = 2_000
-	result := make([]CompanionEvent, 0, 500)
+	result := eventHistory{Events: make([]CompanionEvent, 0, 500), Complete: true}
 	var cursor int64
-	for len(result) < maxEvents {
-		page, err := client.Events(ctx, cursor, 500)
+	for {
+		limit := 500
+		if remaining := maxEvents - len(result.Events); remaining < limit {
+			limit = remaining
+		}
+		if limit == 0 {
+			// One bounded look-ahead distinguishes an exactly full journal from
+			// a result truncated by this driver's safety cap.
+			page, err := client.Events(ctx, cursor, 1)
+			if err != nil {
+				return eventHistory{}, err
+			}
+			if !page.Complete || len(page.Events) != 0 {
+				result.Complete = false
+			}
+			return result, nil
+		}
+		page, err := client.Events(ctx, cursor, limit)
 		if err != nil {
-			return nil, err
+			return eventHistory{}, err
+		}
+		if !page.Complete {
+			result.Complete = false
 		}
 		if len(page.Events) == 0 {
-			break
+			return result, nil
 		}
-		result = append(result, page.Events...)
+		result.Events = append(result.Events, page.Events...)
 		if page.NextCursor <= cursor {
-			break
+			result.Complete = false
+			return result, nil
 		}
 		cursor = page.NextCursor
 	}
-	return result, nil
 }
 
 func snapshotConfirmsTitle(snapshot UISnapshot, title string) bool {
@@ -1628,27 +2727,36 @@ func sensitiveSurfaceLabel(label string) bool {
 	)
 }
 
-func surfaceHighRisk(snapshot UISnapshot) bool { return sensitiveSurfaceLabel(snapshotText(snapshot)) }
+func surfaceHighRisk(snapshot UISnapshot) bool { return structuredHighRiskSurface(snapshot) }
 
-func snapshotShowsAuthRequired(snapshot UISnapshot) bool {
-	state, _ := classifyLogin(snapshot)
-	return state == core.StateAuthRequired
+func authenticationSurface(snapshot UISnapshot) bool {
+	if snapshot.PackageName != DefaultWeComPackage {
+		return false
+	}
+	if isWeComActivity(snapshot, weComLoginWxAuthActivity) ||
+		isWeComActivity(snapshot, weComSMSVerifyActivity) ||
+		hasWeComLoginAgreementControl(snapshot) || hasWeComLoginMethodMarker(snapshot) ||
+		hasPrivacyConsentModalMarker(snapshot) {
+		return true
+	}
+	return structuredSMSFallback(snapshot) || structuredQRFallback(snapshot)
+}
+
+func hasWeComLoginAgreementControl(snapshot UISnapshot) bool {
+	for _, node := range snapshot.Nodes {
+		if isWeComLoginAgreementImage(node) {
+			return true
+		}
+	}
+	return false
 }
 
 func snapshotRequiresUserAction(snapshot UISnapshot) bool {
-	return containsAny(
-		snapshotText(snapshot),
-		"账号存在风险", "账户存在风险", "设备验证", "安全验证", "异常登录", "确认本人操作",
-		"account risk", "device verification", "security verification", "unusual login", "confirm on your phone",
-	)
+	return structuredSecurityChallenge(snapshot)
 }
 
 func snapshotHasHardAuthRisk(snapshot UISnapshot) bool {
-	return containsAny(
-		snapshotText(snapshot),
-		"账号存在风险", "账户存在风险", "设备验证", "安全验证", "异常登录",
-		"account risk", "device verification", "security verification", "unusual login",
-	)
+	return structuredSecurityChallenge(snapshot)
 }
 
 func conversationID(accountID, conversationKey string) string {
@@ -1657,6 +2765,15 @@ func conversationID(accountID, conversationKey string) string {
 
 func messageID(accountID string, sequence int64) string {
 	return "wecom-msg-" + digestID(accountID+":"+strconv.FormatInt(sequence, 10))
+}
+
+func notificationSurfaceReference(accountID string, sequence int64) string {
+	sequenceText := strconv.FormatInt(sequence, 10)
+	return "wecom-notification:" + sequenceText + ":" + notificationSurfaceScope(accountID, sequence)
+}
+
+func notificationSurfaceScope(accountID string, sequence int64) string {
+	return digestID("wecom-notification\x00" + accountID + "\x00" + strconv.FormatInt(sequence, 10))
 }
 
 func digestID(value string) string {

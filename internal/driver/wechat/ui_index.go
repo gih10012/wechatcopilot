@@ -16,7 +16,10 @@ import (
 	shared "github.com/gih10012/wechatcopilot/internal/driver"
 )
 
-const uiConfidence = 0.55
+const (
+	uiConfidence    = 0.55
+	uiSurfaceRefTTL = 2 * time.Minute
+)
 
 type uiConversationEntry struct {
 	conversation shared.Conversation
@@ -34,6 +37,11 @@ type normalizedVisible struct {
 	visible VisibleMessage
 }
 
+type uiSurfaceLease struct {
+	target    SurfaceTarget
+	expiresAt time.Time
+}
+
 // UIIndex is a deliberately bounded fallback for client versions without a
 // compatible read-only WCDB adapter. It exposes only currently visible data.
 type UIIndex struct {
@@ -44,7 +52,8 @@ type UIIndex struct {
 
 	mu            sync.Mutex
 	conversations map[string]uiConversationEntry
-	surfaces      map[string]SurfaceTarget
+	surfaces      map[string]uiSurfaceLease
+	surfaceBatch  uint64
 	sequences     map[string]int64
 	nextSequence  int64
 	baselines     map[string]outgoingBaseline
@@ -60,14 +69,14 @@ func NewUIIndex(backend Backend, accountID string, now func() time.Time) *UIInde
 	return &UIIndex{
 		backend: backend, accountID: accountID, now: now, pollEvery: 250 * time.Millisecond,
 		conversations: make(map[string]uiConversationEntry),
-		surfaces:      make(map[string]SurfaceTarget), sequences: make(map[string]int64),
+		surfaces:      make(map[string]uiSurfaceLease), sequences: make(map[string]int64),
 		baselines: make(map[string]outgoingBaseline),
 	}
 }
 
 func (i *UIIndex) Available(ctx context.Context) bool {
 	probe, err := i.backend.Probe(ctx)
-	return err == nil && (probe.State == shared.StateOnline || probe.State == shared.StateDegraded)
+	return err == nil && probe.State == shared.StateOnline
 }
 
 func (i *UIIndex) ListConversations(ctx context.Context, query shared.ConversationQuery) ([]shared.Conversation, error) {
@@ -190,10 +199,17 @@ func (i *UIIndex) Conversation(ctx context.Context, id string) (shared.Conversat
 func (i *UIIndex) ResolveSurface(_ context.Context, reference string) (SurfaceTarget, error) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
-	target, ok := i.surfaces[reference]
+	lease, ok := i.surfaces[reference]
 	if !ok {
 		return SurfaceTarget{}, ErrSurfaceMissing
 	}
+	// A UI-derived reference is a click lease, not a durable message ID. Consume
+	// it before validation so failures and retries can never dispatch twice.
+	delete(i.surfaces, reference)
+	if !i.now().Before(lease.expiresAt) {
+		return SurfaceTarget{}, ErrSurfaceMissing
+	}
+	target := lease.target
 	entry, ok := i.conversations[target.ConversationID]
 	if !ok || entry.ambiguous {
 		return SurfaceTarget{}, ErrTargetAmbiguous
@@ -327,10 +343,20 @@ func (i *UIIndex) rememberVisibleConversation(title, locator string) (uiConversa
 
 func (i *UIIndex) normalizeVisible(entry uiConversationEntry, visible []VisibleMessage) []normalizedVisible {
 	observedAt := i.now().UTC()
+	i.mu.Lock()
+	i.surfaceBatch++
+	surfaceBatch := i.surfaceBatch
+	for reference, lease := range i.surfaces {
+		if lease.target.ConversationID == entry.conversation.ID || !observedAt.Before(lease.expiresAt) {
+			delete(i.surfaces, reference)
+		}
+	}
+	i.mu.Unlock()
 	occurrences := make(map[string]int)
 	result := make([]normalizedVisible, 0, len(visible))
 	for _, item := range visible {
 		item.AccessibleLabel = strings.TrimSpace(item.AccessibleLabel)
+		item.SurfaceLocator = strings.TrimSpace(item.SurfaceLocator)
 		if strings.TrimSpace(item.Text) == "" && item.AccessibleLabel == "" {
 			continue
 		}
@@ -352,13 +378,20 @@ func (i *UIIndex) normalizeVisible(entry uiConversationEntry, visible []VisibleM
 			SenderName: item.SenderName, SentAt: observedAt, Kind: kind, Text: item.Text,
 			Source: "ui", Complete: false, Confidence: confidence,
 		}
-		if item.SurfaceKind != "" && item.AccessibleLabel != "" {
-			message.SurfaceRef = stableUIID("wxui_s_", messageID, item.AccessibleLabel)
+		if item.SurfaceKind != "" && item.AccessibleLabel != "" && item.SurfaceLocator != "" {
+			message.SurfaceRef = stableUIID(
+				"wxui_s_", messageID, item.SurfaceKind, item.AccessibleLabel, item.SurfaceLocator,
+				strconv.FormatUint(surfaceBatch, 10),
+			)
 			i.mu.Lock()
-			i.surfaces[message.SurfaceRef] = SurfaceTarget{
-				Reference: message.SurfaceRef, ConversationID: entry.conversation.ID,
-				ConversationTitle: entry.conversation.Title, ConversationLocator: entry.locator,
-				AccessibleLabel: item.AccessibleLabel, Kind: item.SurfaceKind,
+			i.surfaces[message.SurfaceRef] = uiSurfaceLease{
+				target: SurfaceTarget{
+					Reference: message.SurfaceRef, ConversationID: entry.conversation.ID,
+					ConversationTitle: entry.conversation.Title, ConversationLocator: entry.locator,
+					AccessibleLabel: item.AccessibleLabel, Kind: item.SurfaceKind,
+					SurfaceLocator: item.SurfaceLocator,
+				},
+				expiresAt: observedAt.Add(uiSurfaceRefTTL),
 			}
 			i.mu.Unlock()
 		}

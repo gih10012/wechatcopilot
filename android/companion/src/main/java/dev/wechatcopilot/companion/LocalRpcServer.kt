@@ -153,8 +153,8 @@ internal fun validateLocalAction(action: CompanionAction) {
             }
         }
         "global_back" -> {
-            if (action.nodeId.isNotEmpty() || action.text.isNotEmpty()) {
-                throw RequestException(400, "global_back accepts no parameters")
+            if (action.nodeId.isNotEmpty() || action.text.isNotEmpty() || action.expectedSequence <= 0) {
+                throw RequestException(400, "global_back requires expected_sequence and no node or text")
             }
         }
         else -> throw RequestException(400, "unsupported action")

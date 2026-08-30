@@ -1,4 +1,5 @@
 GO ?= go
+GOFMT ?= gofmt
 PYTHON ?= python3
 GO_FILES := $(shell find cmd internal -type f -name '*.go' -print 2>/dev/null)
 
@@ -26,7 +27,8 @@ test-android:
 check: fmt-check vet scripts-check skill-check payload-check
 
 fmt-check:
-	test -z "$$(gofmt -l $(GO_FILES))"
+	@command -v "$(GOFMT)" >/dev/null
+	test -z "$$($(GOFMT) -l $(GO_FILES))"
 
 vet:
 	$(GO) vet ./...

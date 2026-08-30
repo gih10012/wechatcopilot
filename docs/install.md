@@ -225,7 +225,29 @@ For unattended use, install the project-supplied systemd user unit:
 wechatcopilot daemon install
 ```
 
-The command refuses to replace an existing unit unless `--force` is explicit. A normal install enables and restarts the service so the newly written unit and mount gate apply even when an older daemon is already active. Use `--no-start` to enable without starting or restarting it while you inspect the generated unit. When the encrypted mount gate is enabled, run this command only after unlocking the volume and exporting `WECHATCOPILOT_HOME` plus all three gate variables; the required `state-mount.environment` file is then generated as described above. An administrator may run `loginctl enable-linger USERNAME` for host-boot startup, but the encrypted state volume still requires its separate manual unlock; `wechatcopilot` never elevates privileges or configures TPM unlock. The daemon socket remains accessible only to the operator UID.
+The command refuses to replace an existing unit unless `--force` is explicit. A normal install enables and restarts the service so the newly written unit and mount gate apply even when an older daemon is already active. Use `--no-start` to enable without starting or restarting it while you inspect the generated unit. When the encrypted mount gate is enabled, run this command only after unlocking the volume and exporting `WECHATCOPILOT_HOME` plus all three gate variables; the required `state-mount.environment` file is then generated as described above. An administrator may run `loginctl enable-linger USERNAME` for host-boot startup, but the encrypted state volume still requires its separate manual unlock; `wechatcopilot` never elevates privileges or configures TPM unlock. A boot-time start attempted while the manual-passphrase volume is locked fails once and is not put into an automatic restart loop; after unlocking, start the user daemon explicitly. Abnormal process termination remains restartable. The daemon socket remains accessible only to the operator UID.
+
+## Upgrade a non-empty legacy message index
+
+Indexes created before account ownership metadata was introduced cannot be claimed automatically when they contain conversations, messages, FTS rows, or send-journal state. Back up the encrypted state, stop the daemon, and run the migration once for the exact saved account:
+
+```bash
+wechatcopilot daemon stop
+wechatcopilot accounts adopt-legacy-index --account ACCOUNT_ID --confirm --json
+```
+
+Keep the configured `WECHATCOPILOT_HOME` and state-mount variables in the migration shell. The command acquires the same state lock as `daemon serve`; a still-running daemon returns `CONFLICT`. It resolves an exact account ID or alias from the existing registry and validates the existing account directory, `index.sqlite3`, complete legacy schema, and SQLite integrity before transactionally recording ownership. It refuses to initialize missing state and does not print indexed content. An empty recognized legacy index is bound automatically by the daemon and does not use this command. Start the daemon only after the migration returns `adopted:true`.
+
+## Approve a stopped legacy WeCom profile
+
+An existing WeCom `/data` tree created before account/profile markers were introduced is never adopted on first sight. Back up the encrypted state, stop the daemon so its exact Redroid container is stopped, keep the configured Docker binary, digest-pinned Redroid image, state home, and mount-gate variables in the shell, then run:
+
+```bash
+wechatcopilot daemon stop
+wechatcopilot accounts approve-legacy-wecom-profile --account ACCOUNT_ID --confirm --json
+```
+
+The command requires an existing registered WeCom account, non-empty real `/data` directory, exact stopped account container, exact isolated network, exact bind mount, and the same immutable container ID and stopped execution epoch before and after approval publication. It creates only a mode-`0600`, one-use approval bound to the account, canonical data path and inode, container ID, state, start/finish timestamps, restart count, and exit code; it does not start or stop a container, change `/data`, create either profile marker, or print profile contents. The durable record intentionally does not bind `st_dev`, which may change when the verified encrypted state volume is remounted; approval creation and consumption still pin and compare the live device/inode within each operation. If the container runs or changes afterward, activation rejects and revokes the stale approval so the operator must approve the new stopped epoch. A valid internal sentinel may already exist after an interrupted earlier publication, but it does not bypass this approval. A running, replaced, foreign, missing, symlinked, empty, already externally marked, or unregistered profile fails without leaving a usable approval. Start the daemon only after the command returns `approved:true`; migration consumes the approval before publishing markers and safely rolls back its own markers if the final pinned-inode checks fail.
 
 ## Add and log in to an account
 

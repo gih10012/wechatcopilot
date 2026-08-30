@@ -79,6 +79,13 @@ class AtomicActionTest {
                 original.copy(nodes = listOf(original.nodes.single().copy(checked = true))),
             ),
         )
+        assertFalse(
+            guard.matches(
+                41,
+                41,
+                original.copy(nodes = listOf(original.nodes.single().copy(selected = true))),
+            ),
+        )
     }
 
     @Test
@@ -98,6 +105,25 @@ class AtomicActionTest {
         val changed = original.copy(nodes = listOf(original.nodes.single().copy(checked = true)))
         guard.record(42, changed)
         assertTrue(guard.matches(42, 42, changed))
+    }
+
+    @Test
+    fun globalBackRequiresTheSameOfficialWindowAndConsumesTheSnapshot() {
+        val guard = SemanticSnapshotGuard()
+        val original = fingerprint()
+        guard.record(41, original)
+
+        assertFalse(
+            consumeConstrainedGlobalBack(
+                guard,
+                41,
+                41,
+                original,
+                original.copy(windowId = original.windowId + 1),
+            ),
+        )
+        assertTrue(consumeConstrainedGlobalBack(guard, 41, 41, original, original))
+        assertFalse(consumeConstrainedGlobalBack(guard, 41, 41, original, original))
     }
 
     @Test
@@ -130,6 +156,7 @@ class AtomicActionTest {
                 clickable = true,
                 checkable = true,
                 checked = false,
+                selected = false,
                 editable = false,
                 scrollable = false,
                 enabled = true,

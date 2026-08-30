@@ -22,16 +22,22 @@ type AndroidContainer struct {
 	Container    string
 	Executor     Executor
 	Verify       func(context.Context) error
+	// Resolve proves the live profile frame and returns the immutable Docker
+	// container ID that the immediately following operation must target. The
+	// runtime always configures Resolve; Verify remains for isolated tests and
+	// compatibility with non-runtime callers.
+	Resolve func(context.Context) (string, error)
 }
 
 func (a AndroidContainer) run(ctx context.Context, command string, args ...string) ([]byte, error) {
 	if err := a.validate(); err != nil {
 		return nil, err
 	}
-	if err := a.Verify(ctx); err != nil {
+	target, err := a.verifiedTarget(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("verify Redroid container before exec: %w", err)
 	}
-	execArgs := []string{"container", "exec", a.Container, command}
+	execArgs := []string{"container", "exec", target, command}
 	execArgs = append(execArgs, args...)
 	return a.Executor.Run(ctx, a.DockerBinary, execArgs...)
 }
@@ -40,22 +46,40 @@ func (a AndroidContainer) runInput(ctx context.Context, input []byte, maxOutputB
 	if err := a.validate(); err != nil {
 		return nil, err
 	}
-	if err := a.Verify(ctx); err != nil {
+	target, err := a.verifiedTarget(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("verify Redroid container before interactive exec: %w", err)
 	}
-	execArgs := []string{"container", "exec", "--interactive", a.Container, command}
+	execArgs := []string{"container", "exec", "--interactive", target, command}
 	execArgs = append(execArgs, args...)
 	return a.Executor.RunInput(ctx, input, maxOutputBytes, a.DockerBinary, execArgs...)
 }
 
 func (a AndroidContainer) validate() error {
-	if a.Executor == nil || a.Verify == nil {
+	if a.Executor == nil || a.Verify == nil && a.Resolve == nil {
 		return errors.New("Android container transport is not configured")
 	}
 	if a.DockerBinary == "" || a.Container == "" {
 		return errors.New("Android container command target is empty")
 	}
 	return nil
+}
+
+func (a AndroidContainer) verifiedTarget(ctx context.Context) (string, error) {
+	if a.Resolve != nil {
+		target, err := a.Resolve(ctx)
+		if err != nil {
+			return "", err
+		}
+		if !validImmutableContainerID(target) {
+			return "", errors.New("verified Redroid container identity is invalid")
+		}
+		return target, nil
+	}
+	if err := a.Verify(ctx); err != nil {
+		return "", err
+	}
+	return a.Container, nil
 }
 
 func (a AndroidContainer) WaitForBoot(ctx context.Context, timeout time.Duration) error {
@@ -154,10 +178,11 @@ func (a AndroidContainer) Install(ctx context.Context, hostAPKPath, containerAPK
 		}
 	}()
 
-	if err := a.Verify(ctx); err != nil {
+	targetContainer, err := a.verifiedTarget(ctx)
+	if err != nil {
 		return fmt.Errorf("verify Redroid container before APK copy: %w", err)
 	}
-	target := a.Container + ":" + containerAPKPath
+	target := targetContainer + ":" + containerAPKPath
 	if _, err := a.Executor.Run(ctx, a.DockerBinary, "container", "cp", hostAPKPath, target); err != nil {
 		return fmt.Errorf("copy verified APK into Redroid: %w", err)
 	}

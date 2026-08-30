@@ -7,31 +7,35 @@ import (
 
 // Capability names are stable API keys shared by every driver.
 const (
-	CapabilityAuthQR               = "auth.qr"
-	CapabilityAuthSMS              = "auth.sms"
-	CapabilityMessagesVisible      = "messages.visible"
-	CapabilityMessagesHistory      = "messages.history"
-	CapabilityMessagesWatch        = "messages.watch"
-	CapabilityMessagesSend         = "messages.send"
-	CapabilityAttachmentsSend      = "attachments.send"
-	CapabilityOfficialAccountsRead = "official_accounts.read"
-	CapabilityWebOpen              = "web.open"
-	CapabilityMiniProgramOpen      = "miniprogram.open"
-	CapabilitySurfaceAct           = "surface.act"
+	CapabilityAuthQR                = "auth.qr"
+	CapabilityAuthSMS               = "auth.sms"
+	CapabilityMessagesVisible       = "messages.visible"
+	CapabilityMessagesHistory       = "messages.history"
+	CapabilityMessagesWatch         = "messages.watch"
+	CapabilityMessagesSend          = "messages.send"
+	CapabilityAttachmentsSend       = "attachments.send"
+	CapabilityOfficialAccountsRead  = "official_accounts.read"
+	CapabilityWebOpen               = "web.open"
+	CapabilityMiniProgramOpen       = "miniprogram.open"
+	CapabilityMiniProgramOpenByName = "miniprogram.open_by_name"
+	CapabilitySurfaceAct            = "surface.act"
+	CapabilitySurfaceAssetExport    = "surface.assets.export"
 )
 
 var knownCapabilities = map[string]struct{}{
-	CapabilityAuthQR:               {},
-	CapabilityAuthSMS:              {},
-	CapabilityMessagesVisible:      {},
-	CapabilityMessagesHistory:      {},
-	CapabilityMessagesWatch:        {},
-	CapabilityMessagesSend:         {},
-	CapabilityAttachmentsSend:      {},
-	CapabilityOfficialAccountsRead: {},
-	CapabilityWebOpen:              {},
-	CapabilityMiniProgramOpen:      {},
-	CapabilitySurfaceAct:           {},
+	CapabilityAuthQR:                {},
+	CapabilityAuthSMS:               {},
+	CapabilityMessagesVisible:       {},
+	CapabilityMessagesHistory:       {},
+	CapabilityMessagesWatch:         {},
+	CapabilityMessagesSend:          {},
+	CapabilityAttachmentsSend:       {},
+	CapabilityOfficialAccountsRead:  {},
+	CapabilityWebOpen:               {},
+	CapabilityMiniProgramOpen:       {},
+	CapabilityMiniProgramOpenByName: {},
+	CapabilitySurfaceAct:            {},
+	CapabilitySurfaceAssetExport:    {},
 }
 
 // CapabilityMap fills absent keys with unsupported. Unknown keys panic because

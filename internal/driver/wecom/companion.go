@@ -36,6 +36,7 @@ type Node struct {
 	Clickable          bool   `json:"clickable"`
 	Checkable          bool   `json:"checkable"`
 	Checked            bool   `json:"checked"`
+	Selected           *bool  `json:"selected"`
 	Editable           bool   `json:"editable"`
 	Scrollable         bool   `json:"scrollable"`
 	Enabled            bool   `json:"enabled"`
@@ -46,10 +47,22 @@ type Node struct {
 type UISnapshot struct {
 	Sequence    int64     `json:"sequence"`
 	PackageName string    `json:"package_name"`
+	WindowID    int       `json:"window_id"`
 	WindowTitle string    `json:"window_title,omitempty"`
 	WindowClass string    `json:"window_class,omitempty"`
 	CapturedAt  time.Time `json:"captured_at"`
 	Nodes       []Node    `json:"nodes"`
+}
+
+func (snapshot *UISnapshot) UnmarshalJSON(data []byte) error {
+	// Missing window_id means an older companion cannot safely bind surfaces.
+	type wireSnapshot UISnapshot
+	decoded := wireSnapshot{WindowID: -1}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*snapshot = UISnapshot(decoded)
+	return nil
 }
 
 type CompanionEvent struct {
@@ -63,6 +76,10 @@ type CompanionEvent struct {
 	Text            string    `json:"text,omitempty"`
 	Openable        bool      `json:"openable"`
 	PostedAt        time.Time `json:"posted_at"`
+	// GapBefore is emitted by the companion on the oldest currently retained
+	// record for each conversation. It is conversation-scoped, not merely the
+	// boundary of the global notification ring.
+	GapBefore bool `json:"gap_before"`
 }
 
 type EventPage struct {
@@ -277,8 +294,8 @@ func validateCompanionAction(action CompanionAction) error {
 			return errors.New("set_text payload exceeds 32 KiB")
 		}
 	case ActionGlobalBack:
-		if action.NodeID != "" || action.Text != "" || action.ExpectedSequence != 0 {
-			return errors.New("global_back does not accept parameters")
+		if action.NodeID != "" || action.Text != "" || action.ExpectedSequence <= 0 {
+			return errors.New("global_back requires expected_sequence and no node or text")
 		}
 	case ActionOpenNotification:
 		if action.NodeID == "" || action.Text != "" || action.ExpectedSequence != 0 {

@@ -31,14 +31,26 @@ Require fresh confirmation for group messages, attachments, surface sharing, or 
 
 ## Web and mini-program surfaces
 
-Open the surface by passing the source message's opaque `surface_ref` to `surfaces open --ref`; a `message_id` is not a surface reference. Request a snapshot and choose only from its current semantic action IDs. Snapshot after navigation or data entry because the action set becomes stale.
+There are two distinct open paths. A message-backed webpage or mini program requires the source message's opaque `surface_ref` and capability `web.open` or `miniprogram.open`; pass it to `surfaces open --ref` and never substitute `message_id`. The reference binds the exact card observed during indexing, so a stale same-label replacement must fail rather than be rediscovered by label. A named launch requires `miniprogram.open_by_name` and `surfaces open --mini-program` with the exact display name. The two inputs are mutually exclusive. A named launch performs no click when search results are ambiguous, requires a newly observed and verified WMPF window, and must return the actual mini-program context before the agent proceeds. Do not claim an AppID unless the returned `app_id` is populated.
 
-Do not request arbitrary coordinates, keyboard events, ADB, JavaScript injection, or shell access. Stop before payments, transfers, authorization grants, identity verification, security settings, risk warnings, or an action classified as `USER_ACTION_REQUIRED`.
+Mini-program screens are not a finite workflow. Repeat this observation loop until the user's read-only goal is satisfied or a policy boundary stops it:
+
+```text
+open -> snapshot -> inspect elements/actions -> act(action_id) -> snapshot
+```
+
+Snapshot after every action, navigation, input, or scroll. Use only an action ID currently offered for that surface. When elements are available, relate `elements[].target_id` to `actions[].target_id`; `elements[].action_ids` lists the actions for that exact target, and `elements[].action_id` may appear as a convenience only when there is exactly one. Current WeCom snapshots may expose only the matching screenshot and actions, so do not invent a missing element relationship. When labels repeat, distinguish targets with available IDs and observed bounds instead of guessing from label text. Bounds are observational metadata, never input coordinates.
+
+Low-risk observation, scrolling, proven navigation, and proven search input may proceed. A `medium` or `unknown` action, or any action with `effect:"external_write"`, requires the user's explicit current-turn authorization for that exact action. An agent must not set `--confirm` or `confirmed:true` by itself. Likes, comments, favorites, follows, publishes, submissions, and shares are external writes. `high`, `sensitive`, and `destructive` actions are always refused even when the user offers confirmation.
+
+OCR may supplement visible text or advertise an unknown visual action. Use OCR input only when execution can prove one focused editable target and read the value back; otherwise treat it as confirmation-required or unsupported. Never infer success merely because the entered text also appears elsewhere on the page.
+
+When `surface.assets.export` is available, an asset token may export exact rendered pixels from the current snapshot. Current personal-WeChat snapshots include a `rendered_viewport` token for the complete verified window, so a Canvas-only page remains exportable even when no semantic image node exists; semantic image tokens may provide tighter crops. Current WeCom does not advertise this capability and supplies no export token. Rendered assets are not the mini program's original image, URL, attachment, or official download. Snapshotting invalidates older asset tokens. Do not request arbitrary coordinates, raw X11/XTest input, keyboard or mouse events, ADB, JavaScript or shell injection, or a forged locator/action ID, and never work around Tencent verification or risk controls.
 
 ## Failure behavior
 
 - `AUTH_REQUIRED`: ask the user to start a CLI login challenge manually in a separate trusted terminal. Never run `accounts login` or an `auth` subcommand through an agent tool, or ask for their bearer-URL/verification-secret input or output.
-- `TARGET_AMBIGUOUS`: present the candidates and wait for a choice.
+- `TARGET_AMBIGUOUS`: stop and ask the user to refine the exact target or name; the current API does not return a candidate list.
 - `CLIENT_INCOMPATIBLE`: stop and report the exact detected client version.
 - `UNSUPPORTED_CAPABILITY`: report the boundary; do not find a raw-input workaround.
 - `SEND_UNCERTAIN`: report that it may have sent and inspect before any retry.

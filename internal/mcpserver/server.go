@@ -4,7 +4,12 @@ package mcpserver
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"net/http"
 
 	"github.com/gih10012/wechatcopilot/internal/account"
 	"github.com/gih10012/wechatcopilot/internal/api"
@@ -110,8 +115,9 @@ type commitSendInput struct {
 }
 
 type surfaceOpenInput struct {
-	AccountID string `json:"account_id"`
-	Reference string `json:"reference" jsonschema:"Message-backed URL or mini-program reference returned by the message API."`
+	AccountID   string `json:"account_id"`
+	Reference   string `json:"reference,omitempty" jsonschema:"Message-backed URL or mini-program reference returned by the message API; mutually exclusive with mini_program."`
+	MiniProgram string `json:"mini_program,omitempty" jsonschema:"Exact mini-program display name; mutually exclusive with reference."`
 }
 
 type surfaceInput struct {
@@ -120,10 +126,27 @@ type surfaceInput struct {
 }
 
 type surfaceActInput struct {
-	AccountID string `json:"account_id"`
-	SurfaceID string `json:"surface_id"`
-	ActionID  string `json:"action_id" jsonschema:"Semantic action ID from the latest surface snapshot."`
-	Text      string `json:"text,omitempty"`
+	AccountID string  `json:"account_id"`
+	SurfaceID string  `json:"surface_id"`
+	ActionID  string  `json:"action_id" jsonschema:"Semantic action ID from the latest surface snapshot."`
+	Text      *string `json:"text,omitempty" jsonschema:"Replacement text for an advertised kind=input action; explicitly pass an empty string to clear it. At most 4096 Unicode code points and no NUL. OCR input must resolve to one focused editable target and pass value readback."`
+	Confirmed bool    `json:"confirmed,omitempty" jsonschema:"True only after the user authorizes this exact current action; required for medium or unknown risk and external-write actions, and never overrides a high-risk block."`
+}
+
+type surfaceExportInput struct {
+	AccountID  string `json:"account_id"`
+	SurfaceID  string `json:"surface_id"`
+	AssetToken string `json:"asset_token" jsonschema:"Short-lived token from the latest snapshot of this exact surface."`
+}
+
+type surfaceDaemonOutput struct {
+	Surface          driver.Surface `json:"surface"`
+	ScreenshotBase64 string         `json:"screenshot_base64,omitempty"`
+}
+
+type surfaceExportDaemonOutput struct {
+	Asset      driver.SurfaceAssetExport `json:"asset"`
+	DataBase64 string                    `json:"data_base64,omitempty"`
 }
 
 func (s *Server) addTools() {
@@ -257,29 +280,58 @@ func (s *Server) addTools() {
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
-		Name: "surfaces_open", Description: "Open a message-backed webpage or mini program in the selected official client.", Annotations: interactive,
+		Name: "surfaces_open", Description: "Open exactly one message-backed surface or named mini program in the selected official client.", Annotations: interactive,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in surfaceOpenInput) (*mcp.CallToolResult, any, error) {
-		var output map[string]any
-		err := s.client.Post(ctx, "/v1/surfaces/open", map[string]any{"account": in.AccountID, "ref": in.Reference}, &output)
-		return toolResult(output, err)
+		var output surfaceDaemonOutput
+		err := s.client.Post(ctx, "/v1/surfaces/open", map[string]any{
+			"account": in.AccountID, "ref": in.Reference, "mini_program": in.MiniProgram,
+		}, &output)
+		return surfaceToolResult(output, err)
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
 		Name: "surfaces_snapshot", Description: "Read the current screenshot, semantic text, and allowed action IDs for an open surface.", Annotations: readOnly,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in surfaceInput) (*mcp.CallToolResult, any, error) {
-		var output map[string]any
+		var output surfaceDaemonOutput
 		err := s.client.Post(ctx, "/v1/surfaces/snapshot", map[string]any{"account": in.AccountID, "id": in.SurfaceID}, &output)
-		return toolResult(output, err)
+		return surfaceToolResult(output, err)
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
-		Name: "surfaces_act", Description: "Use one semantic action from the latest surface snapshot; high-risk actions are blocked.", Annotations: interactive,
+		Name: "surfaces_act", Description: "Use one semantic action from the latest snapshot, optionally supplying replacement text and exact-action confirmation; high-risk actions are blocked.", Annotations: interactive,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in surfaceActInput) (*mcp.CallToolResult, any, error) {
-		var output map[string]any
-		err := s.client.Post(ctx, "/v1/surfaces/act", map[string]any{
-			"account": in.AccountID, "id": in.SurfaceID, "action_id": in.ActionID, "text": in.Text,
+		var output surfaceDaemonOutput
+		input := map[string]any{
+			"account": in.AccountID, "id": in.SurfaceID, "action_id": in.ActionID,
+			"confirmed": in.Confirmed,
+		}
+		if in.Text != nil {
+			input["text"] = *in.Text
+		}
+		err := s.client.Post(ctx, "/v1/surfaces/act", input, &output)
+		return surfaceToolResult(output, err)
+	})
+
+	mcp.AddTool(s.server, &mcp.Tool{
+		Name: "surfaces_export", Description: "Export one rendered image crop using an asset token from the latest exact surface snapshot.", Annotations: readOnly,
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in surfaceExportInput) (*mcp.CallToolResult, any, error) {
+		var output surfaceExportDaemonOutput
+		err := s.client.Post(ctx, "/v1/surfaces/export", map[string]any{
+			"account": in.AccountID, "id": in.SurfaceID, "asset_token": in.AssetToken,
 		}, &output)
-		return toolResult(output, err)
+		if err != nil {
+			return toolResult(output.Asset, err)
+		}
+		data, decodeErr := base64.StdEncoding.DecodeString(output.DataBase64)
+		if decodeErr != nil || len(data) == 0 {
+			return toolResult(output.Asset, api.WrapError(http.StatusInternalServerError, api.CodeInternal, "daemon returned invalid rendered image data", errors.Join(decodeErr)))
+		}
+		digest := sha256.Sum256(data)
+		if output.Asset.Fidelity != "rendered" || output.Asset.MediaType != "image/png" ||
+			output.Asset.Bytes != int64(len(data)) || output.Asset.SHA256 != hex.EncodeToString(digest[:]) {
+			return toolResult(output.Asset, api.NewError(http.StatusInternalServerError, api.CodeInternal, "daemon returned inconsistent rendered image metadata"))
+		}
+		return toolImageResult(output.Asset, data, output.Asset.MediaType)
 	})
 
 	mcp.AddTool(s.server, &mcp.Tool{
@@ -320,4 +372,36 @@ func toolResult(data any, err error) (*mcp.CallToolResult, any, error) {
 		StructuredContent: envelope,
 		IsError:           err != nil,
 	}, nil, nil
+}
+
+func toolImageResult(metadata any, data []byte, mediaType string) (*mcp.CallToolResult, any, error) {
+	envelope := api.Success(metadata)
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: string(encoded)},
+			&mcp.ImageContent{Data: data, MIMEType: mediaType},
+		},
+		StructuredContent: envelope,
+	}, nil, nil
+}
+
+func surfaceToolResult(output surfaceDaemonOutput, operationErr error) (*mcp.CallToolResult, any, error) {
+	if operationErr != nil {
+		output.ScreenshotBase64 = ""
+		return toolResult(output, operationErr)
+	}
+	data, err := base64.StdEncoding.DecodeString(output.ScreenshotBase64)
+	if err != nil || len(data) == 0 {
+		return toolResult(output.Surface, api.WrapError(http.StatusInternalServerError, api.CodeInternal, "daemon returned invalid surface screenshot data", errors.Join(err)))
+	}
+	digest := sha256.Sum256(data)
+	if output.Surface.ScreenshotSHA256 == "" || output.Surface.ScreenshotSHA256 != hex.EncodeToString(digest[:]) {
+		return toolResult(output.Surface, api.NewError(http.StatusInternalServerError, api.CodeInternal, "daemon returned a screenshot from another surface frame"))
+	}
+	output.ScreenshotBase64 = ""
+	return toolImageResult(output, data, "image/png")
 }

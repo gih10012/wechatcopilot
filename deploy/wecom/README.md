@@ -36,6 +36,33 @@ stops its ownership-labelled container while preserving this bind-mounted tree
 and stable hostname. This normally keeps the official client's login state,
 but WeCom may require QR, phone confirmation, or SMS verification again.
 
+Each initialized profile has a mode `0600` `wecom-profile.json` in its account
+state directory and a matching mode `0600` `.wechatcopilot-profile.json`
+sentinel inside `wecom/android-data`. The versioned records bind the opaque
+account ID, canonical data path, persistent inode, random stable profile
+identity, and creation identity. The on-disk identity deliberately excludes
+`st_dev`, which can change when the verified dm-crypt state filesystem is
+remounted; each sensitive operation still pins and compares the live
+device/inode pair. A missing, exchanged, symlinked, or in-place-cleared `/data`
+directory, or a missing or mismatched internal sentinel, is a hard startup
+failure. The daemon never
+creates an empty replacement for a marked profile.
+
+The first activation after upgrading from a markerless release writes both
+records only when the existing data directory is real and the existing
+container name, account labels, pinned image, hostname, isolated network, and
+exact `/data` bind source all verify. A running legacy container must also prove
+the live mounted inode. A stopped markerless container is never trusted on
+first use: while the daemon is offline, the operator must explicitly run
+`wechatcopilot accounts approve-legacy-wecom-profile --account ACCOUNT_ID
+--confirm`. That command publishes only a mode-`0600`, one-use approval bound to
+the resolved WeCom account, canonical data path and inode, immutable
+container ID, and complete stopped execution epoch; activation consumes it
+before writing either marker. Running or otherwise changing the container
+invalidates and revokes the stale approval. Neither path modifies existing
+Android data. Do not remove the legacy container before this first upgraded
+activation. Markerless data without the applicable proof is left untouched.
+
 The daemon obtains login screenshots with a bounded, exact-container
 `docker exec /system/bin/screencap -p` and submits numeric verification codes
 only to the single semantic editable field advertised by the accessibility
@@ -54,8 +81,15 @@ Available endpoints are `GET /v1/health`, `GET /v1/snapshot`,
 `GET /v1/events`, and `POST /v1/actions`. Actions are restricted to semantic
 click, check-if-unchecked, text entry, forward/backward scroll, Android Back,
 and opening a stored notification PendingIntent. The check-only action requires
-a fresh visible, enabled, clickable, checkable node and rejects an already
-checked node. There is no arbitrary ADB, shell, coordinate,
+a fresh visible, enabled, clickable control and rejects an already accepted
+control. The pinned WeCom 5.0.9 login screen permits only its exact
+`android.widget.ImageView` agreement control
+(`com.tencent.wework:id/ow`) while an explicit `selected=false` is present in
+the companion snapshot; every other image and a missing state field are
+rejected, and that control is always rejected by the generic click action.
+Another client layout requires a separately reviewed, version-specific profile;
+there is no generic checkbox fallback.
+There is no arbitrary ADB, shell, coordinate,
 filesystem, WebView debugging, or network proxy method.
 
 Before every exec or copy, the daemon rechecks the exact container name,

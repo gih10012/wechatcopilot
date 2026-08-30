@@ -3,12 +3,16 @@
 package wechat
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"image"
+	"image/draw"
+	"image/png"
 	"io"
 	"io/fs"
 	"os"
@@ -23,11 +27,16 @@ import (
 )
 
 var authCodePattern = regexp.MustCompile(`^[0-9]{4,10}$`)
+var errRenderedAssetTooLarge = errors.New("rendered asset exceeds safe size limit")
 
 const (
 	defaultVerificationTimeout = 15 * time.Second
 	defaultMaxAttachmentBytes  = int64(512 << 20)
 	defaultMaxMessageRunes     = 100_000
+	surfaceAssetTokenTTL       = 2 * time.Minute
+	maxSurfaceScreenshotBytes  = 32 << 20
+	maxSurfaceImageDimension   = 16_384
+	maxSurfaceImagePixels      = 64_000_000
 )
 
 type IndexFactory func(Profile) (MessageIndex, error)
@@ -57,9 +66,16 @@ type Driver struct {
 }
 
 type surfaceSession struct {
-	id      string
-	actions map[string]BackendAction
-	surface shared.Surface
+	id               string
+	accountID        string
+	generation       string
+	screenshotSHA256 string
+	windowIdentity   string
+	actions          map[string]BackendAction
+	consumedActions  map[string]struct{}
+	replayTombstones map[string]struct{}
+	assets           map[string]shared.SurfaceAsset
+	surface          shared.Surface
 }
 
 type sendMemo struct {
@@ -68,8 +84,28 @@ type sendMemo struct {
 	err    error
 }
 
+type boundedBytesBuffer struct {
+	bytes.Buffer
+	maximum int
+}
+
+func (b *boundedBytesBuffer) Write(contents []byte) (int, error) {
+	remaining := b.maximum - b.Len()
+	if remaining <= 0 {
+		return 0, errRenderedAssetTooLarge
+	}
+	if len(contents) <= remaining {
+		return b.Buffer.Write(contents)
+	}
+	written, _ := b.Buffer.Write(contents[:remaining])
+	return written, errRenderedAssetTooLarge
+}
+
 var _ shared.Driver = (*Driver)(nil)
 var _ shared.AccountPurger = (*Driver)(nil)
+var _ shared.AuthActionDriver = (*Driver)(nil)
+var _ shared.NamedSurfaceOpener = (*Driver)(nil)
+var _ shared.SurfaceAssetExporter = (*Driver)(nil)
 
 func New(config Config) (*Driver, error) {
 	backend := config.Backend
@@ -210,9 +246,15 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (shared.AuthSnapshot, error) 
 	if err != nil {
 		return shared.AuthSnapshot{}, err
 	}
-	screenshot, err := d.backend.Screenshot(ctx)
-	if err != nil {
-		return shared.AuthSnapshot{}, err
+	screenshot := append([]byte(nil), probe.ScreenshotPNG...)
+	if len(screenshot) == 0 {
+		if hasImageBoundAuthAction(probe.Actions) {
+			return shared.AuthSnapshot{}, fmt.Errorf("%w: image-bound authentication action has no matching screenshot", ErrClientIncompatible)
+		}
+		screenshot, err = d.backend.Screenshot(ctx)
+		if err != nil {
+			return shared.AuthSnapshot{}, err
+		}
 	}
 	var qrCode []byte
 	if probe.State == shared.StateAuthRequired && (probe.AuthKind == "" || probe.AuthKind == shared.AuthQR) {
@@ -228,7 +270,9 @@ func (d *Driver) AuthSnapshot(ctx context.Context) (shared.AuthSnapshot, error) 
 	return shared.AuthSnapshot{
 		Kind: kind, State: probe.State, Prompt: probe.Prompt,
 		QRCodePNG: qrCode, ScreenshotPNG: screenshot,
-		CanSubmitCode: probe.CanSubmitCode, ObservedAt: probe.ObservedAt,
+		CanSubmitCode: probe.CanSubmitCode,
+		Actions:       append([]shared.AuthAction(nil), probe.Actions...),
+		ObservedAt:    probe.ObservedAt,
 	}, nil
 }
 
@@ -243,6 +287,77 @@ func (d *Driver) SubmitAuthCode(ctx context.Context, code string) error {
 	d.operationMu.Lock()
 	defer d.operationMu.Unlock()
 	return d.backend.SubmitAuthCode(ctx, code)
+}
+
+func (d *Driver) PerformAuthAction(ctx context.Context, request shared.AuthActionRequest) error {
+	expectedGeneration, ok := savedAccountLoginGeneration(request.ActionID)
+	if !ok {
+		return fmt.Errorf("%w: authentication action is not advertised", ErrActionStale)
+	}
+	if !request.Confirmed {
+		return fmt.Errorf("%w: authentication action requires explicit user confirmation", ErrUserActionRequired)
+	}
+
+	d.operationMu.Lock()
+	defer d.operationMu.Unlock()
+	if !d.started() {
+		return ErrNotStarted
+	}
+	probe, err := d.backend.Probe(ctx)
+	if err != nil {
+		return err
+	}
+	if probe.State != shared.StateAuthRequired || !savedAccountLoginActionAdvertised(probe.Actions, request.ActionID) {
+		return fmt.Errorf("%w: saved-account login confirmation is no longer advertised", ErrActionStale)
+	}
+	if err := d.backend.ContinueSavedAccountLogin(ctx, expectedGeneration); err != nil {
+		if definitiveAuthActionRejection(err) || shared.AuthActionWasConsumed(err) {
+			return err
+		}
+		// Losing the Docker/control response cannot prove that the official
+		// client rejected the activation. Consume the one-time web action so a
+		// retry cannot click the login control twice.
+		return shared.MarkAuthActionConsumed(err)
+	}
+	return nil
+}
+
+func savedAccountLoginGeneration(actionID string) (string, bool) {
+	if !strings.HasPrefix(actionID, savedAccountLoginActionPrefix) {
+		return "", false
+	}
+	generation := strings.TrimPrefix(actionID, savedAccountLoginActionPrefix)
+	return generation, authGenerationPattern.MatchString(generation)
+}
+
+func hasImageBoundAuthAction(actions []shared.AuthAction) bool {
+	for _, action := range actions {
+		if action.ImageBound {
+			return true
+		}
+	}
+	return false
+}
+
+func savedAccountLoginActionAdvertised(actions []shared.AuthAction, actionID string) bool {
+	matches := 0
+	for _, action := range actions {
+		if action.ID != actionID {
+			continue
+		}
+		if !action.RequiresConfirmation || !action.ImageBound {
+			return false
+		}
+		matches++
+	}
+	return matches == 1
+}
+
+func definitiveAuthActionRejection(err error) bool {
+	return errors.Is(err, ErrNotStarted) || errors.Is(err, ErrActionStale) ||
+		errors.Is(err, ErrTargetAmbiguous) || errors.Is(err, ErrUserActionRequired) ||
+		errors.Is(err, ErrClientIncompatible) || errors.Is(err, ErrAuthRequired) ||
+		errors.Is(err, ErrInvalidArgument)
 }
 
 func (d *Driver) ListConversations(ctx context.Context, query shared.ConversationQuery) ([]shared.Conversation, error) {
@@ -304,7 +419,7 @@ func (d *Driver) Send(ctx context.Context, request shared.SendRequest) (shared.S
 	if probe.State == shared.StateAuthRequired {
 		return shared.SendResult{}, ErrAuthRequired
 	}
-	if probe.State != shared.StateOnline && probe.State != shared.StateDegraded {
+	if probe.State != shared.StateOnline {
 		return shared.SendResult{}, fmt.Errorf("wechat client is not online: %s", probe.State)
 	}
 
@@ -419,20 +534,56 @@ func (d *Driver) OpenSurface(ctx context.Context, reference string) (shared.Surf
 	d.mu.Lock()
 	d.surfaces = make(map[string]*surfaceSession)
 	d.mu.Unlock()
-	return d.storeSurface(id, backendSurface), nil
+	return d.storeSurface(id, backendSurface)
+}
+
+func (d *Driver) OpenNamedSurface(ctx context.Context, target shared.NamedSurface) (shared.Surface, error) {
+	if !d.started() {
+		return shared.Surface{}, ErrNotStarted
+	}
+	if target.Kind != "miniprogram" {
+		return shared.Surface{}, fmt.Errorf("%w: only named mini programs are supported", ErrUnsupported)
+	}
+	name := strings.TrimSpace(target.Name)
+	if name == "" || utf8.RuneCountInString(name) > 128 || strings.ContainsRune(name, '\x00') {
+		return shared.Surface{}, errors.New("mini-program name must contain between 1 and 128 characters")
+	}
+	d.operationMu.Lock()
+	defer d.operationMu.Unlock()
+	backendSurface, err := d.backend.OpenNamedSurface(ctx, target.Kind, name)
+	if err != nil {
+		return shared.Surface{}, err
+	}
+	if backendSurface.Generation == "" || backendSurface.ScreenshotSHA256 == "" || backendSurface.WindowIdentity == "" {
+		return shared.Surface{}, fmt.Errorf("%w: named mini-program open did not return a frame-bound snapshot", ErrClientIncompatible)
+	}
+	id, err := randomOpaqueID("wxsurf_")
+	if err != nil {
+		return shared.Surface{}, err
+	}
+	d.mu.Lock()
+	d.surfaces = make(map[string]*surfaceSession)
+	d.mu.Unlock()
+	return d.storeSurface(id, backendSurface)
 }
 
 func (d *Driver) SnapshotSurface(ctx context.Context, id string) (shared.Surface, error) {
 	d.operationMu.Lock()
 	defer d.operationMu.Unlock()
-	if !d.hasSurface(id) {
+	d.mu.Lock()
+	session := d.surfaces[id]
+	d.mu.Unlock()
+	if session == nil {
 		return shared.Surface{}, ErrSurfaceMissing
 	}
-	surface, err := d.backend.SnapshotSurface(ctx)
+	surface, err := d.backend.SnapshotSurface(ctx, session.windowIdentity)
 	if err != nil {
 		return shared.Surface{}, err
 	}
-	return d.storeSurface(id, surface), nil
+	if surface.WindowIdentity != session.windowIdentity {
+		return shared.Surface{}, ErrActionStale
+	}
+	return d.storeSurface(id, surface)
 }
 
 func (d *Driver) ActSurface(ctx context.Context, id string, request shared.SurfaceAction) (shared.Surface, error) {
@@ -441,60 +592,286 @@ func (d *Driver) ActSurface(ctx context.Context, id string, request shared.Surfa
 	d.mu.Lock()
 	session := d.surfaces[id]
 	var action BackendAction
-	found := false
+	actionFound := false
 	if session != nil {
-		action, found = session.actions[request.ActionID]
+		action, actionFound = session.actions[request.ActionID]
 	}
 	d.mu.Unlock()
-	if !found {
+	if !actionFound {
 		return shared.Surface{}, ErrActionStale
 	}
-	if action.Action.Disabled || action.Action.Risk == "high" {
+	risk := strings.ToLower(strings.TrimSpace(action.Action.Risk))
+	effect := strings.ToLower(strings.TrimSpace(action.Action.Effect))
+	if action.Action.Disabled || risk == "high" || risk == "sensitive" || risk == "destructive" ||
+		effect == "high_risk" || effect == "sensitive" || effect == "destructive" {
 		return shared.Surface{}, ErrUserActionRequired
 	}
-	if request.Text != "" && action.Action.Kind != "input" {
-		return shared.Surface{}, errors.New("text is only accepted by a surface input action")
+	if !request.TextProvided && request.Text != "" {
+		return shared.Surface{}, fmt.Errorf("%w: surface action text presence is inconsistent", ErrInvalidArgument)
 	}
-	surface, err := d.backend.ActSurface(ctx, action.Locator, request.Text)
+	if action.Action.Kind == "input" {
+		if !request.TextProvided {
+			return shared.Surface{}, fmt.Errorf("%w: text is required by a surface input action; pass an explicit empty string to clear it", ErrInvalidArgument)
+		}
+	} else if request.TextProvided {
+		return shared.Surface{}, fmt.Errorf("%w: text is only accepted by a surface input action", ErrInvalidArgument)
+	}
+	if request.TextProvided && (utf8.RuneCountInString(request.Text) > 4_096 || strings.ContainsRune(request.Text, '\x00')) {
+		return shared.Surface{}, fmt.Errorf("%w: surface input text must not exceed 4096 characters or contain NUL", ErrInvalidArgument)
+	}
+	if (risk != "low" || effect == "external_write") && !request.Confirmed {
+		return shared.Surface{}, ErrConfirmationRequired
+	}
+	d.mu.Lock()
+	// A semantic action is a one-shot capability. Consume it before the
+	// backend dispatch so retries after a timeout cannot double-click.
+	delete(session.actions, request.ActionID)
+	session.consumedActions[request.ActionID] = struct{}{}
+	d.mu.Unlock()
+	surface, err := d.backend.ActSurface(ctx, session.windowIdentity, action.Locator, request.Text)
+	if shouldTombstoneReplay(effect, err == nil) {
+		d.mu.Lock()
+		current := d.surfaces[id]
+		if current != nil && current.windowIdentity == session.windowIdentity {
+			current.replayTombstones[action.ReplayID] = struct{}{}
+		}
+		d.mu.Unlock()
+	}
 	if err != nil {
 		return shared.Surface{}, err
 	}
-	return d.storeSurface(id, surface), nil
+	return d.storeSurface(id, surface)
+}
+
+func shouldTombstoneReplay(effect string, succeeded bool) bool {
+	switch effect {
+	case "observe", "search_input":
+		return false
+	case "navigate":
+		return !succeeded
+	default:
+		return true
+	}
 }
 
 func (d *Driver) CloseSurface(ctx context.Context, id string) error {
 	d.operationMu.Lock()
 	defer d.operationMu.Unlock()
-	if !d.hasSurface(id) {
+	d.mu.Lock()
+	session := d.surfaces[id]
+	if session != nil {
+		// Closing is a one-shot action. Invalidate the session before dispatch
+		// so a timeout cannot turn a caller retry into a second back/close.
+		delete(d.surfaces, id)
+	}
+	d.mu.Unlock()
+	if session == nil {
 		return ErrSurfaceMissing
 	}
-	if err := d.backend.CloseSurface(ctx); err != nil {
+	if err := d.backend.CloseSurface(ctx, session.windowIdentity); err != nil {
 		return err
 	}
-	d.mu.Lock()
-	delete(d.surfaces, id)
-	d.mu.Unlock()
 	return nil
 }
 
-func (d *Driver) storeSurface(id string, backend BackendSurface) shared.Surface {
+func (d *Driver) storeSurface(id string, backend BackendSurface) (shared.Surface, error) {
+	if authenticationSurfaceKind(backend.Kind) {
+		return shared.Surface{}, ErrAuthRequired
+	}
+	if backend.WindowIdentity == "" {
+		return shared.Surface{}, fmt.Errorf("%w: surface response has no bound window identity", ErrClientIncompatible)
+	}
+	if len(backend.Screenshot) == 0 || len(backend.Screenshot) > maxSurfaceScreenshotBytes {
+		return shared.Surface{}, fmt.Errorf("%w: surface screenshot size is outside the safe limit", ErrClientIncompatible)
+	}
+	configuration, err := png.DecodeConfig(bytes.NewReader(backend.Screenshot))
+	if err != nil || configuration.Width <= 0 || configuration.Height <= 0 ||
+		configuration.Width > maxSurfaceImageDimension || configuration.Height > maxSurfaceImageDimension ||
+		int64(configuration.Width)*int64(configuration.Height) > maxSurfaceImagePixels {
+		return shared.Surface{}, fmt.Errorf("%w: surface screenshot is not a bounded PNG", ErrClientIncompatible)
+	}
+	digest := sha256.Sum256(backend.Screenshot)
+	screenshotSHA256 := hex.EncodeToString(digest[:])
+	if backend.ScreenshotSHA256 != "" && !strings.EqualFold(backend.ScreenshotSHA256, screenshotSHA256) {
+		return shared.Surface{}, fmt.Errorf("%w: surface screenshot digest changed across the driver boundary", ErrClientIncompatible)
+	}
+	if (len(backend.Elements) != 0 || len(backend.Assets) != 0 || backend.Viewport != nil) && backend.Generation == "" {
+		return shared.Surface{}, fmt.Errorf("%w: semantic surface metadata has no generation", ErrClientIncompatible)
+	}
+	now := d.config.Now().UTC()
 	surface := shared.Surface{
 		ID: id, Kind: backend.Kind, Title: backend.Title, URL: backend.URL,
-		AppID: backend.AppID, Screenshot: backend.Screenshot,
-		OCRText: backend.SemanticText, ObservedAt: d.config.Now().UTC(),
+		AppID: backend.AppID, Generation: backend.Generation,
+		Screenshot: append([]byte(nil), backend.Screenshot...), ScreenshotSHA256: screenshotSHA256,
+		OCRText: backend.SemanticText, Viewport: backend.Viewport, ObservedAt: now,
 	}
+	d.mu.Lock()
+	previous := d.surfaces[id]
+	consumedActions := make(map[string]struct{})
+	replayTombstones := make(map[string]struct{})
+	if previous != nil {
+		for actionID := range previous.consumedActions {
+			consumedActions[actionID] = struct{}{}
+		}
+		for replayID := range previous.replayTombstones {
+			replayTombstones[replayID] = struct{}{}
+		}
+	}
+	d.mu.Unlock()
 	actions := make(map[string]BackendAction, len(backend.Actions))
 	for _, action := range backend.Actions {
-		if action.Action.ID == "" || action.Locator == "" {
+		if action.Action.ID == "" || action.ReplayID == "" || action.Locator == "" {
+			continue
+		}
+		if _, consumed := consumedActions[action.Action.ID]; consumed {
+			continue
+		}
+		if _, tombstoned := replayTombstones[action.ReplayID]; tombstoned {
 			continue
 		}
 		actions[action.Action.ID] = action
 		surface.Actions = append(surface.Actions, action.Action)
 	}
+	for _, element := range backend.Elements {
+		candidateIDs := element.ActionIDs
+		if len(candidateIDs) == 0 && element.ActionID != "" {
+			candidateIDs = []string{element.ActionID}
+		}
+		element.ActionID = ""
+		element.ActionIDs = nil
+		seen := make(map[string]struct{}, len(candidateIDs))
+		for _, actionID := range candidateIDs {
+			if _, duplicate := seen[actionID]; duplicate {
+				continue
+			}
+			seen[actionID] = struct{}{}
+			if _, active := actions[actionID]; active {
+				element.ActionIDs = append(element.ActionIDs, actionID)
+			}
+		}
+		if len(element.ActionIDs) == 1 {
+			element.ActionID = element.ActionIDs[0]
+		}
+		surface.Elements = append(surface.Elements, element)
+	}
+	assets := make(map[string]shared.SurfaceAsset, len(backend.Assets))
+	assetIDs := make(map[string]bool, len(backend.Assets))
+	for _, asset := range backend.Assets {
+		if asset.ID == "" || asset.Token == "" || asset.Kind == "" || asset.Bounds.Width <= 0 || asset.Bounds.Height <= 0 || assetIDs[asset.ID] {
+			continue
+		}
+		token, err := randomOpaqueID("wxasset_")
+		if err != nil {
+			return shared.Surface{}, err
+		}
+		assetIDs[asset.ID] = true
+		asset.Token = token
+		asset.ExpiresAt = now.Add(surfaceAssetTokenTTL)
+		assets[token] = asset
+		surface.Assets = append(surface.Assets, asset)
+	}
 	d.mu.Lock()
-	d.surfaces[id] = &surfaceSession{id: id, actions: actions, surface: surface}
+	accountID := ""
+	if d.account != nil {
+		accountID = d.account.AccountID
+	}
+	d.surfaces[id] = &surfaceSession{
+		id: id, accountID: accountID, generation: backend.Generation,
+		screenshotSHA256: screenshotSHA256, windowIdentity: backend.WindowIdentity,
+		actions: actions, consumedActions: consumedActions, replayTombstones: replayTombstones,
+		assets: assets, surface: surface,
+	}
 	d.mu.Unlock()
-	return surface
+	return surface, nil
+}
+
+func authenticationSurfaceKind(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "auth", "auth_required", "authentication", "login", "qr", "sms":
+		return true
+	default:
+		return false
+	}
+}
+
+func (d *Driver) ExportSurfaceAsset(ctx context.Context, id, token string) (shared.SurfaceAssetExport, error) {
+	d.operationMu.Lock()
+	defer d.operationMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return shared.SurfaceAssetExport{}, err
+	}
+	d.mu.Lock()
+	session := d.surfaces[id]
+	var asset shared.SurfaceAsset
+	found := false
+	accountID := ""
+	if d.account != nil {
+		accountID = d.account.AccountID
+	}
+	if session != nil && session.accountID == accountID {
+		asset, found = session.assets[token]
+	}
+	if found && !d.config.Now().UTC().Before(asset.ExpiresAt) {
+		delete(session.assets, token)
+		found = false
+	}
+	var screenshot []byte
+	var generation, screenshotSHA256 string
+	if found {
+		screenshot = append([]byte(nil), session.surface.Screenshot...)
+		generation = session.generation
+		screenshotSHA256 = session.screenshotSHA256
+	}
+	d.mu.Unlock()
+	if session == nil {
+		return shared.SurfaceAssetExport{}, ErrSurfaceMissing
+	}
+	if !found || token == "" || generation == "" || screenshotSHA256 == "" {
+		return shared.SurfaceAssetExport{}, ErrAssetStale
+	}
+	digest := sha256.Sum256(screenshot)
+	if hex.EncodeToString(digest[:]) != screenshotSHA256 {
+		return shared.SurfaceAssetExport{}, fmt.Errorf("%w: cached surface screenshot no longer matches its generation", ErrClientIncompatible)
+	}
+	if len(screenshot) > maxSurfaceScreenshotBytes {
+		return shared.SurfaceAssetExport{}, fmt.Errorf("%w: cached surface screenshot is too large", ErrClientIncompatible)
+	}
+	configuration, err := png.DecodeConfig(bytes.NewReader(screenshot))
+	if err != nil {
+		return shared.SurfaceAssetExport{}, fmt.Errorf("%w: inspect surface screenshot: %v", ErrClientIncompatible, err)
+	}
+	if configuration.Width <= 0 || configuration.Height <= 0 ||
+		configuration.Width > maxSurfaceImageDimension || configuration.Height > maxSurfaceImageDimension ||
+		int64(configuration.Width)*int64(configuration.Height) > maxSurfaceImagePixels {
+		return shared.SurfaceAssetExport{}, fmt.Errorf("%w: surface screenshot dimensions are outside the safe export limit", ErrClientIncompatible)
+	}
+	decoded, err := png.Decode(bytes.NewReader(screenshot))
+	if err != nil {
+		return shared.SurfaceAssetExport{}, fmt.Errorf("%w: decode surface screenshot: %v", ErrClientIncompatible, err)
+	}
+	imageBounds := decoded.Bounds()
+	if asset.Bounds.X < imageBounds.Min.X || asset.Bounds.Y < imageBounds.Min.Y ||
+		asset.Bounds.Width <= 0 || asset.Bounds.Height <= 0 ||
+		asset.Bounds.Width > imageBounds.Max.X-asset.Bounds.X ||
+		asset.Bounds.Height > imageBounds.Max.Y-asset.Bounds.Y {
+		return shared.SurfaceAssetExport{}, fmt.Errorf("%w: asset bounds are outside the matching screenshot", ErrClientIncompatible)
+	}
+	rectangle := image.Rect(asset.Bounds.X, asset.Bounds.Y, asset.Bounds.X+asset.Bounds.Width, asset.Bounds.Y+asset.Bounds.Height)
+	crop := image.NewRGBA(image.Rect(0, 0, rectangle.Dx(), rectangle.Dy()))
+	draw.Draw(crop, crop.Bounds(), decoded, rectangle.Min, draw.Src)
+	encoded := boundedBytesBuffer{maximum: maxSurfaceScreenshotBytes}
+	if err := png.Encode(&encoded, crop); err != nil {
+		if errors.Is(err, errRenderedAssetTooLarge) {
+			return shared.SurfaceAssetExport{}, fmt.Errorf("%w: rendered asset exceeds the safe export limit", ErrClientIncompatible)
+		}
+		return shared.SurfaceAssetExport{}, fmt.Errorf("encode rendered asset: %w", err)
+	}
+	data := encoded.Bytes()
+	assetDigest := sha256.Sum256(data)
+	return shared.SurfaceAssetExport{
+		SurfaceID: id, AssetID: asset.ID, Fidelity: "rendered", MediaType: "image/png",
+		SHA256: hex.EncodeToString(assetDigest[:]), Bytes: int64(len(data)), Data: data,
+	}, nil
 }
 
 func (d *Driver) hasSurface(id string) bool {
@@ -518,8 +895,11 @@ func (d *Driver) currentIndex() MessageIndex {
 
 func (d *Driver) capabilities(ctx context.Context) map[string]shared.Support {
 	result := shared.CapabilityMap(map[string]shared.Support{
-		shared.CapabilityAuthQR:  shared.SupportBeta,
-		shared.CapabilityAuthSMS: shared.SupportBeta,
+		shared.CapabilityAuthQR:                shared.SupportBeta,
+		shared.CapabilityAuthSMS:               shared.SupportBeta,
+		shared.CapabilityMiniProgramOpenByName: shared.SupportExperimental,
+		shared.CapabilitySurfaceAct:            shared.SupportExperimental,
+		shared.CapabilitySurfaceAssetExport:    shared.SupportExperimental,
 	})
 	index := d.currentIndex()
 	if index != nil && index.Available(ctx) {
@@ -530,7 +910,6 @@ func (d *Driver) capabilities(ctx context.Context) map[string]shared.Support {
 		result[shared.CapabilityAttachmentsSend] = shared.SupportExperimental
 		result[shared.CapabilityWebOpen] = shared.SupportExperimental
 		result[shared.CapabilityMiniProgramOpen] = shared.SupportExperimental
-		result[shared.CapabilitySurfaceAct] = shared.SupportExperimental
 		if _, uiFallback := index.(*UIIndex); uiFallback {
 			result[shared.CapabilityMessagesVisible] = shared.SupportBeta
 			result[shared.CapabilityMessagesHistory] = shared.SupportUnsupported

@@ -8,6 +8,7 @@ import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import java.time.Instant
+import java.util.Locale
 
 internal fun canRequestCheck(
     visibleToUser: Boolean,
@@ -16,6 +17,182 @@ internal fun canRequestCheck(
     checkable: Boolean,
     checked: Boolean,
 ): Boolean = visibleToUser && enabled && clickable && checkable && !checked
+
+internal fun canRequestConstrainedCheck(
+    fingerprint: SemanticTreeFingerprint,
+    target: UiNodeModel,
+    packageName: String,
+    className: String,
+    viewId: String,
+    visibleToUser: Boolean,
+    enabled: Boolean,
+    clickable: Boolean,
+    checkable: Boolean,
+    checked: Boolean,
+    selected: Boolean,
+): Boolean {
+    val liveAgreementControl = isOfficialWeComLoginAgreementControl(packageName, className, viewId)
+    val capturedAgreementControl = isOfficialWeComLoginAgreementControl(
+        fingerprint.packageName,
+        target.className,
+        target.viewId,
+    )
+    if (!liveAgreementControl && !capturedAgreementControl) {
+        return canRequestCheck(visibleToUser, enabled, clickable, checkable, checked)
+    }
+    return liveAgreementControl && capturedAgreementControl &&
+        visibleToUser && enabled && clickable && !checkable && !checked && !selected &&
+        canRequestWeComLoginAgreementSelection(fingerprint, target)
+}
+
+internal fun canRequestConstrainedClick(
+    fingerprint: SemanticTreeFingerprint,
+    target: UiNodeModel,
+    packageName: String,
+    className: String,
+    viewId: String,
+    visibleToUser: Boolean,
+    enabled: Boolean,
+    clickable: Boolean,
+): Boolean {
+    val liveAgreementControl = isOfficialWeComLoginAgreementControl(packageName, className, viewId)
+    val capturedAgreementControl = isOfficialWeComLoginAgreementControl(
+        fingerprint.packageName,
+        target.className,
+        target.viewId,
+    )
+    return visibleToUser && enabled && clickable &&
+        !liveAgreementControl && !capturedAgreementControl
+}
+
+internal fun consumeConstrainedGlobalBack(
+    guard: SemanticSnapshotGuard,
+    expectedSequence: Long,
+    currentSequence: Long,
+    captured: SemanticTreeFingerprint,
+    verified: SemanticTreeFingerprint,
+): Boolean = captured.complete &&
+    captured.packageName == CompanionRuntime.WECOM_PACKAGE &&
+    captured == verified &&
+    guard.consume(expectedSequence, currentSequence, verified)
+
+private fun isOfficialWeComLoginAgreementControl(
+    packageName: String,
+    className: String,
+    viewId: String,
+): Boolean = packageName == CompanionRuntime.WECOM_PACKAGE &&
+    className == WECOM_LOGIN_AGREEMENT_CLASS &&
+    viewId == WECOM_LOGIN_AGREEMENT_VIEW_ID
+
+internal fun canRequestWeComLoginAgreementSelection(
+    fingerprint: SemanticTreeFingerprint,
+    target: UiNodeModel,
+): Boolean {
+    if (!fingerprint.complete ||
+        fingerprint.packageName != CompanionRuntime.WECOM_PACKAGE ||
+        fingerprint.windowClass != WECOM_LOGIN_WX_AUTH_ACTIVITY
+    ) {
+        return false
+    }
+    val nodes = fingerprint.nodes
+    val agreementControls = nodes.filter {
+        it.className == WECOM_LOGIN_AGREEMENT_CLASS && it.viewId == WECOM_LOGIN_AGREEMENT_VIEW_ID
+    }
+    if (agreementControls.size != 1 || agreementControls.single() != target ||
+        target.id.isBlank() || !target.visibleToUser || !target.enabled || !target.clickable ||
+        target.checkable || target.checked || target.selected || !hasUsableBounds(target.bounds)
+    ) {
+        return false
+    }
+
+    val visibleText = buildString {
+        append(fingerprint.windowTitle)
+        nodes.filter { it.visibleToUser }.forEach { node ->
+            append('\n')
+            append(node.text)
+            append(' ')
+            append(node.contentDescription)
+        }
+    }.lowercase(Locale.US)
+    if (!visibleText.contains("read and agree") ||
+        !visibleText.contains("software licensing and service agreements") ||
+        !visibleText.contains("privacy policy") ||
+        containsAnyText(visibleText, WECOM_HARD_AUTH_RISK_MARKERS)
+    ) {
+        return false
+    }
+    if (visibleText.contains("welcome to wecom") || nodes.any {
+            it.visibleToUser && normalizedNodeLabel(it) in setOf("agree", "disagree")
+        }
+    ) {
+        return false
+    }
+
+    val loginTargets = listOf(
+        uniqueVisibleClickableLabelTarget(nodes, "continue with wechat"),
+        uniqueVisibleClickableLabelTarget(nodes, "continue with email"),
+        uniqueVisibleClickableLabelTarget(nodes, "continue with phone"),
+    )
+    if (loginTargets.any { it == null } || loginTargets.toSet().size != loginTargets.size) return false
+    return target.id !in loginTargets.filterNotNull()
+}
+
+private fun uniqueVisibleClickableLabelTarget(nodes: List<UiNodeModel>, label: String): String? {
+    val byId = nodes.associateBy { it.id }
+    val candidates = LinkedHashSet<String>()
+    for (node in nodes) {
+        if (node.id.isBlank() || !node.visibleToUser || normalizedNodeLabel(node) != label) continue
+        var current = node
+        for (depth in 0..nodes.size) {
+            if (current.visibleToUser && current.enabled && current.clickable && hasUsableBounds(current.bounds)) {
+                candidates.add(current.id)
+                break
+            }
+            val parentId = current.parentId ?: break
+            val parent = byId[parentId] ?: break
+            if (parent.id == current.id) break
+            current = parent
+        }
+    }
+    return candidates.singleOrNull()
+}
+
+private fun normalizedNodeLabel(node: UiNodeModel): String =
+    (node.text.ifBlank { node.contentDescription })
+        .trim()
+        .split(Regex("\\s+"))
+        .joinToString(" ")
+        .lowercase(Locale.US)
+
+private fun hasUsableBounds(bounds: BoundsModel): Boolean =
+    bounds.right > bounds.left && bounds.bottom > bounds.top && bounds.right > 0 && bounds.bottom > 0
+
+private fun containsAnyText(value: String, candidates: List<String>): Boolean =
+    candidates.any { value.contains(it) }
+
+private const val WECOM_LOGIN_WX_AUTH_ACTIVITY =
+    "com.tencent.wework.login.controller.LoginWxAuthActivity"
+private const val WECOM_LOGIN_AGREEMENT_CLASS = "android.widget.ImageView"
+private const val WECOM_LOGIN_AGREEMENT_VIEW_ID = "com.tencent.wework:id/ow"
+private val WECOM_HARD_AUTH_RISK_MARKERS = listOf(
+    "账号存在风险",
+    "账户存在风险",
+    "设备验证",
+    "安全验证",
+    "异常登录",
+    "人脸验证",
+    "人脸识别",
+    "滑块验证",
+    "完成验证",
+    "account risk",
+    "device verification",
+    "security verification",
+    "unusual login",
+    "face verification",
+    "captcha",
+    "确认本人操作",
+    "confirm on your phone",
+)
 
 class WeComAccessibilityService : AccessibilityService() {
     private val mainThreadDispatcher by lazy {
@@ -112,6 +289,34 @@ class WeComAccessibilityService : AccessibilityService() {
         var mutationStarted = false
         try {
             if (action.kind == "global_back") {
+                val sequenceBefore = CompanionRuntime.currentSequence()
+                if (action.expectedSequence != sequenceBefore) return rejected("semantic snapshot is stale")
+                val root = rootInActiveWindow
+                    ?: return rejected("semantic tree is stale or missing")
+                val capture = captureTree(root, null)
+                if (!capture.fingerprint.complete) {
+                    return rejected("semantic tree exceeds the safe traversal limit")
+                }
+                if (!snapshotGuard.matches(action.expectedSequence, sequenceBefore, capture.fingerprint)) {
+                    return rejected("semantic tree is stale or does not match the captured snapshot")
+                }
+                if (capture.fingerprint.packageName != CompanionRuntime.WECOM_PACKAGE) {
+                    return rejected("semantic tree is outside the official WeCom package")
+                }
+                if (!root.refresh()) return rejected("semantic root changed before action")
+                val verifiedCapture = captureTree(root, null)
+                val sequenceBeforeMutation = CompanionRuntime.currentSequence()
+                if (sequenceBeforeMutation != action.expectedSequence ||
+                    !consumeConstrainedGlobalBack(
+                        snapshotGuard,
+                        action.expectedSequence,
+                        sequenceBeforeMutation,
+                        capture.fingerprint,
+                        verifiedCapture.fingerprint,
+                    )
+                ) {
+                    return rejected("semantic tree changed before action")
+                }
                 mutationStarted = true
                 val accepted = performGlobalAction(GLOBAL_ACTION_BACK)
                 return actionResult(accepted, if (accepted) "back requested" else "back rejected")
@@ -152,7 +357,7 @@ class WeComAccessibilityService : AccessibilityService() {
             if (target.packageName?.toString() != CompanionRuntime.WECOM_PACKAGE) {
                 return rejected("semantic node is outside the official WeCom package")
             }
-            if (!isActionAllowed(action, target)) {
+            if (!isActionAllowed(action, target, targetModel, verifiedCapture.fingerprint)) {
                 return rejected("action rejected by semantic node")
             }
 
@@ -284,6 +489,7 @@ class WeComAccessibilityService : AccessibilityService() {
             clickable = node.isClickable,
             checkable = node.isCheckable,
             checked = node.isChecked,
+            selected = node.isSelected,
             editable = node.isEditable,
             scrollable = node.isScrollable,
             enabled = node.isEnabled,
@@ -292,15 +498,35 @@ class WeComAccessibilityService : AccessibilityService() {
         )
     }
 
-    private fun isActionAllowed(action: CompanionAction, node: AccessibilityNodeInfo): Boolean =
+    private fun isActionAllowed(
+        action: CompanionAction,
+        node: AccessibilityNodeInfo,
+        targetModel: UiNodeModel,
+        fingerprint: SemanticTreeFingerprint,
+    ): Boolean =
         when (action.kind) {
-            "click" -> node.isVisibleToUser && node.isEnabled && node.isClickable
-            "check" -> canRequestCheck(
+            "click" -> canRequestConstrainedClick(
+                fingerprint = fingerprint,
+                target = targetModel,
+                packageName = node.packageName?.toString().orEmpty(),
+                className = node.className?.toString().orEmpty(),
+                viewId = node.viewIdResourceName.orEmpty(),
+                visibleToUser = node.isVisibleToUser,
+                enabled = node.isEnabled,
+                clickable = node.isClickable,
+            )
+            "check" -> canRequestConstrainedCheck(
+                fingerprint = fingerprint,
+                target = targetModel,
+                packageName = node.packageName?.toString().orEmpty(),
+                className = node.className?.toString().orEmpty(),
+                viewId = node.viewIdResourceName.orEmpty(),
                 visibleToUser = node.isVisibleToUser,
                 enabled = node.isEnabled,
                 clickable = node.isClickable,
                 checkable = node.isCheckable,
                 checked = node.isChecked,
+                selected = node.isSelected,
             )
             "set_text" ->
                 node.isVisibleToUser && node.isEnabled && node.isEditable && action.text.length <= 32 * 1024
@@ -342,6 +568,7 @@ class WeComAccessibilityService : AccessibilityService() {
         fun toSnapshot(sequence: Long): UiSnapshotModel = UiSnapshotModel(
             sequence = sequence,
             packageName = fingerprint.packageName,
+            windowId = fingerprint.windowId,
             windowTitle = fingerprint.windowTitle,
             windowClass = fingerprint.windowClass,
             capturedAt = Instant.now(),

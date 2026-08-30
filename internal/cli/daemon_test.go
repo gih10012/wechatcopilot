@@ -15,6 +15,7 @@ import (
 	"github.com/gih10012/wechatcopilot/internal/api"
 	"github.com/gih10012/wechatcopilot/internal/config"
 	"github.com/gih10012/wechatcopilot/internal/daemon"
+	"golang.org/x/sys/unix"
 )
 
 func mustSystemdUnit(t *testing.T, binary, stateHome, environmentPath, swapPolicyEnvironmentPath, stateMountEnvironmentPath string) string {
@@ -48,10 +49,14 @@ func TestSystemdUnitUsesPrivateRuntimeWithoutMountNamespace(t *testing.T) {
 		"RuntimeDirectory=wechatcopilot",
 		"RuntimeDirectoryMode=0700",
 		"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+		"Restart=on-abnormal",
 	} {
 		if !strings.Contains(unit, expected) {
 			t.Fatalf("systemd unit is missing %q:\n%s", expected, unit)
 		}
+	}
+	if strings.Contains(unit, "Restart=on-failure") {
+		t.Fatalf("persistent startup failures must not create a restart loop:\n%s", unit)
 	}
 	for _, forbidden := range []string{"PrivateTmp=", "ProtectSystem=", "ProtectHome=", "ReadWritePaths="} {
 		if strings.Contains(unit, forbidden) {
@@ -172,6 +177,56 @@ func TestSurfaceOpenAcceptsOnlySurfaceReference(t *testing.T) {
 	}
 	if flag := command.Flags().Lookup("message"); flag != nil {
 		t.Fatal("--message must not alias --ref because message IDs are not surface references")
+	}
+	if flag := command.Flags().Lookup("mini-program"); flag == nil || flag.Hidden {
+		t.Fatal("--mini-program must expose the named mini-program launcher")
+	}
+	root.SetArgs([]string{"--json", "surfaces", "open", "--account", "fixture", "--ref", "ref", "--mini-program", "校园瞄"})
+	err = root.ExecuteContext(context.Background())
+	var appErr *api.AppError
+	if !errors.As(err, &appErr) || appErr.Code != api.CodeInvalidArgument {
+		t.Fatalf("mutually exclusive surface selectors error = %v", err)
+	}
+}
+
+func TestWriteNewPrivateFileDoesNotOverwrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "asset.png")
+	if err := writeNewPrivateFile(path, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("output mode = %o", info.Mode().Perm())
+	}
+	if err := writeNewPrivateFile(path, []byte("second")); err == nil {
+		t.Fatal("secure output helper overwrote an existing file")
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "first" {
+		t.Fatalf("existing output changed to %q", contents)
+	}
+}
+
+func TestWriteNewPrivateFileRejectsWiderPermissionsAndRemovesOutput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "asset.png")
+	err := writeNewPrivateFileWithStat(path, []byte("private"), func(fd int, stat *unix.Stat_t) error {
+		if err := unix.Fstat(fd, stat); err != nil {
+			return err
+		}
+		stat.Mode = stat.Mode&^0o777 | 0o644
+		return nil
+	})
+	if err == nil {
+		t.Fatal("secure output helper accepted filesystem-widened permissions")
+	}
+	if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("rejected output still exists: %v", statErr)
 	}
 }
 

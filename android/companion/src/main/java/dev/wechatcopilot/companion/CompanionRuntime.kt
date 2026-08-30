@@ -22,7 +22,7 @@ internal object CompanionRuntime {
     private val sequence = AtomicLong(System.currentTimeMillis() * 1_000L)
     private val accessibility = AtomicReference<WeComAccessibilityService?>()
     private val observedWindow = AtomicReference<ObservedWindow?>()
-    private val events = ArrayDeque<EventRecord>()
+    private val events = BoundedEventJournal(MAX_EVENTS)
     private val server = AtomicReference<LocalRpcServer?>()
 
     fun start(context: Context) {
@@ -78,7 +78,7 @@ internal object CompanionRuntime {
     }
 
     fun snapshot(): UiSnapshotModel = accessibility.get()?.buildSnapshot()
-        ?: UiSnapshotModel(currentSequence(), "", "", "", Instant.now(), emptyList())
+        ?: UiSnapshotModel(currentSequence(), "", -1, "", "", Instant.now(), emptyList())
 
     fun perform(action: CompanionAction): ActionResult {
         return when (action.kind) {
@@ -90,7 +90,7 @@ internal object CompanionRuntime {
 
     fun addNotification(
         packageName: String,
-		conversationKey: String,
+        conversationKey: String,
         conversation: String,
         sender: String,
         title: String,
@@ -102,7 +102,7 @@ internal object CompanionRuntime {
             sequence = sequence.incrementAndGet(),
             kind = "notification",
             packageName = packageName,
-			conversationKey = conversationKey,
+            conversationKey = conversationKey,
             conversation = conversation,
             sender = sender,
             title = title,
@@ -110,17 +110,12 @@ internal object CompanionRuntime {
             postedAt = postedAt,
             contentIntent = contentIntent,
         )
-        synchronized(events) {
-            events.addLast(event)
-            while (events.size > MAX_EVENTS) events.removeFirst()
-        }
+        events.add(event)
     }
 
-    fun eventsAfter(after: Long, limit: Int): List<EventRecord> = synchronized(events) {
-        events.asSequence().filter { it.sequence > after }.take(limit.coerceIn(1, 500)).toList()
-    }
+    fun eventsAfter(after: Long, limit: Int): List<EventRecord> = events.after(after, limit)
 
-    fun oldestEventSequence(): Long? = synchronized(events) { events.firstOrNull()?.sequence }
+    fun oldestEventSequence(): Long? = events.oldestSequence()
 
     fun tokenMatches(context: Context, provided: String): Boolean {
 		val expected = try {
@@ -159,7 +154,7 @@ internal object CompanionRuntime {
     private fun openNotification(sequenceText: String): ActionResult {
         val target = sequenceText.toLongOrNull()
             ?: return ActionResult(false, currentSequence(), "notification sequence is invalid")
-        val event = synchronized(events) { events.firstOrNull { it.sequence == target } }
+        val event = events.find(target)
             ?: return ActionResult(false, currentSequence(), "notification is no longer in the bounded event journal")
         val intent = event.contentIntent
             ?: return ActionResult(false, currentSequence(), "notification has no content intent")
@@ -169,6 +164,61 @@ internal object CompanionRuntime {
         } catch (error: PendingIntent.CanceledException) {
             Log.w("WCCCompanion", "Notification intent expired", error)
             ActionResult(false, currentSequence(), "notification intent expired")
+        }
+    }
+}
+
+/**
+ * A conversation-scoped bounded journal.
+ *
+ * The first currently retained record for every conversation is marked as a
+ * boundary. When that record is evicted, the marker moves to the next retained
+ * record for the same conversation. This makes a global ring truncation remain
+ * visible after the host filters or persists messages by conversation.
+ */
+internal class BoundedEventJournal(private val capacity: Int) {
+    private val records = ArrayDeque<EventRecord>()
+
+    init {
+        require(capacity > 0) { "event journal capacity must be positive" }
+    }
+
+    fun add(record: EventRecord) = synchronized(records) {
+        val conversationRetained = records.any { it.conversationKey == record.conversationKey }
+        records.addLast(record.copy(gapBefore = record.gapBefore || !conversationRetained))
+        while (records.size > capacity) {
+            val removed = records.removeFirst()
+            markOldestConversationRecord(removed.conversationKey)
+        }
+    }
+
+    fun after(after: Long, limit: Int): List<EventRecord> = synchronized(records) {
+        records.asSequence()
+            .filter { it.sequence > after }
+            .take(limit.coerceIn(1, 500))
+            .toList()
+    }
+
+    fun oldestSequence(): Long? = synchronized(records) { records.firstOrNull()?.sequence }
+
+    fun find(sequence: Long): EventRecord? = synchronized(records) {
+        records.firstOrNull { it.sequence == sequence }
+    }
+
+    private fun markOldestConversationRecord(conversationKey: String) {
+        val replacement = ArrayDeque<EventRecord>(records.size)
+        var marked = false
+        records.forEach { record ->
+            if (!marked && record.conversationKey == conversationKey) {
+                replacement.addLast(record.copy(gapBefore = true))
+                marked = true
+            } else {
+                replacement.addLast(record)
+            }
+        }
+        if (marked) {
+            records.clear()
+            records.addAll(replacement)
         }
     }
 }

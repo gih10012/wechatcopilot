@@ -41,17 +41,19 @@ Never send using a display name alone. Never reuse an idempotency key for differ
 
 ## Use webpages and mini programs
 
-1. Take `surface_ref` from the source message and pass it to `surfaces open --ref`; never substitute `message_id`.
-2. Call `surfaces snapshot` and select one of the returned semantic action IDs.
-3. Call `surfaces act`; snapshot again after every navigation or form submission.
-4. Use `surfaces share` only through the same prepare/commit send transaction.
-5. Close the surface when finished.
+1. For a message-backed surface, check `web.open` or `miniprogram.open` and pass its opaque `surface_ref` to `surfaces open --ref`; never substitute `message_id`.
+2. To launch by exact display name, check the separate `miniprogram.open_by_name` capability and use `surfaces open --mini-program`. Never provide both open inputs, and stop on an ambiguous name.
+3. Repeat `snapshot -> inspect elements/actions -> act(action_id) -> snapshot`. Mini programs have no fixed workflow. Snapshot after every action, input, navigation, or scroll and use an action ID only when the latest snapshot advertises it.
+4. When `elements` are present, match them to actions through `target_id` and `action_ids`; use bounds to disambiguate repeated labels, never as click coordinates. A driver may expose only the current screenshot and actions, so never invent a missing element relationship.
+5. Execute low-risk observation and proven navigation/search actions directly. Require the user's current-turn authorization for the exact medium, unknown, or external-write action before setting confirmation. Never set confirmation on the user's behalf; never execute high, sensitive, or destructive actions.
+6. Export only when `surface.assets.export` is available, using a current `fidelity:"rendered"` asset token. The current personal-WeChat driver gives each snapshot a generation-bound `rendered_viewport` asset, including Canvas-only pages; semantic image assets may offer tighter crops. Drivers without that capability, including current WeCom, do not provide export tokens. Rendered assets are never original images or URLs.
+7. Use `surfaces share` only through the same prepare/commit send transaction, then close the surface when finished.
 
-Do not invent coordinates or expose X11, ADB, shell, or raw input commands. Stop on `USER_ACTION_REQUIRED`, payment, authorization, account-risk, or identity-verification screens.
+Do not expose coordinates, raw X11/XTest, keyboard/mouse, ADB, shell, JavaScript, or forged locator/action commands. OCR input is allowed only when the driver proves one focused editable target and verifies readback. Stop on `USER_ACTION_REQUIRED`, Tencent verification, payment, authorization, account-risk, or identity-verification screens. Read [CLI reference](references/cli.md), [MCP reference](references/mcp.md), and [safety rules](references/safety.md) for the exact surface contract.
 
 ## Handle authentication and multiple accounts
 
-Use the CLI login flow outside model context. Tell the user the exact `accounts login` command to type in a trusted terminal, but never execute it or an `auth begin`, `auth status`, `auth wait`, or `auth submit` command through an agent shell or tool, and never ask the user to paste their output. These commands handle a one-time bearer URL or verification secret; only the user may open the page to scan a QR code, confirm on a phone, enter an SMS code, or explicitly accept an advertised official-client onboarding policy. Never call the page's private action endpoint for the user. The URL, QR content, and code must never appear in tool output, command arguments, environment variables, logs, chat, or MCP calls.
+Use the CLI login flow outside model context. Tell the user the exact `accounts login` command to type in a trusted terminal, but never execute it or an `auth begin`, `auth status`, `auth wait`, or `auth submit-code` command through an agent shell or tool, and never ask the user to paste their output. These commands handle a one-time bearer URL or verification secret; only the user may open the page to scan a QR code, confirm on a phone, enter an SMS code, or explicitly accept an advertised official-client onboarding policy. Never call the page's private action endpoint for the user. The URL, QR content, and code must never appear in tool output, command arguments, environment variables, logs, chat, or MCP calls.
 
 Only one account per platform is active at a time. Switching accounts preserves the inactive profile and indexed history but does not collect new messages while that profile is stopped. WeChat and WeCom may each have one active account concurrently. Read [account and authentication workflow](references/accounts.md) before adding, activating, removing, or recovering an account.
 

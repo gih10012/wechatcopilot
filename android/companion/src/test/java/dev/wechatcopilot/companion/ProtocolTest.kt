@@ -24,20 +24,31 @@ class ProtocolTest {
     }
 
     @Test
-    fun snapshotCarriesTheObservedWindowClass() {
+    fun snapshotWireScalarFieldsMatchTheProtocolGolden() {
         val snapshot = UiSnapshotModel(
             sequence = 7,
             packageName = CompanionRuntime.WECOM_PACKAGE,
+            windowId = 11,
             windowTitle = "",
             windowClass = "com.tencent.wework.login.controller.LoginWxAuthActivity",
             capturedAt = Instant.EPOCH,
             nodes = emptyList(),
         )
-        assertEquals("com.tencent.wework.login.controller.LoginWxAuthActivity", snapshot.windowClass)
+        assertEquals(
+            linkedMapOf(
+                "sequence" to 7L,
+                "package_name" to CompanionRuntime.WECOM_PACKAGE,
+                "window_id" to 11,
+                "window_title" to "",
+                "window_class" to "com.tencent.wework.login.controller.LoginWxAuthActivity",
+                "captured_at" to Instant.EPOCH.toString(),
+            ),
+            snapshot.wireScalarFields(),
+        )
     }
 
     @Test
-    fun nodeProtocolCarriesVisibilityAndCheckedStateToTheHost() {
+    fun nodeProtocolCarriesVisibilityCheckedAndSelectedStateToTheHost() {
         val node = UiNodeModel(
             id = "0/1",
             parentId = "0",
@@ -49,6 +60,7 @@ class ProtocolTest {
             clickable = true,
             checkable = true,
             checked = true,
+            selected = true,
             editable = false,
             scrollable = false,
             enabled = true,
@@ -60,6 +72,7 @@ class ProtocolTest {
         assertTrue(node.visibleToUser)
         assertTrue(node.checkable)
         assertTrue(node.checked)
+        assertTrue(node.selected)
     }
 
     @Test
@@ -88,6 +101,20 @@ class ProtocolTest {
             CompanionAction("check", "0/1", "unexpected", 7),
             CompanionAction("check", "0/1", "", 0),
             CompanionAction("toggle", "0/1", "", 7),
+        )
+        invalid.forEach { action ->
+            assertFailsWith<RequestException> { validateLocalAction(action) }
+        }
+    }
+
+    @Test
+    fun localActionValidatorRequiresASequenceForGlobalBack() {
+        validateLocalAction(CompanionAction("global_back", "", "", 7))
+
+        val invalid = listOf(
+            CompanionAction("global_back", "", "", 0),
+            CompanionAction("global_back", "0/1", "", 7),
+            CompanionAction("global_back", "", "unexpected", 7),
         )
         invalid.forEach { action ->
             assertFailsWith<RequestException> { validateLocalAction(action) }

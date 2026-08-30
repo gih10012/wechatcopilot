@@ -16,6 +16,10 @@ func classifiedDriverError(err error) *api.AppError {
 	code := api.CodeConflict
 	message := "official client operation could not continue"
 	switch kind {
+	case driver.FailureInvalidArgument:
+		status = http.StatusBadRequest
+		code = api.CodeInvalidArgument
+		message = "official client operation arguments are invalid"
 	case driver.FailureAuthRequired:
 		code = api.CodeAuthRequired
 		message = "official client authentication is required"
@@ -28,6 +32,9 @@ func classifiedDriverError(err error) *api.AppError {
 	case driver.FailureUnsupported:
 		code = api.CodeUnsupportedCapability
 		message = "the active driver does not support this capability"
+	case driver.FailureConfirmationRequired:
+		code = api.CodeConfirmationRequired
+		message = "this surface action requires explicit confirmation"
 	case driver.FailureUserActionRequired:
 		code = api.CodeUserActionRequired
 		message = "this step requires direct user interaction"

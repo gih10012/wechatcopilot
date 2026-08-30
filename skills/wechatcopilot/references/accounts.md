@@ -32,6 +32,26 @@ Removal is always permanent in v0.1. It unregisters the saved account and delete
 
 The daemon persists `deleting:true` before driver cleanup begins. A deleting account remains visible in `accounts list` but fails closed for status, activation, reads, sends, and surfaces. If removal returns a retryable `CONFLICT`, do not try to recover or reactivate the account; repeat the exact removal command with the same account ID, `--confirm`, and `--purge`. The marker survives daemon restarts until cleanup completes.
 
+## Adopt a legacy message index
+
+Current indexes carry their owning account UUID. A recognized row-empty legacy index can be bound automatically, but a non-empty index without ownership metadata requires an explicit offline migration. After making a state backup, stop the daemon and run this operator-only command with the exact registered account ID or alias:
+
+```bash
+wechatcopilot accounts adopt-legacy-index --account ACCOUNT_ID --confirm --json
+```
+
+The command holds the same state lock as `daemon serve`, so it returns `CONFLICT` while any daemon owns that state home. It uses `WECHATCOPILOT_HOME` or `--home`, enforces the configured state-mount gate, resolves the account from that registry, and adopts only the existing `accounts/ACCOUNT_UUID/index.sqlite3`. It refuses missing or linked account state, a missing index, an empty or already-owned database, and any unrecognized schema or failed integrity check. It creates no replacement account directory or index and prints no indexed messages. Restart the daemon only after a successful result.
+
+## Approve a stopped legacy WeCom profile
+
+If a registered WeCom account already has non-empty Android `/data` but lacks external profile metadata, stop the daemon and obtain explicit operator confirmation before running:
+
+```bash
+wechatcopilot accounts approve-legacy-wecom-profile --account ACCOUNT_ID --confirm --json
+```
+
+The command succeeds only while the exact digest-pinned account container is stopped and has the expected isolated network and bind mount; it brackets durable approval publication with the same immutable container ID, complete stopped execution epoch, and pinned canonical data path/inode. It creates no container, profile marker, or replacement directory. The persistent approval excludes `st_dev` so a verified dm-crypt remount does not invalidate it, while each publication and consumption frame still compares the live device/inode. The one-use approval is consumed before stopped-profile migration writes markers; running or changing the container first invalidates and revokes it. Do not infer this confirmation from activation or another account operation, and do not retry a failed approval without reporting why its exact stopped-container or filesystem frame failed.
+
 ## Recover authentication
 
 When Tencent invalidates a session, preserve the profile and enter `AUTH_REQUIRED`. Ask the user to create a new login challenge manually rather than adding a replacement account; never create it through an agent tool. Stop if the official client reports a risk warning, device rejection, or unsupported environment; the project does not automate around these controls.

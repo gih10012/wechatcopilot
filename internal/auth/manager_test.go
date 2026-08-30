@@ -85,6 +85,10 @@ func TestChallengeUsesCorrectScopedRoutesAndPrivateCodeSubmission(t *testing.T) 
 		`if(completed||stateInFlight)return`,
 		`generation!==uiGeneration`,
 		`completed||generation!==imageGeneration`,
+		`action.image_bound===true`,
+		`base+'/image?action_id='+encodeURIComponent(action.id)`,
+		`signature!==actionSignature`,
+		`screenLink.hidden=true`,
 		`screen.replaceWith(candidate)`,
 		`codeButton.disabled=true`,
 		`codeButton.disabled=!state.can_submit_code`,
@@ -221,6 +225,88 @@ func TestChallengeAuthActionRequiresSameOriginExplicitConfirmationAndCannotRepla
 	_ = response.Body.Close()
 }
 
+func TestImageBoundAuthActionRejectsStateImageAndAccountRaces(t *testing.T) {
+	actionA := driver.AuthAction{
+		ID: "continue_saved_account_login." + strings.Repeat("a", 64), Label: "Alice",
+		RequiresConfirmation: true, ImageBound: true,
+	}
+	actionB := driver.AuthAction{
+		ID: "continue_saved_account_login." + strings.Repeat("b", 64), Label: "Bob",
+		RequiresConfirmation: true, ImageBound: true,
+	}
+	driverInstance := &fixedAuthActionDriver{
+		Driver: fake.New(driver.PlatformWeChat), actions: []driver.AuthAction{actionA},
+		screenshot: []byte("alice-image"),
+	}
+	item := newAuthActionEntry(driverInstance)
+	state := readChallengeState(t, item)
+	if len(state.Actions) != 1 || state.Actions[0].ID != actionA.ID || !state.Actions[0].ImageBound {
+		t.Fatalf("Alice state did not advertise its image-bound action: %#v", state.Actions)
+	}
+
+	driverInstance.mu.Lock()
+	driverInstance.actions = []driver.AuthAction{actionB}
+	driverInstance.screenshot = []byte("bob-image")
+	driverInstance.mu.Unlock()
+
+	staleImage := httptest.NewRecorder()
+	item.handleImage(staleImage, httptest.NewRequest(
+		http.MethodGet, "http://127.0.0.1/image?action_id="+url.QueryEscape(actionA.ID), nil,
+	))
+	if staleImage.Code != http.StatusConflict || staleImage.Body.String() == "bob-image" {
+		t.Fatalf("stale Alice image binding status=%d body=%q", staleImage.Code, staleImage.Body.String())
+	}
+	if err := item.performAuthAction(context.Background(), actionA.ID, true); !errors.Is(err, errActionUnavailable) {
+		t.Fatalf("stale Alice action error = %v, want unavailable", err)
+	}
+	if calls := driverInstance.callCount(actionA.ID); calls != 0 {
+		t.Fatalf("stale Alice action reached driver %d times", calls)
+	}
+
+	currentImage := httptest.NewRecorder()
+	item.handleImage(currentImage, httptest.NewRequest(
+		http.MethodGet, "http://127.0.0.1/image?action_id="+url.QueryEscape(actionB.ID), nil,
+	))
+	if currentImage.Code != http.StatusOK || currentImage.Body.String() != "bob-image" {
+		t.Fatalf("current Bob image binding status=%d body=%q", currentImage.Code, currentImage.Body.String())
+	}
+	if err := item.performAuthAction(context.Background(), actionB.ID, true); err != nil {
+		t.Fatalf("current Bob action: %v", err)
+	}
+	if calls := driverInstance.callCount(actionB.ID); calls != 1 {
+		t.Fatalf("current Bob action reached driver %d times", calls)
+	}
+}
+
+func TestImageBindingRequiresUniqueImageBoundAction(t *testing.T) {
+	action := driver.AuthAction{ID: "bound-action", Label: "Bound", ImageBound: true}
+	driverInstance := &fixedAuthActionDriver{
+		Driver: fake.New(driver.PlatformWeChat), actions: []driver.AuthAction{action, action},
+		screenshot: []byte("ambiguous-image"),
+	}
+	item := newAuthActionEntry(driverInstance)
+	response := httptest.NewRecorder()
+	item.handleImage(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/image?action_id=bound-action", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("duplicate image-bound action status=%d body=%q", response.Code, response.Body.String())
+	}
+
+	driverInstance.mu.Lock()
+	driverInstance.actions = []driver.AuthAction{{ID: "static-action", Label: "Static"}}
+	driverInstance.screenshot = []byte("static-image")
+	driverInstance.mu.Unlock()
+	response = httptest.NewRecorder()
+	item.handleImage(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/image?action_id=static-action", nil))
+	if response.Code != http.StatusConflict {
+		t.Fatalf("non-image-bound action image status=%d body=%q", response.Code, response.Body.String())
+	}
+	response = httptest.NewRecorder()
+	item.handleImage(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/image", nil))
+	if response.Code != http.StatusOK || response.Body.String() != "static-image" {
+		t.Fatalf("static action generic image regressed: status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
 func TestChallengeAuthActionsRunSequentiallyAndRejectSuccessfulReplay(t *testing.T) {
 	driverInstance := &sequentialAuthActionDriver{Driver: fake.New(driver.PlatformWeCom)}
 	item := newAuthActionEntry(driverInstance)
@@ -315,8 +401,150 @@ func TestConsumedAuthActionErrorPreservesCauseAndRejectsReplay(t *testing.T) {
 	}
 }
 
-func TestAuthActionAttemptsCountOnlyFreshAdvertisedDispatches(t *testing.T) {
-	dispatchErr := errors.New("driver rejected before dispatch")
+func TestSavedAccountReplayKeySurvivesImageGenerationChangeAndDriverError(t *testing.T) {
+	dispatchErr := errors.New("synthetic driver failure after invocation")
+	actionA := driver.AuthAction{
+		ID: "continue_saved_account_login." + strings.Repeat("a", 64), Label: "Saved account A",
+		ImageBound: true, ReplayKey: "continue_saved_account_login",
+	}
+	actionB := driver.AuthAction{
+		ID: "continue_saved_account_login." + strings.Repeat("b", 64), Label: "Saved account B",
+		ImageBound: true, ReplayKey: "continue_saved_account_login",
+	}
+	driverInstance := &fixedAuthActionDriver{
+		Driver: fake.New(driver.PlatformWeChat), actions: []driver.AuthAction{actionA},
+		screenshot: []byte("saved-account-a-png"),
+		results:    map[string][]error{actionA.ID: {dispatchErr}},
+	}
+	item := newAuthActionEntry(driverInstance)
+
+	response := httptest.NewRecorder()
+	item.handleState(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/state", nil))
+	if response.Code != http.StatusOK || strings.Contains(response.Body.String(), `"ReplayKey"`) ||
+		strings.Contains(response.Body.String(), `"replay_key"`) {
+		t.Fatalf("internal replay key escaped challenge JSON: status=%d body=%q", response.Code, response.Body.String())
+	}
+	if err := item.performAuthAction(context.Background(), actionA.ID, true); !errors.Is(err, dispatchErr) {
+		t.Fatalf("first generation error = %v", err)
+	}
+
+	driverInstance.mu.Lock()
+	driverInstance.actions = []driver.AuthAction{actionB}
+	driverInstance.screenshot = []byte("saved-account-b-png")
+	driverInstance.mu.Unlock()
+	state := readChallengeState(t, item)
+	if len(state.Actions) != 0 {
+		t.Fatalf("new image generation revived consumed logical action: %#v", state.Actions)
+	}
+	image := httptest.NewRecorder()
+	item.handleImage(image, httptest.NewRequest(
+		http.MethodGet, "http://127.0.0.1/image?action_id="+url.QueryEscape(actionB.ID), nil,
+	))
+	if image.Code != http.StatusConflict {
+		t.Fatalf("consumed replay key image status=%d body=%q", image.Code, image.Body.String())
+	}
+	if err := item.performAuthAction(context.Background(), actionB.ID, true); !errors.Is(err, errActionUnavailable) {
+		t.Fatalf("new image generation replay error = %v, want unavailable", err)
+	}
+	if driverInstance.callCount(actionA.ID) != 1 || driverInstance.callCount(actionB.ID) != 0 {
+		t.Fatalf("logical operation dispatch counts A=%d B=%d", driverInstance.callCount(actionA.ID), driverInstance.callCount(actionB.ID))
+	}
+}
+
+func TestAuthActionReplayKeyIsPreconsumedBeforeConcurrentDriverCall(t *testing.T) {
+	driverErr := errors.New("driver returned after dispatch attempt")
+	actionA := driver.AuthAction{ID: "continue." + strings.Repeat("c", 64), ImageBound: true, ReplayKey: "continue_login"}
+	actionB := driver.AuthAction{ID: "continue." + strings.Repeat("d", 64), ImageBound: true, ReplayKey: "continue_login"}
+	base := &fixedAuthActionDriver{
+		Driver: fake.New(driver.PlatformWeCom), actions: []driver.AuthAction{actionA},
+		results: map[string][]error{actionA.ID: {driverErr}},
+	}
+	driverInstance := &blockingReplayKeyAuthDriver{
+		fixedAuthActionDriver: base, started: make(chan struct{}), release: make(chan struct{}),
+	}
+	item := newAuthActionEntry(driverInstance)
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- item.performAuthAction(context.Background(), actionA.ID, true) }()
+	select {
+	case <-driverInstance.started:
+	case <-time.After(time.Second):
+		close(driverInstance.release)
+		t.Fatal("first generation did not reach driver")
+	}
+
+	base.mu.Lock()
+	base.actions = []driver.AuthAction{actionB}
+	base.screenshot = []byte("changed-png")
+	base.mu.Unlock()
+	if err := item.performAuthAction(context.Background(), actionB.ID, true); !errors.Is(err, errActionInFlight) {
+		close(driverInstance.release)
+		t.Fatalf("concurrent generation error = %v, want in-flight", err)
+	}
+	close(driverInstance.release)
+	if err := <-firstDone; !errors.Is(err, driverErr) {
+		t.Fatalf("first generation error = %v", err)
+	}
+	if state := readChallengeState(t, item); len(state.Actions) != 0 {
+		t.Fatalf("post-error generation was advertised: %#v", state.Actions)
+	}
+	if err := item.performAuthAction(context.Background(), actionB.ID, true); !errors.Is(err, errActionUnavailable) {
+		t.Fatalf("post-error generation replay error = %v", err)
+	}
+	if base.callCount(actionA.ID) != 1 || base.callCount(actionB.ID) != 0 {
+		t.Fatalf("concurrent logical operation dispatched A=%d B=%d", base.callCount(actionA.ID), base.callCount(actionB.ID))
+	}
+}
+
+func TestSavedAccountReplayKeyIsScopedToOneChallengeAndAccount(t *testing.T) {
+	actionA := driver.AuthAction{ID: "continue_saved_account_login." + strings.Repeat("a", 64), ReplayKey: "continue_saved_account_login"}
+	actionB := driver.AuthAction{ID: "continue_saved_account_login." + strings.Repeat("b", 64), ReplayKey: "continue_saved_account_login"}
+	actionC := driver.AuthAction{ID: "continue_saved_account_login." + strings.Repeat("c", 64), ReplayKey: "continue_saved_account_login"}
+	firstDriver := &fixedAuthActionDriver{Driver: fake.New(driver.PlatformWeChat), actions: []driver.AuthAction{actionA}}
+	secondDriver := &fixedAuthActionDriver{Driver: fake.New(driver.PlatformWeChat), actions: []driver.AuthAction{actionB}}
+	thirdDriver := &fixedAuthActionDriver{Driver: fake.New(driver.PlatformWeChat), actions: []driver.AuthAction{actionC}}
+	first := newAuthActionEntry(firstDriver)
+	first.public.AccountID = "account-a"
+	second := newAuthActionEntry(secondDriver)
+	second.public.AccountID = "account-b"
+	third := newAuthActionEntry(thirdDriver)
+	third.public.AccountID = "account-a"
+	if err := first.performAuthAction(context.Background(), actionA.ID, true); err != nil {
+		t.Fatalf("first challenge action: %v", err)
+	}
+	if err := second.performAuthAction(context.Background(), actionB.ID, true); err != nil {
+		t.Fatalf("second challenge action was polluted by first replay scope: %v", err)
+	}
+	if err := third.performAuthAction(context.Background(), actionC.ID, true); err != nil {
+		t.Fatalf("new same-account challenge was polluted by prior replay scope: %v", err)
+	}
+	if firstDriver.callCount(actionA.ID) != 1 || secondDriver.callCount(actionB.ID) != 1 || thirdDriver.callCount(actionC.ID) != 1 {
+		t.Fatalf(
+			"challenge-local dispatch counts first=%d second=%d third=%d",
+			firstDriver.callCount(actionA.ID), secondDriver.callCount(actionB.ID), thirdDriver.callCount(actionC.ID),
+		)
+	}
+}
+
+func TestDuplicateAuthActionReplayKeyFailsClosed(t *testing.T) {
+	actionA := driver.AuthAction{ID: "policy.a", ReplayKey: "accept_policy"}
+	actionB := driver.AuthAction{ID: "policy.b", ReplayKey: "accept_policy"}
+	driverInstance := &fixedAuthActionDriver{
+		Driver: fake.New(driver.PlatformWeCom), actions: []driver.AuthAction{actionA, actionB},
+	}
+	item := newAuthActionEntry(driverInstance)
+	if state := readChallengeState(t, item); len(state.Actions) != 0 {
+		t.Fatalf("duplicate replay scope was advertised: %#v", state.Actions)
+	}
+	if err := item.performAuthAction(context.Background(), actionA.ID, true); !errors.Is(err, errActionUnavailable) {
+		t.Fatalf("duplicate replay scope action error = %v", err)
+	}
+	if driverInstance.callCount(actionA.ID) != 0 {
+		t.Fatal("duplicate replay scope reached driver")
+	}
+}
+
+func TestAuthActionPreconsumesFreshAdvertisedDispatchEvenOnDriverError(t *testing.T) {
+	dispatchErr := errors.New("driver returned failure")
 	driverInstance := &fixedAuthActionDriver{
 		Driver: fake.New(driver.PlatformWeCom),
 		actions: []driver.AuthAction{
@@ -324,7 +552,7 @@ func TestAuthActionAttemptsCountOnlyFreshAdvertisedDispatches(t *testing.T) {
 			{ID: "action-b", Label: "B"},
 		},
 		results: map[string][]error{
-			"action-a": {dispatchErr, dispatchErr},
+			"action-a": {dispatchErr},
 		},
 	}
 	item := newAuthActionEntry(driverInstance)
@@ -338,22 +566,20 @@ func TestAuthActionAttemptsCountOnlyFreshAdvertisedDispatches(t *testing.T) {
 	if item.totalActionAttempts != 0 {
 		t.Fatalf("non-dispatched requests consumed %d attempts", item.totalActionAttempts)
 	}
-	for attempt := 0; attempt < maxAuthActionAttemptsPerAction; attempt++ {
-		if err := item.performAuthAction(context.Background(), "action-a", true); !errors.Is(err, dispatchErr) {
-			t.Fatalf("action-a attempt %d error = %v", attempt+1, err)
-		}
+	if err := item.performAuthAction(context.Background(), "action-a", true); !errors.Is(err, dispatchErr) {
+		t.Fatalf("action-a error = %v", err)
 	}
-	if err := item.performAuthAction(context.Background(), "action-a", true); !errors.Is(err, errTooManyActionAttempts) {
-		t.Fatalf("action-a over-limit error = %v", err)
+	if err := item.performAuthAction(context.Background(), "action-a", true); !errors.Is(err, errActionUnavailable) {
+		t.Fatalf("action-a replay error = %v", err)
 	}
 	state := readChallengeState(t, item)
 	if len(state.Actions) != 1 || state.Actions[0].ID != "action-b" {
-		t.Fatalf("per-action limit did not filter exhausted action: %#v", state.Actions)
+		t.Fatalf("preconsumed failed action was advertised again: %#v", state.Actions)
 	}
 	if err := item.performAuthAction(context.Background(), "action-b", true); err != nil {
 		t.Fatalf("action-b was starved by action-a failures: %v", err)
 	}
-	if item.totalActionAttempts != maxAuthActionAttemptsPerAction+1 || driverInstance.callCount("action-a") != maxAuthActionAttemptsPerAction {
+	if item.totalActionAttempts != 2 || driverInstance.callCount("action-a") != 1 {
 		t.Fatalf("dispatch accounting = total %d action-a calls %d", item.totalActionAttempts, driverInstance.callCount("action-a"))
 	}
 }
@@ -761,6 +987,7 @@ func newAuthActionEntry(instance driver.Driver) *entry {
 			State: driver.StateAuthRequired, ExpiresAt: time.Now().UTC().Add(time.Minute),
 		},
 		driver: instance, actionAttempts: make(map[string]int), performedActions: make(map[string]bool),
+		performedReplayKeys: make(map[string]bool),
 	}
 }
 
@@ -846,10 +1073,28 @@ func (d *blockingSequentialAuthActionDriver) PerformAuthAction(ctx context.Conte
 
 type fixedAuthActionDriver struct {
 	*fake.Driver
-	mu      sync.Mutex
-	actions []driver.AuthAction
-	results map[string][]error
-	calls   map[string]int
+	mu         sync.Mutex
+	actions    []driver.AuthAction
+	screenshot []byte
+	results    map[string][]error
+	calls      map[string]int
+}
+
+type blockingReplayKeyAuthDriver struct {
+	*fixedAuthActionDriver
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (d *blockingReplayKeyAuthDriver) PerformAuthAction(ctx context.Context, request driver.AuthActionRequest) error {
+	d.once.Do(func() { close(d.started) })
+	select {
+	case <-d.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return d.fixedAuthActionDriver.PerformAuthAction(ctx, request)
 }
 
 func (d *fixedAuthActionDriver) AuthSnapshot(context.Context) (driver.AuthSnapshot, error) {
@@ -857,7 +1102,8 @@ func (d *fixedAuthActionDriver) AuthSnapshot(context.Context) (driver.AuthSnapsh
 	defer d.mu.Unlock()
 	return driver.AuthSnapshot{
 		State: driver.StateAuthRequired, Kind: driver.AuthPhoneConfirm,
-		Actions: append([]driver.AuthAction(nil), d.actions...), ObservedAt: time.Now().UTC(),
+		Actions:       append([]driver.AuthAction(nil), d.actions...),
+		ScreenshotPNG: append([]byte(nil), d.screenshot...), ObservedAt: time.Now().UTC(),
 	}, nil
 }
 

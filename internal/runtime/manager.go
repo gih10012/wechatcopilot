@@ -20,6 +20,7 @@ type activeRuntime struct {
 	cancel   context.CancelFunc
 	done     chan struct{}
 	ingestMu sync.Mutex
+	stopping bool
 	cursor   int64
 }
 
@@ -30,6 +31,7 @@ type Manager struct {
 	active     map[driver.Platform]*activeRuntime
 	operations map[driver.Platform]*sync.Mutex
 	closed     bool
+	closedCh   chan struct{}
 }
 
 func NewManager(accounts *account.Store) *Manager {
@@ -40,6 +42,7 @@ func NewManager(accounts *account.Store) *Manager {
 			driver.PlatformWeChat: {},
 			driver.PlatformWeCom:  {},
 		},
+		closedCh: make(chan struct{}),
 	}
 }
 
@@ -105,6 +108,12 @@ func (m *Manager) activate(ctx context.Context, value string, restoring bool) (a
 	if target.Deleting {
 		return account.Account{}, account.ErrDeleting
 	}
+	// Restore works from a snapshot of the durable registry. Re-check the
+	// requested slot after acquiring the platform lock so a concurrent explicit
+	// deactivation or account switch cannot be undone by a stale retry.
+	if restoring && !target.Active {
+		return target, nil
+	}
 	m.mu.Lock()
 	factory := m.factories[target.Platform]
 	previous := m.active[target.Platform]
@@ -118,19 +127,29 @@ func (m *Manager) activate(ctx context.Context, value string, restoring bool) (a
 	}
 	if previous != nil && previous.account.ID == target.ID {
 		m.mu.Unlock()
-		return previous.account, nil
-	}
-	if previous != nil {
-		if err := previous.driver.Stop(ctx); err != nil {
-			m.mu.Unlock()
-			return account.Account{}, fmt.Errorf("stop active %s account %s: %w", target.Platform, previous.account.Alias, err)
+		if !restoring {
+			return previous.account, nil
 		}
-		previous.cancel()
-		delete(m.active, target.Platform)
+		status, err := previous.driver.Status(ctx)
+		if err != nil {
+			_ = m.accounts.UpdateStatus(previous.account.ID, driver.Status{
+				State: driver.StateDegraded, Reason: err.Error(), ObservedAt: time.Now().UTC(),
+			})
+			return previous.account, err
+		}
+		_ = m.accounts.UpdateStatus(previous.account.ID, status)
+		return m.accounts.Resolve(previous.account.ID)
 	}
 	m.mu.Unlock()
 	if previous != nil {
-		<-previous.done
+		if err := m.stopRuntime(ctx, previous, true); err != nil {
+			return account.Account{}, fmt.Errorf("stop active %s account %s: %w", target.Platform, previous.account.Alias, err)
+		}
+		m.mu.Lock()
+		if m.active[target.Platform] == previous {
+			delete(m.active, target.Platform)
+		}
+		m.mu.Unlock()
 	}
 
 	activated, _, err := m.accounts.Activate(target.ID)
@@ -156,13 +175,19 @@ func (m *Manager) activate(ctx context.Context, value string, restoring bool) (a
 		status = driver.Status{State: driver.StateDegraded, Reason: statusErr.Error(), ObservedAt: time.Now().UTC()}
 	}
 	_ = m.accounts.UpdateStatus(activated.ID, status)
-	runCtx, cancel := context.WithCancel(context.Background())
-	runtime := &activeRuntime{account: activated, driver: instance, cancel: cancel, done: make(chan struct{})}
+	runtime := &activeRuntime{account: activated, driver: instance}
 	m.mu.Lock()
 	m.active[activated.Platform] = runtime
 	m.mu.Unlock()
-	go m.ingestLoop(runCtx, runtime)
-	return m.accounts.Resolve(activated.ID)
+	m.startIngest(runtime)
+	resolved, err := m.accounts.Resolve(activated.ID)
+	if err != nil {
+		return account.Account{}, err
+	}
+	if restoring && statusErr != nil {
+		return resolved, statusErr
+	}
+	return resolved, nil
 }
 
 func (m *Manager) recordActivationFailure(accountID string, failure error, restoring bool) {
@@ -194,19 +219,18 @@ func (m *Manager) Deactivate(ctx context.Context, value string) (account.Account
 	if target.Deleting {
 		return account.Account{}, account.ErrDeleting
 	}
-	m.mu.Lock()
+	m.mu.RLock()
 	runtime := m.active[target.Platform]
+	m.mu.RUnlock()
 	if runtime != nil && runtime.account.ID == target.ID {
-		if err := runtime.driver.Stop(ctx); err != nil {
-			m.mu.Unlock()
+		if err := m.stopRuntime(ctx, runtime, true); err != nil {
 			return account.Account{}, fmt.Errorf("stop %s account %s: %w", target.Platform, target.Alias, err)
 		}
-		runtime.cancel()
-		delete(m.active, target.Platform)
-	}
-	m.mu.Unlock()
-	if runtime != nil && runtime.account.ID == target.ID {
-		<-runtime.done
+		m.mu.Lock()
+		if m.active[target.Platform] == runtime {
+			delete(m.active, target.Platform)
+		}
+		m.mu.Unlock()
 	}
 	return m.accounts.Deactivate(target.ID)
 }
@@ -256,10 +280,12 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	defer wecomOperation.Unlock()
 
 	m.mu.Lock()
-	m.closed = true
+	if !m.closed {
+		m.closed = true
+		close(m.closedCh)
+	}
 	var stopped []*activeRuntime
 	for platform, runtime := range m.active {
-		runtime.cancel()
 		stopped = append(stopped, runtime)
 		delete(m.active, platform)
 	}
@@ -275,20 +301,13 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	results := make(chan stopResult, len(stopped))
 	for index, runtime := range stopped {
 		go func(index int, runtime *activeRuntime) {
-			results <- stopResult{index: index, err: runtime.driver.Stop(ctx)}
+			results <- stopResult{index: index, err: m.stopRuntime(ctx, runtime, false)}
 		}(index, runtime)
 	}
 	for range stopped {
 		select {
 		case result := <-results:
 			stopErrors[result.index] = result.err
-		case <-ctx.Done():
-			return errors.Join(append(stopErrors, ctx.Err())...)
-		}
-	}
-	for _, runtime := range stopped {
-		select {
-		case <-runtime.done:
 		case <-ctx.Done():
 			return errors.Join(append(stopErrors, ctx.Err())...)
 		}
@@ -331,8 +350,76 @@ func lockOperation(ctx context.Context, operation *sync.Mutex) error {
 	}
 }
 
-func (m *Manager) ingestLoop(ctx context.Context, runtime *activeRuntime) {
-	defer close(runtime.done)
+func (m *Manager) startIngest(runtime *activeRuntime) {
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	runtime.cancel = cancel
+	runtime.done = done
+	go m.ingestLoop(runCtx, runtime, done)
+}
+
+// stopRuntime first drains both the background ingest loop and any explicit
+// Sync call. Holding ingestMu across Stop also prevents a Sync that already
+// resolved the runtime from entering the driver after shutdown begins.
+func (m *Manager) stopRuntime(ctx context.Context, runtime *activeRuntime, restartOnFailure bool) error {
+	runtime.cancel()
+	done := runtime.done
+	select {
+	case <-done:
+	case <-ctx.Done():
+		if restartOnFailure {
+			m.restartIngestAfterExit(runtime, done)
+		}
+		return ctx.Err()
+	}
+	if err := lockOperation(ctx, &runtime.ingestMu); err != nil {
+		if restartOnFailure {
+			m.restartIngestAfterExit(runtime, done)
+		}
+		return err
+	}
+	runtime.stopping = true
+	err := runtime.driver.Stop(ctx)
+	if err != nil && restartOnFailure {
+		runtime.stopping = false
+	}
+	runtime.ingestMu.Unlock()
+	if err != nil && restartOnFailure {
+		m.startIngest(runtime)
+	}
+	return err
+}
+
+// restartIngestAfterExit repairs a canceled-but-still-active runtime after a
+// bounded deactivation or switch attempt times out. The platform operation
+// lock and generation check prevent this repair from racing a later lifecycle
+// operation or reviving an explicitly deactivated runtime.
+func (m *Manager) restartIngestAfterExit(runtime *activeRuntime, done <-chan struct{}) {
+	go func() {
+		select {
+		case <-done:
+		case <-m.closedCh:
+			return
+		}
+		operation := m.operations[runtime.account.Platform]
+		operation.Lock()
+		defer operation.Unlock()
+
+		current, err := m.accounts.Resolve(runtime.account.ID)
+		if err != nil || !current.Active || current.Deleting {
+			return
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.closed || m.active[runtime.account.Platform] != runtime || runtime.done != done {
+			return
+		}
+		m.startIngest(runtime)
+	}()
+}
+
+func (m *Manager) ingestLoop(ctx context.Context, runtime *activeRuntime, done chan<- struct{}) {
+	defer close(done)
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -353,6 +440,9 @@ func (m *Manager) ingestLoop(ctx context.Context, runtime *activeRuntime) {
 func (m *Manager) ingestOnce(ctx context.Context, runtime *activeRuntime) error {
 	runtime.ingestMu.Lock()
 	defer runtime.ingestMu.Unlock()
+	if runtime.stopping {
+		return errors.New("account runtime is stopping")
+	}
 	conversations, err := runtime.driver.ListConversations(ctx, driver.ConversationQuery{Limit: 500})
 	if err != nil {
 		return err

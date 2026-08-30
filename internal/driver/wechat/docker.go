@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,8 +24,11 @@ import (
 
 var imageReferencePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,511}$`)
 var sha256DigestPattern = regexp.MustCompile(`^[A-Fa-f0-9]{64}$`)
+var authGenerationPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var dockerImageIDPattern = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
 var dockerByteSizePattern = regexp.MustCompile(`^([1-9][0-9]*)([bBkKmMgG])$`)
+
+const maxEmbeddedSurfaceScreenshotBytes = 32 << 20
 
 type DockerConfig struct {
 	Binary                 string
@@ -49,35 +53,54 @@ type DockerBackend struct {
 }
 
 type controlRequest struct {
-	Operation           string   `json:"operation"`
-	ConversationID      string   `json:"conversation_id,omitempty"`
-	ConversationTitle   string   `json:"conversation_title,omitempty"`
-	ConversationLocator string   `json:"conversation_locator,omitempty"`
-	Text                string   `json:"text,omitempty"`
-	Attachments         []string `json:"attachments,omitempty"`
-	Reference           string   `json:"reference,omitempty"`
-	AccessibleLabel     string   `json:"accessible_label,omitempty"`
-	Locator             string   `json:"locator,omitempty"`
-	ShareLocator        string   `json:"share_locator,omitempty"`
+	Operation              string   `json:"operation"`
+	ConversationID         string   `json:"conversation_id,omitempty"`
+	ConversationTitle      string   `json:"conversation_title,omitempty"`
+	ConversationLocator    string   `json:"conversation_locator,omitempty"`
+	Text                   string   `json:"text,omitempty"`
+	Attachments            []string `json:"attachments,omitempty"`
+	Reference              string   `json:"reference,omitempty"`
+	AccessibleLabel        string   `json:"accessible_label,omitempty"`
+	SurfaceLocator         string   `json:"surface_locator,omitempty"`
+	Kind                   string   `json:"kind,omitempty"`
+	Name                   string   `json:"name,omitempty"`
+	Locator                string   `json:"locator,omitempty"`
+	ShareLocator           string   `json:"share_locator,omitempty"`
+	ExpectedWindowIdentity string   `json:"expected_window_identity,omitempty"`
+	ExpectedAuthGeneration string   `json:"expected_auth_generation,omitempty"`
 }
 
 type controlResponse struct {
 	OK                  bool                  `json:"ok"`
 	Error               string                `json:"error,omitempty"`
 	Code                string                `json:"code,omitempty"`
+	Consumed            bool                  `json:"consumed,omitempty"`
 	State               string                `json:"state,omitempty"`
 	Reason              string                `json:"reason,omitempty"`
 	ClientVersion       string                `json:"client_version,omitempty"`
 	AuthKind            string                `json:"auth_kind,omitempty"`
 	Prompt              string                `json:"prompt,omitempty"`
 	CanSubmitCode       bool                  `json:"can_submit_code,omitempty"`
+	AuthGeneration      string                `json:"auth_generation,omitempty"`
+	ScreenshotBase64    string                `json:"screenshot_base64,omitempty"`
+	ScreenshotSHA256    string                `json:"screenshot_sha256,omitempty"`
 	Identity            *controlIdentity      `json:"identity,omitempty"`
 	QRBounds            *Rectangle            `json:"qr_bounds,omitempty"`
+	Actions             []controlAuthAction   `json:"actions,omitempty"`
 	Surface             *controlSurface       `json:"surface,omitempty"`
 	Conversations       []controlConversation `json:"conversations,omitempty"`
 	Messages            []controlMessage      `json:"messages,omitempty"`
 	ConversationTitle   string                `json:"conversation_title,omitempty"`
 	ConversationLocator string                `json:"conversation_locator,omitempty"`
+}
+
+type controlAuthAction struct {
+	ID                   string `json:"id"`
+	Label                string `json:"label,omitempty"`
+	Risk                 string `json:"risk,omitempty"`
+	Confirmation         string `json:"confirmation,omitempty"`
+	RequiresConfirmation bool   `json:"requires_confirmation,omitempty"`
+	ImageBound           bool   `json:"image_bound,omitempty"`
 }
 
 type controlConversation struct {
@@ -95,6 +118,7 @@ type controlMessage struct {
 	Outgoing        bool    `json:"outgoing,omitempty"`
 	AccessibleLabel string  `json:"accessible_label,omitempty"`
 	SurfaceKind     string  `json:"surface_kind,omitempty"`
+	SurfaceLocator  string  `json:"surface_locator,omitempty"`
 	Confidence      float64 `json:"confidence,omitempty"`
 }
 
@@ -104,19 +128,64 @@ type controlIdentity struct {
 }
 
 type controlSurface struct {
-	Kind         string          `json:"kind,omitempty"`
-	Title        string          `json:"title,omitempty"`
-	URL          string          `json:"url,omitempty"`
-	AppID        string          `json:"app_id,omitempty"`
-	SemanticText string          `json:"semantic_text,omitempty"`
-	Actions      []controlAction `json:"actions,omitempty"`
+	Kind             string           `json:"kind,omitempty"`
+	Title            string           `json:"title,omitempty"`
+	URL              string           `json:"url,omitempty"`
+	AppID            string           `json:"app_id,omitempty"`
+	Generation       string           `json:"generation,omitempty"`
+	ScreenshotBase64 string           `json:"screenshot_base64,omitempty"`
+	ScreenshotSHA256 string           `json:"screenshot_sha256,omitempty"`
+	WindowIdentity   string           `json:"window_identity,omitempty"`
+	SemanticText     string           `json:"semantic_text,omitempty"`
+	Elements         []controlElement `json:"elements,omitempty"`
+	Assets           []controlAsset   `json:"assets,omitempty"`
+	Viewport         *controlViewport `json:"viewport,omitempty"`
+	Actions          []controlAction  `json:"actions,omitempty"`
+}
+
+type controlElement struct {
+	ID          string        `json:"id"`
+	TargetID    string        `json:"target_id,omitempty"`
+	Label       string        `json:"label,omitempty"`
+	Description string        `json:"description,omitempty"`
+	Role        string        `json:"role,omitempty"`
+	Bounds      shared.Bounds `json:"bounds"`
+	Source      string        `json:"source,omitempty"`
+	Confidence  float64       `json:"confidence,omitempty"`
+	Locator     string        `json:"locator,omitempty"`
+}
+
+type controlAsset struct {
+	ID         string        `json:"id"`
+	Token      string        `json:"token"`
+	Kind       string        `json:"kind,omitempty"`
+	Role       string        `json:"role,omitempty"`
+	Label      string        `json:"label,omitempty"`
+	Bounds     shared.Bounds `json:"bounds"`
+	Source     string        `json:"source,omitempty"`
+	Confidence float64       `json:"confidence,omitempty"`
+	Locator    string        `json:"locator,omitempty"`
+}
+
+type controlViewport struct {
+	Bounds           shared.Bounds `json:"bounds"`
+	Generation       string        `json:"generation,omitempty"`
+	ScreenshotSHA256 string        `json:"screenshot_sha256,omitempty"`
+	WindowIdentity   string        `json:"window_identity,omitempty"`
+	X                int           `json:"x,omitempty"`
+	Y                int           `json:"y,omitempty"`
+	Width            int           `json:"width,omitempty"`
+	Height           int           `json:"height,omitempty"`
 }
 
 type controlAction struct {
 	ID       string `json:"id"`
+	ReplayID string `json:"replay_id"`
+	TargetID string `json:"target_id,omitempty"`
 	Label    string `json:"label"`
 	Kind     string `json:"kind"`
 	Risk     string `json:"risk,omitempty"`
+	Effect   string `json:"effect,omitempty"`
 	Disabled bool   `json:"disabled,omitempty"`
 	Locator  string `json:"locator"`
 }
@@ -433,6 +502,10 @@ func (b *DockerBackend) Probe(ctx context.Context) (ProbeResult, error) {
 		return ProbeResult{}, err
 	}
 	state := parseRuntimeState(response.State)
+	actions, screenshot, err := validatedAuthCapture(response, state)
+	if err != nil {
+		return ProbeResult{}, err
+	}
 	result := ProbeResult{
 		State:         state,
 		Reason:        response.Reason,
@@ -440,6 +513,8 @@ func (b *DockerBackend) Probe(ctx context.Context) (ProbeResult, error) {
 		AuthKind:      shared.AuthKind(response.AuthKind),
 		Prompt:        response.Prompt,
 		CanSubmitCode: response.CanSubmitCode,
+		Actions:       actions,
+		ScreenshotPNG: screenshot,
 		ObservedAt:    time.Now().UTC(),
 		QRBounds:      response.QRBounds,
 	}
@@ -450,6 +525,43 @@ func (b *DockerBackend) Probe(ctx context.Context) (ProbeResult, error) {
 		}
 	}
 	return result, nil
+}
+
+func validatedAuthCapture(response controlResponse, state shared.RuntimeState) ([]shared.AuthAction, []byte, error) {
+	hasCapture := response.AuthGeneration != "" || response.ScreenshotBase64 != "" || response.ScreenshotSHA256 != ""
+	if len(response.Actions) == 0 {
+		if hasCapture {
+			return nil, nil, fmt.Errorf("%w: authentication capture has no action", ErrClientIncompatible)
+		}
+		return nil, nil, nil
+	}
+	if state != shared.StateAuthRequired || shared.AuthKind(response.AuthKind) != shared.AuthPhoneConfirm ||
+		response.CanSubmitCode || len(response.Actions) != 1 {
+		return nil, nil, fmt.Errorf("%w: invalid saved-account authentication actions", ErrClientIncompatible)
+	}
+	action := response.Actions[0]
+	if !authGenerationPattern.MatchString(response.AuthGeneration) ||
+		action.ID != savedAccountLoginActionPrefix+response.AuthGeneration ||
+		!action.RequiresConfirmation || !action.ImageBound {
+		return nil, nil, fmt.Errorf("%w: unsupported authentication action", ErrClientIncompatible)
+	}
+	if response.ScreenshotBase64 == "" || !authGenerationPattern.MatchString(response.ScreenshotSHA256) ||
+		base64.StdEncoding.DecodedLen(len(response.ScreenshotBase64)) > maxEmbeddedSurfaceScreenshotBytes {
+		return nil, nil, fmt.Errorf("%w: invalid saved-account authentication screenshot", ErrClientIncompatible)
+	}
+	screenshot, err := base64.StdEncoding.DecodeString(response.ScreenshotBase64)
+	if err != nil || len(screenshot) == 0 || len(screenshot) > maxEmbeddedSurfaceScreenshotBytes ||
+		!bytes.HasPrefix(screenshot, []byte("\x89PNG\r\n\x1a\n")) {
+		return nil, nil, fmt.Errorf("%w: invalid saved-account authentication screenshot", ErrClientIncompatible)
+	}
+	digest := sha256.Sum256(screenshot)
+	if hex.EncodeToString(digest[:]) != response.ScreenshotSHA256 {
+		return nil, nil, fmt.Errorf("%w: saved-account authentication screenshot digest does not match", ErrClientIncompatible)
+	}
+	// The runtime may only advertise the fixed semantic ID. Security wording is
+	// owned by the host so a compromised or outdated image cannot downgrade the
+	// required confirmation or mislabel the action in the one-time login page.
+	return []shared.AuthAction{savedAccountLoginAction(response.AuthGeneration)}, screenshot, nil
 }
 
 func (b *DockerBackend) Screenshot(ctx context.Context) ([]byte, error) {
@@ -469,6 +581,19 @@ func (b *DockerBackend) Screenshot(ctx context.Context) ([]byte, error) {
 
 func (b *DockerBackend) SubmitAuthCode(ctx context.Context, code string) error {
 	_, err := b.control(ctx, controlRequest{Operation: "submit_auth_code", Text: code})
+	return err
+}
+
+func (b *DockerBackend) ContinueSavedAccountLogin(ctx context.Context, expectedGeneration string) error {
+	if !authGenerationPattern.MatchString(expectedGeneration) {
+		return fmt.Errorf("%w: invalid saved-account authentication generation", ErrInvalidArgument)
+	}
+	response, err := b.control(ctx, controlRequest{
+		Operation: continueSavedAccountLoginOperation, ExpectedAuthGeneration: expectedGeneration,
+	})
+	if err != nil && response.Consumed {
+		return shared.MarkAuthActionConsumed(err)
+	}
 	return err
 }
 
@@ -504,7 +629,8 @@ func (b *DockerBackend) ReadVisibleMessages(ctx context.Context, title, locator 
 		result.Messages = append(result.Messages, VisibleMessage{
 			Text: item.Text, Kind: item.Kind, SenderName: item.SenderName,
 			Outgoing: item.Outgoing, AccessibleLabel: item.AccessibleLabel,
-			SurfaceKind: item.SurfaceKind, Confidence: item.Confidence,
+			SurfaceKind: item.SurfaceKind, SurfaceLocator: item.SurfaceLocator,
+			Confidence: item.Confidence,
 		})
 	}
 	return result, nil
@@ -524,6 +650,12 @@ func (b *DockerBackend) Send(ctx context.Context, request UISendRequest) error {
 }
 
 func (b *DockerBackend) OpenSurface(ctx context.Context, target SurfaceTarget) (BackendSurface, error) {
+	if target.Kind != "web" && target.Kind != "miniprogram" {
+		return BackendSurface{}, fmt.Errorf("%w: message-backed surface kind must be web or miniprogram", ErrClientIncompatible)
+	}
+	if strings.TrimSpace(target.SurfaceLocator) == "" {
+		return BackendSurface{}, fmt.Errorf("%w: message-backed surface has no signed node locator", ErrClientIncompatible)
+	}
 	response, err := b.control(ctx, controlRequest{
 		Operation:           "open_surface",
 		ConversationID:      target.ConversationID,
@@ -531,6 +663,27 @@ func (b *DockerBackend) OpenSurface(ctx context.Context, target SurfaceTarget) (
 		ConversationLocator: target.ConversationLocator,
 		Reference:           target.Reference,
 		AccessibleLabel:     target.AccessibleLabel,
+		SurfaceLocator:      target.SurfaceLocator,
+		Kind:                target.Kind,
+	})
+	if err != nil {
+		return BackendSurface{}, err
+	}
+	surface, err := b.surfaceWithScreenshot(ctx, response.Surface)
+	if err != nil {
+		return BackendSurface{}, err
+	}
+	if surface.Kind != target.Kind {
+		return BackendSurface{}, fmt.Errorf("%w: message-backed surface returned an unexpected kind", ErrClientIncompatible)
+	}
+	return surface, nil
+}
+
+func (b *DockerBackend) OpenNamedSurface(ctx context.Context, kind, name string) (BackendSurface, error) {
+	response, err := b.control(ctx, controlRequest{
+		Operation: "open_named_surface",
+		Kind:      kind,
+		Name:      name,
 	})
 	if err != nil {
 		return BackendSurface{}, err
@@ -538,46 +691,148 @@ func (b *DockerBackend) OpenSurface(ctx context.Context, target SurfaceTarget) (
 	return b.surfaceWithScreenshot(ctx, response.Surface)
 }
 
-func (b *DockerBackend) SnapshotSurface(ctx context.Context) (BackendSurface, error) {
-	response, err := b.control(ctx, controlRequest{Operation: "snapshot_surface"})
+func (b *DockerBackend) SnapshotSurface(ctx context.Context, expectedWindowIdentity string) (BackendSurface, error) {
+	response, err := b.control(ctx, controlRequest{Operation: "snapshot_surface", ExpectedWindowIdentity: expectedWindowIdentity})
 	if err != nil {
 		return BackendSurface{}, err
 	}
 	return b.surfaceWithScreenshot(ctx, response.Surface)
 }
 
-func (b *DockerBackend) ActSurface(ctx context.Context, locator, text string) (BackendSurface, error) {
-	response, err := b.control(ctx, controlRequest{Operation: "act_surface", Locator: locator, Text: text})
+func (b *DockerBackend) ActSurface(ctx context.Context, expectedWindowIdentity, locator, text string) (BackendSurface, error) {
+	response, err := b.control(ctx, controlRequest{
+		Operation: "act_surface", ExpectedWindowIdentity: expectedWindowIdentity,
+		Locator: locator, Text: text,
+	})
 	if err != nil {
 		return BackendSurface{}, err
 	}
 	return b.surfaceWithScreenshot(ctx, response.Surface)
 }
 
-func (b *DockerBackend) CloseSurface(ctx context.Context) error {
-	_, err := b.control(ctx, controlRequest{Operation: "close_surface"})
+func (b *DockerBackend) CloseSurface(ctx context.Context, expectedWindowIdentity string) error {
+	_, err := b.control(ctx, controlRequest{Operation: "close_surface", ExpectedWindowIdentity: expectedWindowIdentity})
 	return err
 }
 
-func (b *DockerBackend) surfaceWithScreenshot(ctx context.Context, surface *controlSurface) (BackendSurface, error) {
+func (b *DockerBackend) surfaceWithScreenshot(_ context.Context, surface *controlSurface) (BackendSurface, error) {
 	if surface == nil {
 		return BackendSurface{}, ErrSurfaceMissing
 	}
-	screenshot, err := b.Screenshot(ctx)
+	screenshot, screenshotSHA256, err := b.surfaceScreenshot(surface)
 	if err != nil {
 		return BackendSurface{}, err
 	}
 	result := BackendSurface{
 		Kind: surface.Kind, Title: surface.Title, URL: surface.URL,
-		AppID: surface.AppID, SemanticText: surface.SemanticText, Screenshot: screenshot,
+		AppID: surface.AppID, Generation: surface.Generation,
+		ScreenshotSHA256: screenshotSHA256, WindowIdentity: surface.WindowIdentity,
+		SemanticText: surface.SemanticText,
+		Screenshot:   screenshot,
 	}
+	if surface.Viewport != nil {
+		if result.WindowIdentity == "" {
+			result.WindowIdentity = surface.Viewport.WindowIdentity
+		} else if surface.Viewport.WindowIdentity != "" && surface.Viewport.WindowIdentity != result.WindowIdentity {
+			return BackendSurface{}, fmt.Errorf("%w: surface viewport window identity does not match", ErrClientIncompatible)
+		}
+		bounds := surface.Viewport.Bounds
+		if bounds.Width == 0 && bounds.Height == 0 {
+			bounds = shared.Bounds{
+				X: surface.Viewport.X, Y: surface.Viewport.Y,
+				Width: surface.Viewport.Width, Height: surface.Viewport.Height,
+			}
+		}
+		if surface.Viewport.Generation != "" && surface.Viewport.Generation != surface.Generation {
+			return BackendSurface{}, fmt.Errorf("%w: surface viewport generation does not match its screenshot", ErrClientIncompatible)
+		}
+		if value := strings.ToLower(surface.Viewport.ScreenshotSHA256); value != "" && value != screenshotSHA256 {
+			return BackendSurface{}, fmt.Errorf("%w: surface viewport screenshot digest does not match", ErrClientIncompatible)
+		}
+		result.Viewport = &shared.SurfaceViewport{X: bounds.X, Y: bounds.Y, Width: bounds.Width, Height: bounds.Height}
+	}
+	targetCounts := make(map[string]int, len(surface.Elements))
+	for _, element := range surface.Elements {
+		if element.TargetID != "" {
+			targetCounts[element.TargetID]++
+		}
+	}
+	for targetID, count := range targetCounts {
+		if count != 1 {
+			return BackendSurface{}, fmt.Errorf("%w: surface target identity %q is not unique", ErrClientIncompatible, targetID)
+		}
+	}
+	actionsForTarget := make(map[string][]string, len(surface.Actions))
+	seenActionIDs := make(map[string]struct{}, len(surface.Actions))
 	for _, action := range surface.Actions {
+		if action.ID != "" && action.Locator != "" && action.ReplayID == "" {
+			return BackendSurface{}, fmt.Errorf("%w: surface action has no replay identity", ErrClientIncompatible)
+		}
+		if action.ID != "" {
+			if _, duplicate := seenActionIDs[action.ID]; duplicate {
+				return BackendSurface{}, fmt.Errorf("%w: surface action identity is not unique", ErrClientIncompatible)
+			}
+			seenActionIDs[action.ID] = struct{}{}
+		}
 		result.Actions = append(result.Actions, BackendAction{
-			Action:  shared.Action{ID: action.ID, Label: action.Label, Kind: action.Kind, Risk: action.Risk, Disabled: action.Disabled},
-			Locator: action.Locator,
+			Action: shared.Action{
+				ID: action.ID, TargetID: action.TargetID, Label: action.Label, Kind: action.Kind,
+				Risk: action.Risk, Effect: action.Effect, Disabled: action.Disabled,
+			},
+			ReplayID: action.ReplayID, Locator: action.Locator,
+		})
+		if targetCounts[action.TargetID] == 1 && action.ID != "" {
+			actionsForTarget[action.TargetID] = append(actionsForTarget[action.TargetID], action.ID)
+		}
+	}
+	for _, element := range surface.Elements {
+		actionIDs := append([]string(nil), actionsForTarget[element.TargetID]...)
+		actionID := ""
+		if len(actionIDs) == 1 {
+			actionID = actionIDs[0]
+		}
+		result.Elements = append(result.Elements, shared.SurfaceElement{
+			ID: element.ID, TargetID: element.TargetID, Label: element.Label, Description: element.Description,
+			Role: element.Role, Bounds: element.Bounds, Source: element.Source,
+			Confidence: element.Confidence, ActionID: actionID, ActionIDs: actionIDs,
+		})
+	}
+	for _, asset := range surface.Assets {
+		kind := asset.Kind
+		if kind == "" {
+			kind = asset.Role
+		}
+		if kind == "" {
+			kind = "image"
+		}
+		result.Assets = append(result.Assets, shared.SurfaceAsset{
+			ID: asset.ID, Token: asset.Token, Kind: kind, Label: asset.Label,
+			Bounds: asset.Bounds, Source: asset.Source, Confidence: asset.Confidence,
 		})
 	}
 	return result, nil
+}
+
+func (b *DockerBackend) surfaceScreenshot(surface *controlSurface) ([]byte, string, error) {
+	if surface.ScreenshotBase64 == "" {
+		return nil, "", fmt.Errorf("%w: semantic surface did not include its matching screenshot", ErrClientIncompatible)
+	}
+	if surface.ScreenshotSHA256 == "" || surface.Generation == "" {
+		return nil, "", fmt.Errorf("%w: embedded surface screenshot is missing its generation or digest", ErrClientIncompatible)
+	}
+	if base64.StdEncoding.DecodedLen(len(surface.ScreenshotBase64)) > maxEmbeddedSurfaceScreenshotBytes {
+		return nil, "", fmt.Errorf("%w: embedded surface screenshot is too large", ErrClientIncompatible)
+	}
+	screenshot, err := base64.StdEncoding.DecodeString(surface.ScreenshotBase64)
+	if err != nil || len(screenshot) == 0 {
+		return nil, "", fmt.Errorf("%w: embedded surface screenshot is invalid", ErrClientIncompatible)
+	}
+	digest := sha256.Sum256(screenshot)
+	digestText := hex.EncodeToString(digest[:])
+	if !strings.EqualFold(surface.ScreenshotSHA256, digestText) {
+		return nil, "", fmt.Errorf("%w: embedded surface screenshot digest does not match", ErrClientIncompatible)
+	}
+	return screenshot, digestText, nil
 }
 
 func (b *DockerBackend) control(ctx context.Context, request controlRequest) (controlResponse, error) {
@@ -611,6 +866,8 @@ func (b *DockerBackend) control(ctx context.Context, request controlRequest) (co
 			return response, ErrSurfaceMissing
 		case "ACTION_STALE":
 			return response, ErrActionStale
+		case "USER_ACTION_REQUIRED":
+			return response, ErrUserActionRequired
 		case "CLIENT_INCOMPATIBLE":
 			return response, ErrClientIncompatible
 		default:

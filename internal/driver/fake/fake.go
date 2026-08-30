@@ -1,14 +1,27 @@
 package fake
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"image"
+	"image/png"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gih10012/wechatcopilot/internal/driver"
 )
+
+var fixtureSurfaceScreenshot = func() []byte {
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+		panic(err)
+	}
+	return encoded.Bytes()
+}()
 
 // Driver is a deterministic in-memory backend used by contract tests and
 // replay development. It never contacts a real client.
@@ -138,7 +151,14 @@ func (d *Driver) OpenSurface(_ context.Context, ref string) (driver.Surface, err
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	id := "surface-" + ref
-	surface := driver.Surface{ID: id, Kind: "web", Title: "Fixture surface", URL: "https://example.invalid/", OCRText: "Fixture surface", ObservedAt: time.Now().UTC(), Actions: []driver.Action{{ID: "close", Label: "Close", Kind: "close"}}}
+	screenshot := append([]byte(nil), fixtureSurfaceScreenshot...)
+	digest := sha256.Sum256(screenshot)
+	surface := driver.Surface{
+		ID: id, Kind: "web", Title: "Fixture surface", URL: "https://example.invalid/",
+		Screenshot: screenshot, ScreenshotSHA256: hex.EncodeToString(digest[:]),
+		OCRText: "Fixture surface", ObservedAt: time.Now().UTC(),
+		Actions: []driver.Action{{ID: "close", Label: "Close", Kind: "close"}},
+	}
 	d.surfaces[id] = surface
 	return surface, nil
 }

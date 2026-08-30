@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -23,6 +25,28 @@ type Server struct {
 	listener   net.Listener
 	socketPath string
 	socket     *socketIdentity
+
+	recoveryMu       sync.Mutex
+	recoveryCancel   context.CancelFunc
+	recoveryDone     chan struct{}
+	recoveryStopping bool
+	restore          func(context.Context) []error
+	closeService     func(context.Context) error
+	recoveryPolicy   restoreRetryPolicy
+	recoveryReporter func(attempt, maximum int, err error)
+}
+
+type restoreRetryPolicy struct {
+	maxAttempts    int
+	initialBackoff time.Duration
+	maxBackoff     time.Duration
+	attemptTimeout time.Duration
+	wait           func(context.Context, time.Duration) error
+}
+
+var defaultRestoreRetryPolicy = restoreRetryPolicy{
+	maxAttempts: 10, initialBackoff: 500 * time.Millisecond, maxBackoff: 15 * time.Second,
+	attemptTimeout: 45 * time.Second,
 }
 
 type socketIdentity struct {
@@ -32,7 +56,10 @@ type socketIdentity struct {
 }
 
 func New(socketPath string, service *service.Service) *Server {
-	server := &Server{service: service, socketPath: socketPath}
+	server := &Server{
+		service: service, socketPath: socketPath, restore: service.Restore,
+		closeService: service.Close, recoveryPolicy: defaultRestoreRetryPolicy,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", server.handleHealth)
 	mux.HandleFunc("GET /v1/accounts", server.handleAccounts)
@@ -54,6 +81,7 @@ func New(socketPath string, service *service.Service) *Server {
 	mux.HandleFunc("POST /v1/surfaces/open", server.handleSurfaceOpen)
 	mux.HandleFunc("POST /v1/surfaces/snapshot", server.handleSurfaceSnapshot)
 	mux.HandleFunc("POST /v1/surfaces/act", server.handleSurfaceAct)
+	mux.HandleFunc("POST /v1/surfaces/export", server.handleSurfaceExport)
 	mux.HandleFunc("POST /v1/surfaces/close", server.handleSurfaceClose)
 	server.httpServer = &http.Server{
 		Handler:           mux,
@@ -112,6 +140,7 @@ func (s *Server) Serve() error {
 			return err
 		}
 	}
+	s.startRestoreRecovery()
 	err := s.httpServer.Serve(s.listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
@@ -120,6 +149,7 @@ func (s *Server) Serve() error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
+	recoveryErr := s.stopRestoreRecovery(ctx)
 	httpErr := s.httpServer.Shutdown(ctx)
 	var listenerErr error
 	if s.listener != nil {
@@ -128,12 +158,153 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			listenerErr = nil
 		}
 	}
-	serviceErr := s.service.Close(ctx)
+	var serviceErr error
+	if recoveryErr == nil {
+		serviceErr = s.closeService(ctx)
+	}
 	var socketErr error
 	if s.socket != nil {
 		socketErr = removeOwnedSocket(s.socketPath, *s.socket)
 	}
-	return errors.Join(httpErr, listenerErr, serviceErr, socketErr)
+	return errors.Join(recoveryErr, httpErr, listenerErr, serviceErr, socketErr)
+}
+
+// SetRestoreFailureReporter installs a non-blocking diagnostic callback. It
+// must be called before Serve.
+func (s *Server) SetRestoreFailureReporter(reporter func(attempt, maximum int, err error)) {
+	s.recoveryMu.Lock()
+	defer s.recoveryMu.Unlock()
+	s.recoveryReporter = reporter
+}
+
+func (s *Server) startRestoreRecovery() {
+	s.recoveryMu.Lock()
+	if s.recoveryDone != nil || s.recoveryStopping {
+		s.recoveryMu.Unlock()
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	s.recoveryCancel = cancel
+	s.recoveryDone = done
+	restore := s.restore
+	policy := s.recoveryPolicy
+	reporter := s.recoveryReporter
+	s.recoveryMu.Unlock()
+
+	go func() {
+		_ = runRestoreRetry(ctx, policy, restore, reporter)
+		s.recoveryMu.Lock()
+		close(done)
+		s.recoveryMu.Unlock()
+	}()
+}
+
+func (s *Server) stopRestoreRecovery(ctx context.Context) error {
+	s.recoveryMu.Lock()
+	s.recoveryStopping = true
+	cancel := s.recoveryCancel
+	done := s.recoveryDone
+	s.recoveryMu.Unlock()
+	if cancel == nil || done == nil {
+		return nil
+	}
+	cancel()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func runRestoreRetry(
+	ctx context.Context,
+	policy restoreRetryPolicy,
+	restore func(context.Context) []error,
+	reporter func(attempt, maximum int, err error),
+) error {
+	if policy.maxAttempts <= 0 {
+		return errors.New("restore retry policy must allow at least one attempt")
+	}
+	if policy.maxAttempts > 1 && policy.initialBackoff <= 0 {
+		return errors.New("restore retry policy must use a positive initial backoff")
+	}
+	if policy.maxAttempts > 1 && policy.maxBackoff <= 0 {
+		return errors.New("restore retry policy must use a positive maximum backoff")
+	}
+	if restore == nil {
+		return errors.New("restore callback is unavailable")
+	}
+	backoff := policy.initialBackoff
+	if backoff < 0 {
+		backoff = 0
+	}
+	if policy.maxBackoff > 0 && backoff > policy.maxBackoff {
+		backoff = policy.maxBackoff
+	}
+	wait := policy.wait
+	if wait == nil {
+		wait = waitForRestoreRetry
+	}
+	var lastErr error
+	for attempt := 1; attempt <= policy.maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attemptCtx := ctx
+		cancel := func() {}
+		if policy.attemptTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, policy.attemptTimeout)
+		}
+		failures := restore(attemptCtx)
+		attemptErr := attemptCtx.Err()
+		cancel()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lastErr = errors.Join(errors.Join(failures...), attemptErr)
+		if lastErr == nil {
+			return nil
+		}
+		if reporter != nil {
+			reporter(attempt, policy.maxAttempts, lastErr)
+		}
+		if attempt == policy.maxAttempts {
+			return lastErr
+		}
+		if err := wait(ctx, backoff); err != nil {
+			return err
+		}
+		if backoff == 0 {
+			continue
+		}
+		next := backoff * 2
+		if next < backoff || (policy.maxBackoff > 0 && next > policy.maxBackoff) {
+			next = policy.maxBackoff
+		}
+		backoff = next
+	}
+	return lastErr
+}
+
+func waitForRestoreRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func ownedSocketIdentity(path string) (socketIdentity, error) {
@@ -393,42 +564,86 @@ func (s *Server) handleCommitSend(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleSurfaceOpen(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Account string `json:"account"`
-		Ref     string `json:"ref"`
+		Account          string `json:"account"`
+		Ref              string `json:"ref"`
+		MiniProgram      string `json:"mini_program"`
+		WithoutImageData bool   `json:"without_image_data,omitempty"`
 	}
 	if err := api.DecodeJSON(r, &body); err != nil {
 		s.respond(w, nil, err)
 		return
 	}
-	surface, err := s.service.OpenSurface(r.Context(), body.Account, body.Ref)
-	s.respond(w, surfacePayload(surface), err)
+	ref := strings.TrimSpace(body.Ref)
+	miniProgram := strings.TrimSpace(body.MiniProgram)
+	if (ref == "") == (miniProgram == "") {
+		s.respond(w, nil, api.NewError(http.StatusBadRequest, api.CodeInvalidArgument, "exactly one of ref or mini_program is required"))
+		return
+	}
+	var surface driver.Surface
+	var err error
+	if miniProgram != "" {
+		surface, err = s.service.OpenNamedSurface(r.Context(), body.Account, driver.NamedSurface{Kind: "miniprogram", Name: miniProgram})
+	} else {
+		surface, err = s.service.OpenSurface(r.Context(), body.Account, ref)
+	}
+	s.respond(w, surfacePayload(surface, !body.WithoutImageData), err)
 }
 
 func (s *Server) handleSurfaceSnapshot(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Account string `json:"account"`
-		ID      string `json:"id"`
+		Account          string `json:"account"`
+		ID               string `json:"id"`
+		WithoutImageData bool   `json:"without_image_data,omitempty"`
 	}
 	if err := api.DecodeJSON(r, &body); err != nil {
 		s.respond(w, nil, err)
 		return
 	}
 	surface, err := s.service.SnapshotSurface(r.Context(), body.Account, body.ID)
-	s.respond(w, surfacePayload(surface), err)
+	s.respond(w, surfacePayload(surface, !body.WithoutImageData), err)
+}
+
+type surfaceActRequest struct {
+	Account          string  `json:"account"`
+	ID               string  `json:"id"`
+	ActionID         string  `json:"action_id"`
+	Text             *string `json:"text,omitempty"`
+	Confirmed        bool    `json:"confirmed,omitempty"`
+	WithoutImageData bool    `json:"without_image_data,omitempty"`
+}
+
+func (request surfaceActRequest) action() driver.SurfaceAction {
+	action := driver.SurfaceAction{
+		ActionID: request.ActionID, TextProvided: request.Text != nil, Confirmed: request.Confirmed,
+	}
+	if request.Text != nil {
+		action.Text = *request.Text
+	}
+	return action
 }
 
 func (s *Server) handleSurfaceAct(w http.ResponseWriter, r *http.Request) {
+	var body surfaceActRequest
+	if err := api.DecodeJSON(r, &body); err != nil {
+		s.respond(w, nil, err)
+		return
+	}
+	surface, err := s.service.ActSurface(r.Context(), body.Account, body.ID, body.action())
+	s.respond(w, surfacePayload(surface, !body.WithoutImageData), err)
+}
+
+func (s *Server) handleSurfaceExport(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Account string `json:"account"`
-		ID      string `json:"id"`
-		driver.SurfaceAction
+		Account    string `json:"account"`
+		ID         string `json:"id"`
+		AssetToken string `json:"asset_token"`
 	}
 	if err := api.DecodeJSON(r, &body); err != nil {
 		s.respond(w, nil, err)
 		return
 	}
-	surface, err := s.service.ActSurface(r.Context(), body.Account, body.ID, body.SurfaceAction)
-	s.respond(w, surfacePayload(surface), err)
+	result, err := s.service.ExportSurfaceAsset(r.Context(), body.Account, body.ID, body.AssetToken)
+	s.respond(w, surfaceExportPayload(result), err)
 }
 
 func (s *Server) handleSurfaceClose(w http.ResponseWriter, r *http.Request) {
@@ -457,9 +672,17 @@ type accountRef struct {
 	Account string `json:"account"`
 }
 
-func surfacePayload(surface driver.Surface) map[string]any {
+func surfacePayload(surface driver.Surface, includeImageData bool) map[string]any {
+	result := map[string]any{"surface": surface}
+	if includeImageData {
+		result["screenshot_base64"] = base64.StdEncoding.EncodeToString(surface.Screenshot)
+	}
+	return result
+}
+
+func surfaceExportPayload(result driver.SurfaceAssetExport) map[string]any {
 	return map[string]any{
-		"surface":           surface,
-		"screenshot_base64": base64.StdEncoding.EncodeToString(surface.Screenshot),
+		"asset":       result,
+		"data_base64": base64.StdEncoding.EncodeToString(result.Data),
 	}
 }

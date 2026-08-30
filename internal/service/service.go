@@ -549,6 +549,22 @@ func (s *Service) OpenSurface(ctx context.Context, value, ref string) (driver.Su
 	return surface, err
 }
 
+func (s *Service) OpenNamedSurface(ctx context.Context, value string, target driver.NamedSurface) (driver.Surface, error) {
+	_, instance, err := s.runtimes.Driver(value)
+	if err != nil {
+		return driver.Surface{}, api.NewError(http.StatusConflict, api.CodeAccountInactive, "account must be active")
+	}
+	opener, ok := instance.(driver.NamedSurfaceOpener)
+	if !ok {
+		return driver.Surface{}, api.NewError(http.StatusConflict, api.CodeUnsupportedCapability, "the active driver cannot open mini programs by name")
+	}
+	surface, err := opener.OpenNamedSurface(ctx, target)
+	if classified := classifiedDriverError(err); classified != nil {
+		return driver.Surface{}, classified
+	}
+	return surface, err
+}
+
 func (s *Service) SnapshotSurface(ctx context.Context, value, id string) (driver.Surface, error) {
 	_, instance, err := s.runtimes.Driver(value)
 	if err != nil {
@@ -587,6 +603,22 @@ func (s *Service) CloseSurface(ctx context.Context, value, id string) error {
 		return classified
 	}
 	return err
+}
+
+func (s *Service) ExportSurfaceAsset(ctx context.Context, value, id, token string) (driver.SurfaceAssetExport, error) {
+	_, instance, err := s.runtimes.Driver(value)
+	if err != nil {
+		return driver.SurfaceAssetExport{}, api.NewError(http.StatusConflict, api.CodeAccountInactive, "account must be active")
+	}
+	exporter, ok := instance.(driver.SurfaceAssetExporter)
+	if !ok {
+		return driver.SurfaceAssetExport{}, api.NewError(http.StatusConflict, api.CodeUnsupportedCapability, "the active driver cannot export surface assets")
+	}
+	result, err := exporter.ExportSurfaceAsset(ctx, id, token)
+	if classified := classifiedDriverError(err); classified != nil {
+		return driver.SurfaceAssetExport{}, classified
+	}
+	return result, err
 }
 
 func (s *Service) ActiveAccounts() []account.Account {

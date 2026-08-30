@@ -25,6 +25,8 @@ func (a *application) accountsCommand() *cobra.Command {
 		a.accountLifecycleCommand("activate"),
 		a.accountLifecycleCommand("deactivate"),
 		a.accountRemoveCommand(),
+		a.accountAdoptLegacyIndexCommand(),
+		a.accountApproveLegacyWeComProfileCommand(),
 		a.accountLoginCommand(),
 	)
 	return command

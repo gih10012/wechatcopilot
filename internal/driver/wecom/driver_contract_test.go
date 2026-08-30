@@ -15,6 +15,8 @@ import (
 	core "github.com/gih10012/wechatcopilot/internal/driver"
 )
 
+var authFixturePNG = []byte("\x89PNG\r\n\x1a\nwecom-auth-fixture")
+
 func TestNotificationRecordsSatisfySharedIndexContract(t *testing.T) {
 	token := "abcdefghijklmnopqrstuvwxyzABCDEFGH0123456789"
 	event := CompanionEvent{
@@ -52,6 +54,16 @@ func TestNotificationRecordsSatisfySharedIndexContract(t *testing.T) {
 		runtime: runtime, account: runtime.account,
 		surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo),
 	}
+	history, err := allEvents(context.Background(), client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history.Complete || len(history.Events) != 1 || history.Events[0].Sequence != event.Sequence {
+		t.Fatalf("incomplete event history was discarded or mislabeled: %#v", history)
+	}
+	if _, err := driver.notificationEvent(context.Background(), client, event.Sequence-1); !errors.Is(err, ErrStale) {
+		t.Fatalf("lookup across known journal gap error = %v, want ErrStale", err)
+	}
 	conversations, err := driver.ListConversations(context.Background(), core.ConversationQuery{Limit: 10})
 	if err != nil {
 		t.Fatal(err)
@@ -63,8 +75,82 @@ func TestNotificationRecordsSatisfySharedIndexContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 1 || messages[0].ID == "" || messages[0].ExternalID == "" || messages[0].ConversationID != conversations[0].ID {
+	if len(messages) != 1 || messages[0].ID == "" || messages[0].ExternalID == "" ||
+		messages[0].ConversationID != conversations[0].ID || !messages[0].GapBefore {
 		t.Fatalf("message violates core index contract: %#v", messages)
+	}
+	encoded, err := json.Marshal(messages[0])
+	if err != nil || !strings.Contains(string(encoded), `"gap_before":true`) {
+		t.Fatalf("message gap is not exposed compatibly: json=%s err=%v", encoded, err)
+	}
+}
+
+func TestReadMessagesOmitsGapMarkerForCompleteEventPage(t *testing.T) {
+	const token = "abcdefghijklmnopqrstuvwxyzABCDEFGH0123456789"
+	event := CompanionEvent{
+		Sequence: 9, PackageName: DefaultWeComPackage,
+		ConversationKey: strings.Repeat("d", 64), Conversation: "Project", Text: "latest",
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(EventPage{Events: []CompanionEvent{event}, NextCursor: event.Sequence, Complete: true})
+	}))
+	defer server.Close()
+	client, err := newCompanionClientForURL(server.URL, token, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &Runtime{config: DefaultConfig(), companion: client, running: true}
+	driver := &Driver{
+		runtime: runtime, account: core.AccountRuntime{AccountID: "account-1"},
+		surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo),
+	}
+	messages, err := driver.ReadMessages(context.Background(), core.MessageQuery{Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || messages[0].GapBefore {
+		t.Fatalf("complete page gained a false gap marker: %#v", messages)
+	}
+	encoded, err := json.Marshal(messages[0])
+	if err != nil || strings.Contains(string(encoded), "gap_before") {
+		t.Fatalf("zero gap marker is not backward-compatible: json=%s err=%v", encoded, err)
+	}
+}
+
+func TestReadMessagesPreservesConversationScopedGapAfterGlobalFiltering(t *testing.T) {
+	const token = "abcdefghijklmnopqrstuvwxyzABCDEFGH0123456789"
+	accountID := "account-1"
+	keyA := strings.Repeat("a", 64)
+	keyB := strings.Repeat("b", 64)
+	events := []CompanionEvent{
+		{Sequence: 21, PackageName: DefaultWeComPackage, ConversationKey: keyA, Conversation: "A", Text: "a-boundary", GapBefore: true},
+		{Sequence: 22, PackageName: DefaultWeComPackage, ConversationKey: keyA, Conversation: "A", Text: "a-next"},
+		{Sequence: 23, PackageName: DefaultWeComPackage, ConversationKey: keyB, Conversation: "B", Text: "b-boundary", GapBefore: true},
+		{Sequence: 24, PackageName: DefaultWeComPackage, ConversationKey: keyB, Conversation: "B", Text: "b-next"},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(EventPage{Events: events, NextCursor: 24, Complete: true})
+	}))
+	defer server.Close()
+	client, err := newCompanionClientForURL(server.URL, token, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &Runtime{config: DefaultConfig(), companion: client, running: true}
+	driver := &Driver{
+		runtime: runtime, account: core.AccountRuntime{AccountID: accountID},
+		surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo),
+	}
+	messages, err := driver.ReadMessages(context.Background(), core.MessageQuery{
+		ConversationID: conversationID(accountID, keyB), Limit: 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 2 || messages[0].Text != "b-boundary" || !messages[0].GapBefore || messages[1].GapBefore {
+		t.Fatalf("filtered conversation boundary = %#v", messages)
 	}
 }
 
@@ -119,6 +205,52 @@ func TestClassifyLoginUsesObservedWeComWindowClass(t *testing.T) {
 	if state == core.StateAuthRequired {
 		t.Fatal("post-login chat text was classified as authentication required")
 	}
+
+	staleBottomNavigation := UISnapshot{
+		PackageName: DefaultWeComPackage,
+		WindowClass: weComLoginWxAuthActivity,
+		Nodes: []Node{
+			{ID: "0/agreement", ClassName: androidImageViewClass, ViewID: weComLoginAgreementViewID},
+			{ID: "0/messages", Text: "消息", VisibleToUser: true},
+			{ID: "0/workbench", Text: "工作台", VisibleToUser: true},
+		},
+	}
+	if state, _ := classifyLogin(staleBottomNavigation); state != core.StateAuthRequired {
+		t.Fatalf("login screen with stale bottom navigation = %s, want %s", state, core.StateAuthRequired)
+	}
+	riskWithStaleBottomNavigation := UISnapshot{
+		PackageName: DefaultWeComPackage,
+		WindowClass: "com.tencent.wework.login.controller.SecurityVerificationActivity",
+		Nodes: []Node{
+			{ID: "0/risk", Text: "Device verification", VisibleToUser: true},
+			{ID: "0/messages", Text: "消息", VisibleToUser: true},
+			{ID: "0/workbench", Text: "工作台", VisibleToUser: true},
+		},
+	}
+	if state, reason := classifyLogin(riskWithStaleBottomNavigation); state != core.StateAuthRequired ||
+		!strings.Contains(reason, "direct user action") {
+		t.Fatalf("risk Activity with stale bottom navigation = %s/%q, want AUTH_REQUIRED/user action", state, reason)
+	}
+	ordinaryAgreementMessage := UISnapshot{
+		PackageName: DefaultWeComPackage,
+		WindowClass: testConversationActivity,
+		Nodes: []Node{
+			{ID: "0/message", Text: "同意", VisibleToUser: true},
+			{ID: "0/messages", Text: "消息", VisibleToUser: true},
+			{ID: "0/workbench", Text: "工作台", VisibleToUser: true},
+		},
+	}
+	if state, _ := classifyLogin(ordinaryAgreementMessage); state != core.StateOnline {
+		t.Fatalf("ordinary chat agreement text = %s, want %s", state, core.StateOnline)
+	}
+
+	evilSuffix := UISnapshot{
+		PackageName: DefaultWeComPackage,
+		WindowClass: weComLoginWxAuthActivity + "Evil",
+	}
+	if state, _ := classifyLogin(evilSuffix); state == core.StateAuthRequired {
+		t.Fatalf("lookalike login activity was trusted: %s", state)
+	}
 }
 
 func TestPrivacyConsentActionRequiresExactOfficialScreenAndUniqueTarget(t *testing.T) {
@@ -131,8 +263,13 @@ func TestPrivacyConsentActionRequiresExactOfficialScreenAndUniqueTarget(t *testi
 			{ID: "0/3", Text: "Disagree", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 10, Top: 60, Right: 100, Bottom: 100}},
 		},
 	}
-	actions := privacyConsentActions(base)
-	if len(actions) != 1 || actions[0].ID != acceptPrivacyPolicyAction || !actions[0].RequiresConfirmation || actions[0].Risk != "high" {
+	actions := privacyConsentActions(base, authFixturePNG, "account-1")
+	if len(actions) != 1 {
+		t.Fatalf("privacy actions = %#v", actions)
+	}
+	operation, validID := parseAuthActionID(actions[0].ID)
+	if !validID || operation != acceptPrivacyPolicyAction || actions[0].ReplayKey != acceptPrivacyPolicyAction || !actions[0].ImageBound ||
+		!actions[0].RequiresConfirmation || actions[0].Risk != "high" {
 		t.Fatalf("privacy actions = %#v", actions)
 	}
 
@@ -170,7 +307,7 @@ func TestPrivacyConsentActionRequiresExactOfficialScreenAndUniqueTarget(t *testi
 		}},
 		{name: "offscreen button", mutate: func(value *UISnapshot) { value.Nodes[2].Bounds = Bounds{} }},
 		{name: "device verification overlay", mutate: func(value *UISnapshot) {
-			value.Nodes = append(value.Nodes, Node{ID: "0/4", Text: "Device verification", Enabled: true})
+			value.Nodes = append(value.Nodes, Node{ID: "0/4", Text: "Device verification", Enabled: true, VisibleToUser: true})
 		}},
 		{name: "ambiguous buttons", mutate: func(value *UISnapshot) {
 			value.Nodes = append(value.Nodes, Node{ID: "0/4", Text: "Agree", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 110, Top: 10, Right: 200, Bottom: 50}})
@@ -189,37 +326,45 @@ func TestPrivacyConsentActionRequiresExactOfficialScreenAndUniqueTarget(t *testi
 			value := base
 			value.Nodes = append([]Node(nil), base.Nodes...)
 			test.mutate(&value)
-			if actions := privacyConsentActions(value); len(actions) != 0 {
+			if actions := privacyConsentActions(value, authFixturePNG, "account-1"); len(actions) != 0 {
 				t.Fatalf("unsafe screen advertised actions: %#v", actions)
 			}
 		})
 	}
 }
 
-func englishWeComLoginMethodSnapshot(checked bool) UISnapshot {
+func englishWeComLoginMethodSnapshot(selected bool) UISnapshot {
 	return UISnapshot{
 		Sequence: 41, PackageName: DefaultWeComPackage, WindowClass: weComLoginWxAuthActivity,
 		Nodes: []Node{
 			{ID: "0/0", Text: "Continue with WeChat", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 300, Right: 340, Bottom: 360}},
 			{ID: "0/1", Text: "Continue with Email", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 380, Right: 170, Bottom: 430}},
 			{ID: "0/2", Text: "Continue with Phone", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 190, Top: 380, Right: 340, Bottom: 430}},
-			{ID: "0/3", ClassName: "android.widget.CheckBox", Clickable: true, Checkable: true, Checked: checked, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 460, Right: 50, Bottom: 490}},
+			{ID: "0/3", ClassName: androidImageViewClass, ViewID: weComLoginAgreementViewID, Clickable: true, Selected: boolPointer(selected), Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 460, Right: 50, Bottom: 490}},
 			{ID: "0/4", Text: "Read and Agree Software Licensing and Service Agreements and Privacy Policy", Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 60, Top: 450, Right: 340, Bottom: 510}},
 		},
 	}
 }
 
-func TestWeComLoginMethodActionsRequireExactOfficialScreenAndCheckboxState(t *testing.T) {
+func TestWeComLoginMethodActionsRequireExactOfficialScreenAndAgreementState(t *testing.T) {
 	unchecked := englishWeComLoginMethodSnapshot(false)
-	actions, prompt := authenticationActions(unchecked)
-	if len(actions) != 1 || actions[0].ID != acceptWeComLoginTermsAction ||
+	actions, prompt := authenticationActions(unchecked, authFixturePNG, "account-1")
+	if len(actions) != 1 {
+		t.Fatalf("unchecked login method actions = %#v prompt=%q", actions, prompt)
+	}
+	operation, validID := parseAuthActionID(actions[0].ID)
+	if !validID || operation != acceptWeComLoginTermsAction || actions[0].ReplayKey != acceptWeComLoginTermsAction || !actions[0].ImageBound ||
 		!actions[0].RequiresConfirmation || actions[0].Risk != "high" || prompt == "" {
 		t.Fatalf("unchecked login method actions = %#v prompt=%q", actions, prompt)
 	}
 
 	checked := englishWeComLoginMethodSnapshot(true)
-	actions, prompt = authenticationActions(checked)
-	if len(actions) != 1 || actions[0].ID != continueWeComWithWechatAction ||
+	actions, prompt = authenticationActions(checked, authFixturePNG, "account-1")
+	if len(actions) != 1 {
+		t.Fatalf("checked login method actions = %#v prompt=%q", actions, prompt)
+	}
+	operation, validID = parseAuthActionID(actions[0].ID)
+	if !validID || operation != continueWeComWithWechatAction || actions[0].ReplayKey != continueWeComWithWechatAction || !actions[0].ImageBound ||
 		!actions[0].RequiresConfirmation || actions[0].Risk != "high" || prompt == "" {
 		t.Fatalf("checked login method actions = %#v prompt=%q", actions, prompt)
 	}
@@ -244,17 +389,22 @@ func TestWeComLoginMethodActionsRequireExactOfficialScreenAndCheckboxState(t *te
 		{name: "disabled Email button", mutate: func(value *UISnapshot) { value.Nodes[1].Enabled = false }},
 		{name: "non-clickable Phone button", mutate: func(value *UISnapshot) { value.Nodes[2].Clickable = false }},
 		{name: "offscreen Phone button", mutate: func(value *UISnapshot) { value.Nodes[2].Bounds = Bounds{} }},
-		{name: "multiple checkboxes", mutate: func(value *UISnapshot) {
+		{name: "multiple agreement controls", mutate: func(value *UISnapshot) {
 			value.Nodes = append(value.Nodes, Node{
-				ID: "0/5", ClassName: "android.widget.CheckBox", Clickable: true, Checkable: true,
+				ID: "0/5", ClassName: androidImageViewClass, ViewID: weComLoginAgreementViewID,
+				Clickable: true, Selected: boolPointer(false),
 				Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 60, Top: 520, Right: 90, Bottom: 550},
 			})
 		}},
-		{name: "non-checkable checkbox", mutate: func(value *UISnapshot) { value.Nodes[3].Checkable = false }},
-		{name: "non-clickable checkbox", mutate: func(value *UISnapshot) { value.Nodes[3].Clickable = false }},
-		{name: "disabled checkbox", mutate: func(value *UISnapshot) { value.Nodes[3].Enabled = false }},
-		{name: "hidden checkbox", mutate: func(value *UISnapshot) { value.Nodes[3].VisibleToUser = false }},
-		{name: "offscreen checkbox", mutate: func(value *UISnapshot) { value.Nodes[3].Bounds = Bounds{} }},
+		{name: "wrong agreement view ID", mutate: func(value *UISnapshot) { value.Nodes[3].ViewID = DefaultWeComPackage + ":id/not-ow" }},
+		{name: "wrong agreement class", mutate: func(value *UISnapshot) { value.Nodes[3].ClassName = "android.widget.Button" }},
+		{name: "missing selected state", mutate: func(value *UISnapshot) { value.Nodes[3].Selected = nil }},
+		{name: "custom control unexpectedly checkable", mutate: func(value *UISnapshot) { value.Nodes[3].Checkable = true }},
+		{name: "custom control unexpectedly checked", mutate: func(value *UISnapshot) { value.Nodes[3].Checked = true }},
+		{name: "non-clickable agreement control", mutate: func(value *UISnapshot) { value.Nodes[3].Clickable = false }},
+		{name: "disabled agreement control", mutate: func(value *UISnapshot) { value.Nodes[3].Enabled = false }},
+		{name: "hidden agreement control", mutate: func(value *UISnapshot) { value.Nodes[3].VisibleToUser = false }},
+		{name: "offscreen agreement control", mutate: func(value *UISnapshot) { value.Nodes[3].Bounds = Bounds{} }},
 		{name: "risk marker", mutate: func(value *UISnapshot) {
 			value.Nodes = append(value.Nodes, Node{ID: "0/5", Text: "Device verification", Enabled: true, VisibleToUser: true})
 		}},
@@ -274,15 +424,15 @@ func TestWeComLoginMethodActionsRequireExactOfficialScreenAndCheckboxState(t *te
 		}},
 	}
 	for _, test := range tests {
-		for _, checkboxChecked := range []bool{false, true} {
+		for _, agreementSelected := range []bool{false, true} {
 			state := "unchecked"
-			if checkboxChecked {
+			if agreementSelected {
 				state = "checked"
 			}
 			t.Run(test.name+"/"+state, func(t *testing.T) {
-				value := englishWeComLoginMethodSnapshot(checkboxChecked)
+				value := englishWeComLoginMethodSnapshot(agreementSelected)
 				test.mutate(&value)
-				if got, _ := authenticationActions(value); len(got) != 0 {
+				if got, _ := authenticationActions(value, authFixturePNG, "account-1"); len(got) != 0 {
 					t.Fatalf("unsafe login method screen advertised actions: %#v", got)
 				}
 			})
@@ -293,7 +443,7 @@ func TestWeComLoginMethodActionsRequireExactOfficialScreenAndCheckboxState(t *te
 func TestPerformWeComLoginMethodActionsInOrder(t *testing.T) {
 	const token = "abcdefghijklmnopqrstuvwxyzABCDEFGH0123456789"
 	var phase atomic.Int32
-	var checkedObservations atomic.Int32
+	var acceptedObservations atomic.Int32
 	var dismissedObservations atomic.Int32
 	actions := make(chan CompanionAction, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -305,7 +455,7 @@ func TestPerformWeComLoginMethodActionsInOrder(t *testing.T) {
 			case 0:
 				_ = json.NewEncoder(writer).Encode(englishWeComLoginMethodSnapshot(false))
 			case 1:
-				checkedObservations.Add(1)
+				acceptedObservations.Add(1)
 				snapshot := englishWeComLoginMethodSnapshot(true)
 				snapshot.Sequence = 42
 				_ = json.NewEncoder(writer).Encode(snapshot)
@@ -313,7 +463,7 @@ func TestPerformWeComLoginMethodActionsInOrder(t *testing.T) {
 				dismissedObservations.Add(1)
 				_ = json.NewEncoder(writer).Encode(UISnapshot{
 					Sequence: 43, PackageName: DefaultWeComPackage, WindowClass: weComLoginWxAuthActivity,
-					Nodes: []Node{{ID: "0/0", Text: "Confirm on your phone", Enabled: true, VisibleToUser: true}},
+					Nodes: []Node{{ID: "0/0", Text: "Waiting for confirmation", Enabled: true, VisibleToUser: true}},
 				})
 			}
 		case request.Method == http.MethodPost && request.URL.Path == "/v1/actions":
@@ -342,16 +492,16 @@ func TestPerformWeComLoginMethodActionsInOrder(t *testing.T) {
 		config: DefaultConfig(), companion: client, running: true,
 		android: AndroidContainer{
 			DockerBinary: "docker", Container: "synthetic",
-			Executor: functionExecutor(func(context.Context, string, ...string) ([]byte, error) {
-				return []byte("topResumedActivity=ActivityRecord{x u0 " + DefaultWeComPackage + "/.login.controller.LoginWxAuthActivity}\n"), nil
-			}),
-			Verify: func(context.Context) error { return nil },
+			Executor: authFixtureExecutor(weComLoginWxAuthActivity),
+			Verify:   func(context.Context) error { return nil },
 		},
 	}
 	driverInstance := &Driver{runtime: runtime, surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo)}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := driverInstance.PerformAuthAction(ctx, core.AuthActionRequest{ActionID: acceptWeComLoginTermsAction, Confirmed: true}); err != nil {
+	firstSnapshot := englishWeComLoginMethodSnapshot(false)
+	firstActionID := bindAuthActionID(acceptWeComLoginTermsAction, firstSnapshot, authFixturePNG, "")
+	if err := driverInstance.PerformAuthAction(ctx, core.AuthActionRequest{ActionID: firstActionID, Confirmed: true}); err != nil {
 		t.Fatalf("accept login terms: %v", err)
 	}
 	var first CompanionAction
@@ -363,7 +513,10 @@ func TestPerformWeComLoginMethodActionsInOrder(t *testing.T) {
 	if first.Kind != ActionCheck || first.NodeID != "0/3" || first.ExpectedSequence != 41 || first.Text != "" {
 		t.Fatalf("accept terms action = %#v", first)
 	}
-	if err := driverInstance.PerformAuthAction(ctx, core.AuthActionRequest{ActionID: continueWeComWithWechatAction, Confirmed: true}); err != nil {
+	secondSnapshot := englishWeComLoginMethodSnapshot(true)
+	secondSnapshot.Sequence = 42
+	secondActionID := bindAuthActionID(continueWeComWithWechatAction, secondSnapshot, authFixturePNG, "")
+	if err := driverInstance.PerformAuthAction(ctx, core.AuthActionRequest{ActionID: secondActionID, Confirmed: true}); err != nil {
 		t.Fatalf("continue with WeChat: %v", err)
 	}
 	var second CompanionAction
@@ -375,8 +528,8 @@ func TestPerformWeComLoginMethodActionsInOrder(t *testing.T) {
 	if second.Kind != ActionClick || second.NodeID != "0/0" || second.ExpectedSequence != 42 || second.Text != "" {
 		t.Fatalf("continue with WeChat action = %#v", second)
 	}
-	if checkedObservations.Load() < 2 {
-		t.Fatalf("terms action returned before stable checked state: observations=%d", checkedObservations.Load())
+	if acceptedObservations.Load() < 2 {
+		t.Fatalf("terms action returned before stable accepted state: observations=%d", acceptedObservations.Load())
 	}
 	if dismissedObservations.Load() < 2 {
 		t.Fatalf("continue action returned before stable marker dismissal: observations=%d", dismissedObservations.Load())
@@ -396,14 +549,14 @@ func TestPerformAuthActionsConsumeUncertainCompanionDispatch(t *testing.T) {
 	}
 	tests := []struct {
 		name       string
-		actionID   string
+		operation  string
 		snapshot   UISnapshot
 		wantKind   string
 		wantNodeID string
 	}{
-		{name: "privacy consent", actionID: acceptPrivacyPolicyAction, snapshot: privacy, wantKind: ActionClick, wantNodeID: "0/2"},
-		{name: "login terms", actionID: acceptWeComLoginTermsAction, snapshot: englishWeComLoginMethodSnapshot(false), wantKind: ActionCheck, wantNodeID: "0/3"},
-		{name: "continue with WeChat", actionID: continueWeComWithWechatAction, snapshot: englishWeComLoginMethodSnapshot(true), wantKind: ActionClick, wantNodeID: "0/0"},
+		{name: "privacy consent", operation: acceptPrivacyPolicyAction, snapshot: privacy, wantKind: ActionClick, wantNodeID: "0/2"},
+		{name: "login terms", operation: acceptWeComLoginTermsAction, snapshot: englishWeComLoginMethodSnapshot(false), wantKind: ActionCheck, wantNodeID: "0/3"},
+		{name: "continue with WeChat", operation: continueWeComWithWechatAction, snapshot: englishWeComLoginMethodSnapshot(true), wantKind: ActionClick, wantNodeID: "0/0"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -440,17 +593,15 @@ func TestPerformAuthActionsConsumeUncertainCompanionDispatch(t *testing.T) {
 				config: DefaultConfig(), companion: client, running: true,
 				android: AndroidContainer{
 					DockerBinary: "docker", Container: "synthetic",
-					Executor: functionExecutor(func(context.Context, string, ...string) ([]byte, error) {
-						return []byte("topResumedActivity=ActivityRecord{x u0 " + DefaultWeComPackage + "/.login.controller.LoginWxAuthActivity}\n"), nil
-					}),
-					Verify: func(context.Context) error { return nil },
+					Executor: authFixtureExecutor(weComLoginWxAuthActivity),
+					Verify:   func(context.Context) error { return nil },
 				},
 			}
 			driverInstance := &Driver{
 				runtime: runtime, surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo),
 			}
 			err = driverInstance.PerformAuthAction(context.Background(), core.AuthActionRequest{
-				ActionID: test.actionID, Confirmed: true,
+				ActionID: bindAuthActionID(test.operation, test.snapshot, authFixturePNG, ""), Confirmed: true,
 			})
 			if !errors.Is(err, ErrActionOutcomeUncertain) {
 				t.Fatalf("action error = %v, want ErrActionOutcomeUncertain", err)
@@ -501,15 +652,13 @@ func TestPerformAuthActionExplicitCompanionRejectionIsNotConsumed(t *testing.T) 
 		config: DefaultConfig(), companion: client, running: true,
 		android: AndroidContainer{
 			DockerBinary: "docker", Container: "synthetic",
-			Executor: functionExecutor(func(context.Context, string, ...string) ([]byte, error) {
-				return []byte("topResumedActivity=ActivityRecord{x u0 " + DefaultWeComPackage + "/.login.controller.LoginWxAuthActivity}\n"), nil
-			}),
-			Verify: func(context.Context) error { return nil },
+			Executor: authFixtureExecutor(weComLoginWxAuthActivity),
+			Verify:   func(context.Context) error { return nil },
 		},
 	}
 	driverInstance := &Driver{runtime: runtime, surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo)}
 	err = driverInstance.PerformAuthAction(context.Background(), core.AuthActionRequest{
-		ActionID: acceptPrivacyPolicyAction, Confirmed: true,
+		ActionID: bindAuthActionID(acceptPrivacyPolicyAction, snapshot, authFixturePNG, ""), Confirmed: true,
 	})
 	if !errors.Is(err, ErrStale) {
 		t.Fatalf("action error = %v, want ErrStale", err)
@@ -552,15 +701,13 @@ func TestPerformContinueWithWeChatConsumesAcceptedActionBeforeHardRiskHandoff(t 
 		config: DefaultConfig(), companion: client, running: true,
 		android: AndroidContainer{
 			DockerBinary: "docker", Container: "synthetic",
-			Executor: functionExecutor(func(context.Context, string, ...string) ([]byte, error) {
-				return []byte("topResumedActivity=ActivityRecord{x u0 " + DefaultWeComPackage + "/.login.controller.LoginWxAuthActivity}\n"), nil
-			}),
-			Verify: func(context.Context) error { return nil },
+			Executor: authFixtureExecutor(weComLoginWxAuthActivity),
+			Verify:   func(context.Context) error { return nil },
 		},
 	}
 	driverInstance := &Driver{runtime: runtime, surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo)}
 	err = driverInstance.PerformAuthAction(context.Background(), core.AuthActionRequest{
-		ActionID: continueWeComWithWechatAction, Confirmed: true,
+		ActionID: bindAuthActionID(continueWeComWithWechatAction, snapshot, authFixturePNG, ""), Confirmed: true,
 	})
 	if !errors.Is(err, ErrUserActionRequired) {
 		t.Fatalf("hard-risk handoff error = %v, want ErrUserActionRequired", err)
@@ -666,14 +813,13 @@ func TestPerformPrivacyConsentUsesFreshSemanticTargetAndConfirmation(t *testing.
 		config: DefaultConfig(), companion: client, running: true,
 		android: AndroidContainer{
 			DockerBinary: "docker", Container: "synthetic",
-			Executor: functionExecutor(func(context.Context, string, ...string) ([]byte, error) {
-				return []byte("topResumedActivity=ActivityRecord{x u0 " + DefaultWeComPackage + "/.login.controller.LoginWxAuthActivity}\n"), nil
-			}),
-			Verify: func(context.Context) error { return nil },
+			Executor: authFixtureExecutor(weComLoginWxAuthActivity),
+			Verify:   func(context.Context) error { return nil },
 		},
 	}
 	driverInstance := &Driver{runtime: runtime, surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo)}
-	if err := driverInstance.PerformAuthAction(context.Background(), core.AuthActionRequest{ActionID: acceptPrivacyPolicyAction}); !errors.Is(err, ErrUserActionRequired) {
+	actionID := bindAuthActionID(acceptPrivacyPolicyAction, snapshot, authFixturePNG, "")
+	if err := driverInstance.PerformAuthAction(context.Background(), core.AuthActionRequest{ActionID: actionID}); !errors.Is(err, ErrUserActionRequired) {
 		t.Fatalf("unconfirmed consent error = %v", err)
 	}
 	select {
@@ -681,7 +827,7 @@ func TestPerformPrivacyConsentUsesFreshSemanticTargetAndConfirmation(t *testing.
 		t.Fatalf("unconfirmed consent reached companion: %#v", action)
 	default:
 	}
-	if err := driverInstance.PerformAuthAction(context.Background(), core.AuthActionRequest{ActionID: acceptPrivacyPolicyAction, Confirmed: true}); err != nil {
+	if err := driverInstance.PerformAuthAction(context.Background(), core.AuthActionRequest{ActionID: actionID, Confirmed: true}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -782,36 +928,143 @@ func TestConversationKeyMappingMultipleTitlesFailsClosed(t *testing.T) {
 	}
 }
 
-func TestHighRiskSnapshotDisablesAllMutatingSurfaceActions(t *testing.T) {
-	png := []byte("\x89PNG\r\n\x1a\nsynthetic")
+func TestHighRiskSnapshotIsRejectedBeforeScreenshot(t *testing.T) {
+	executor := &recordingExecutor{output: resumedActivityOutput("com.tencent.wework.pay.controller.PaymentActivity")}
 	runtime := &Runtime{
+		config:  DefaultConfig(),
 		running: true,
 		android: AndroidContainer{
-			DockerBinary: "docker", Container: "synthetic", Executor: &recordingExecutor{output: png},
+			DockerBinary: "docker", Container: "synthetic", Executor: executor,
 			Verify: func(context.Context) error { return nil },
 		},
 	}
 	driver := &Driver{runtime: runtime, surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo)}
-	surface, err := driver.updateSurface(context.Background(), "surface-risk", UISnapshot{
-		Sequence: 9, PackageName: DefaultWeComPackage, WindowTitle: "订单支付",
+	_, err := driver.updateSurface(context.Background(), "surface-risk", UISnapshot{
+		Sequence: 9, PackageName: DefaultWeComPackage, WindowID: 7, WindowTitle: "订单支付",
 		Nodes: []Node{
-			{ID: "0/confirm", Text: "确认", Clickable: true, Enabled: true},
-			{ID: "0/note", Text: "备注", Editable: true, Enabled: true},
-			{ID: "0/list", Text: "详情", Scrollable: true, Enabled: true},
+			{ID: "0/confirm", Text: "确认支付", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 100, Right: 200, Bottom: 160}},
+			{ID: "0/note", Text: "备注", Editable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 180, Right: 300, Bottom: 240}},
+			{ID: "0/list", Text: "详情", Scrollable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 260, Right: 300, Bottom: 500}},
 		},
+	}, surfaceIdentity{})
+	if !errors.Is(err, ErrUserActionRequired) {
+		t.Fatalf("high-risk surface error = %v", err)
+	}
+	if executorCalledScreenshot(executor) || len(driver.surfaces) != 0 {
+		t.Fatalf("high-risk surface was captured or recorded: calls=%#v surfaces=%#v", executor.calls, driver.surfaces)
+	}
+}
+
+func TestAgreementImageCannotProduceAGenericSurface(t *testing.T) {
+	executor := &recordingExecutor{output: resumedActivityOutput("com.tencent.wework.msg.controller.ConversationActivity")}
+	runtime := &Runtime{
+		config:  DefaultConfig(),
+		running: true,
+		android: AndroidContainer{
+			DockerBinary: "docker", Container: "synthetic", Executor: executor,
+			Verify: func(context.Context) error { return nil },
+		},
+	}
+	driver := &Driver{runtime: runtime, surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo)}
+	_, err := driver.updateSurface(context.Background(), "surface-agreement", UISnapshot{
+		Sequence: 9, PackageName: DefaultWeComPackage, WindowID: 7,
+		Nodes: []Node{{
+			ID: "0/agreement", ClassName: androidImageViewClass, ViewID: weComLoginAgreementViewID,
+			Clickable: true, Enabled: true, VisibleToUser: true,
+		}},
+	}, surfaceIdentity{})
+	if !errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("agreement surface error = %v", err)
+	}
+	if executorCalledScreenshot(executor) || len(driver.surfaces) != 0 {
+		t.Fatalf("agreement surface was captured or recorded: calls=%#v surfaces=%#v", executor.calls, driver.surfaces)
+	}
+}
+
+func TestAuthenticationScreenIsRejectedBeforeScreenshot(t *testing.T) {
+	executor := &recordingExecutor{output: resumedActivityOutput(weComLoginWxAuthActivity)}
+	runtime := &Runtime{
+		config:  DefaultConfig(),
+		running: true,
+		android: AndroidContainer{
+			DockerBinary: "docker", Container: "synthetic", Executor: executor,
+			Verify: func(context.Context) error { return nil },
+		},
+	}
+	driver := &Driver{runtime: runtime, surfaces: make(map[string]surfaceState), sendMemos: make(map[string]sendMemo)}
+	snapshot := englishWeComLoginMethodSnapshot(false)
+	snapshot.WindowID = 7
+	snapshot.WindowClass = ""
+	snapshot.Nodes = append(snapshot.Nodes, Node{
+		ID: "0/input", ClassName: "android.widget.EditText", Editable: true,
+		Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 520, Right: 340, Bottom: 580},
 	})
-	if err != nil {
-		t.Fatal(err)
+	_, err := driver.updateSurface(context.Background(), "surface-auth", snapshot, surfaceIdentity{})
+	if !errors.Is(err, ErrAuthRequired) {
+		t.Fatalf("authentication surface error = %v", err)
 	}
-	for _, action := range surface.Actions {
-		if action.Kind == ActionClick || action.Kind == ActionSetText {
-			if !action.Disabled || action.Risk != "high" {
-				t.Fatalf("high-risk mutating action remained enabled: %#v", action)
+	if executorCalledScreenshot(executor) || len(driver.surfaces) != 0 {
+		t.Fatalf("authentication surface was captured or recorded: calls=%#v surfaces=%#v", executor.calls, driver.surfaces)
+	}
+}
+
+func TestAuthenticationSurfaceFallbackMarkersFailClosed(t *testing.T) {
+	login := englishWeComLoginMethodSnapshot(false)
+	login.WindowClass = ""
+	tests := []struct {
+		name     string
+		snapshot UISnapshot
+		want     bool
+	}{
+		{name: "login methods without activity", snapshot: login, want: true},
+		{name: "exact agreement control without activity or state", snapshot: UISnapshot{
+			PackageName: DefaultWeComPackage,
+			Nodes: []Node{{
+				ID: "0/agreement", ClassName: androidImageViewClass, ViewID: weComLoginAgreementViewID,
+			}},
+		}, want: true},
+		{name: "structured Chinese privacy guide without activity", snapshot: UISnapshot{
+			PackageName: DefaultWeComPackage,
+			Nodes: []Node{
+				{ID: "0/privacy", Text: "欢迎使用企业微信，请阅读隐私政策", VisibleToUser: true},
+				{ID: "0/agree", Text: "同意", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 100, Right: 120, Bottom: 150}},
+				{ID: "0/disagree", Text: "不同意", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 140, Top: 100, Right: 240, Bottom: 150}},
+			},
+		}, want: true},
+		{name: "structured SMS without activity", snapshot: UISnapshot{
+			PackageName: DefaultWeComPackage,
+			Nodes: []Node{
+				{ID: "0/label", Text: "Enter verification code", VisibleToUser: true},
+				{ID: "0/input", Editable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 100, Right: 300, Bottom: 160}},
+				{ID: "0/submit", Text: "Continue", Clickable: true, Enabled: true, VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 180, Right: 300, Bottom: 240}},
+			},
+		}, want: true},
+		{name: "structured QR without activity", snapshot: UISnapshot{
+			PackageName: DefaultWeComPackage,
+			Nodes: []Node{
+				{ID: "0/label", Text: "Scan with WeChat", VisibleToUser: true, Bounds: Bounds{Left: 20, Top: 20, Right: 300, Bottom: 70}},
+				{ID: "0/qr", ClassName: "android.widget.ImageView", VisibleToUser: true, Bounds: Bounds{Left: 60, Top: 100, Right: 300, Bottom: 340}},
+			},
+		}, want: true},
+		{name: "benign official surface", snapshot: UISnapshot{
+			PackageName: DefaultWeComPackage,
+			Nodes:       []Node{{ID: "0/label", Text: "Project updates", VisibleToUser: true}},
+		}, want: false},
+		{name: "lookalike login activity", snapshot: UISnapshot{
+			PackageName: DefaultWeComPackage,
+			WindowClass: weComLoginWxAuthActivity + "Evil",
+		}, want: false},
+		{name: "foreign marker", snapshot: UISnapshot{
+			PackageName: "example.invalid",
+			Nodes:       []Node{{ID: "0/label", Text: "Scan with WeChat", VisibleToUser: true}},
+		}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := authenticationSurface(test.snapshot); got != test.want {
+				t.Fatalf("authenticationSurface() = %t, want %t", got, test.want)
 			}
-		}
-	}
-	if len(driver.surfaces["surface-risk"].actions) != 2 {
-		t.Fatalf("only bounded scroll actions should remain enabled: %#v", driver.surfaces["surface-risk"].actions)
+		})
 	}
 }
 
@@ -821,4 +1074,26 @@ func TestOpenSurfaceRejectsGenericUILabelReference(t *testing.T) {
 	if !errors.Is(err, ErrUnsupportedCapability) {
 		t.Fatalf("expected generic label reference to be rejected, got %v", err)
 	}
+}
+
+func resumedActivityOutput(activity string) []byte {
+	return []byte("topResumedActivity=ActivityRecord{x u0 " + DefaultWeComPackage + "/" + activity + "}\n")
+}
+
+func authFixtureExecutor(activity string) Executor {
+	return functionExecutor(func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if strings.Contains(strings.Join(args, " "), "/system/bin/screencap") {
+			return append([]byte(nil), authFixturePNG...), nil
+		}
+		return resumedActivityOutput(activity), nil
+	})
+}
+
+func executorCalledScreenshot(executor *recordingExecutor) bool {
+	for _, call := range executor.calls {
+		if strings.Contains(strings.Join(call.args, " "), "/system/bin/screencap") {
+			return true
+		}
+	}
+	return false
 }

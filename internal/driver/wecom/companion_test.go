@@ -18,10 +18,10 @@ func TestCompanionClientAuthenticatesAndDecodesSnapshot(t *testing.T) {
 		}
 		writer.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(writer).Encode(UISnapshot{
-			Sequence: 7, PackageName: DefaultWeComPackage,
+			Sequence: 7, PackageName: DefaultWeComPackage, WindowID: 11,
 			WindowClass: "com.tencent.wework.login.controller.LoginWxAuthActivity",
 			Nodes: []Node{{
-				ID: "0/1", Text: "Agree", Checkable: true, Checked: true,
+				ID: "0/1", Text: "Agree", Checkable: true, Checked: true, Selected: boolPointer(true),
 				Enabled: true, VisibleToUser: true,
 			}},
 		})
@@ -36,30 +36,61 @@ func TestCompanionClientAuthenticatesAndDecodesSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	if snapshot.Sequence != 7 || snapshot.PackageName != DefaultWeComPackage ||
+		snapshot.WindowID != 11 ||
 		snapshot.WindowClass != "com.tencent.wework.login.controller.LoginWxAuthActivity" ||
 		len(snapshot.Nodes) != 1 || !snapshot.Nodes[0].Checkable || !snapshot.Nodes[0].Checked ||
+		snapshot.Nodes[0].Selected == nil || !*snapshot.Nodes[0].Selected ||
 		!snapshot.Nodes[0].Enabled || !snapshot.Nodes[0].VisibleToUser {
 		t.Fatalf("unexpected snapshot: %+v", snapshot)
 	}
 }
 
-func TestCompanionNodeCheckboxFieldsUseWireNamesAndDefaultFailClosed(t *testing.T) {
+func TestCompanionNodeSelectionFieldsUseWireNamesAndDefaultFailClosed(t *testing.T) {
 	var checked Node
-	if err := json.Unmarshal([]byte(`{"id":"0/1","checkable":true,"checked":true}`), &checked); err != nil {
+	if err := json.Unmarshal([]byte(`{"id":"0/1","checkable":true,"checked":true,"selected":true}`), &checked); err != nil {
 		t.Fatal(err)
 	}
-	if !checked.Checkable || !checked.Checked {
-		t.Fatalf("checkbox wire fields were not decoded: %+v", checked)
+	if !checked.Checkable || !checked.Checked || checked.Selected == nil || !*checked.Selected {
+		t.Fatalf("selection wire fields were not decoded: %+v", checked)
 	}
 
 	var omitted Node
 	if err := json.Unmarshal([]byte(`{"id":"0/1","enabled":true,"visible_to_user":true}`), &omitted); err != nil {
 		t.Fatal(err)
 	}
-	if omitted.Checkable || omitted.Checked {
-		t.Fatalf("missing checkbox fields must remain false: %+v", omitted)
+	if omitted.Checkable || omitted.Checked || omitted.Selected != nil {
+		t.Fatalf("missing selection fields must remain false: %+v", omitted)
 	}
 }
+
+func TestCompanionSnapshotWithoutWindowIDFailsClosed(t *testing.T) {
+	var snapshot UISnapshot
+	if err := json.Unmarshal([]byte(`{"sequence":7,"package_name":"com.tencent.wework","nodes":[]}`), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.WindowID != -1 {
+		t.Fatalf("missing window_id decoded as %d, want -1", snapshot.WindowID)
+	}
+}
+
+func TestCompanionSnapshotWindowIDWireGolden(t *testing.T) {
+	encoded, err := json.Marshal(UISnapshot{
+		Sequence: 7, PackageName: DefaultWeComPackage, WindowID: 11,
+		WindowClass: weComLoginWxAuthActivity, Nodes: []Node{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if string(fields["window_id"]) != "11" {
+		t.Fatalf("snapshot wire window_id = %s; payload=%s", fields["window_id"], encoded)
+	}
+}
+
+func boolPointer(value bool) *bool { return &value }
 
 func TestCompanionActionValidation(t *testing.T) {
 	if err := validateCompanionAction(CompanionAction{
@@ -67,11 +98,17 @@ func TestCompanionActionValidation(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("expected constrained check action to be accepted: %v", err)
 	}
+	if err := validateCompanionAction(CompanionAction{
+		Kind: ActionGlobalBack, ExpectedSequence: 7,
+	}); err != nil {
+		t.Fatalf("expected sequence-bound global_back to be accepted: %v", err)
+	}
 
 	invalid := []CompanionAction{
 		{Kind: ActionClick},
 		{Kind: ActionCheck},
 		{Kind: ActionCheck, NodeID: "0/1", ExpectedSequence: 7, Text: "unexpected"},
+		{Kind: ActionGlobalBack},
 		{Kind: ActionGlobalBack, Text: "unexpected"},
 		{Kind: "shell", Text: "id"},
 	}

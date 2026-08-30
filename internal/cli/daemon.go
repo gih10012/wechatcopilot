@@ -91,12 +91,18 @@ func (a *application) daemonServeCommand() *cobra.Command {
 				return internalError("cannot initialize daemon service", err)
 			}
 			server := daemon.New(paths.Socket, control)
+			server.SetRestoreFailureReporter(func(attempt, maximum int, restoreErr error) {
+				_, _ = fmt.Fprintf(
+					a.stderr,
+					"wechatcopilot: account restore attempt %d/%d failed: %v\n",
+					attempt,
+					maximum,
+					restoreErr,
+				)
+			})
 			if err := server.Listen(); err != nil {
 				_ = control.Close(context.Background())
 				return api.WrapError(http.StatusConflict, api.CodeConflict, "cannot listen on daemon socket", err)
-			}
-			for _, restoreErr := range control.Restore(command.Context()) {
-				_, _ = fmt.Fprintf(a.stderr, "wechatcopilot: account restore failed: %v\n", restoreErr)
 			}
 			errCh := make(chan error, 1)
 			go func() { errCh <- server.Serve() }()
@@ -334,7 +340,10 @@ func systemdUnit(binary, stateHome, environmentPath, swapPolicyEnvironmentPath, 
 	lines = append(lines, "EnvironmentFile="+swapPolicyEnvironmentPath)
 	lines = append(lines,
 		"ExecStart="+strconv.Quote(binary)+" daemon serve",
-		"Restart=on-failure",
+		// Persistent startup failures (especially a deliberately locked state
+		// volume after reboot) require operator action and must not spin forever.
+		// Signals and other abnormal process failures remain restartable.
+		"Restart=on-abnormal",
 		"RestartSec=3",
 		"TimeoutStopSec=40",
 		"UMask=0077",

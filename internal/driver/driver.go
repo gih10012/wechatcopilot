@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -39,15 +40,17 @@ const (
 type FailureKind string
 
 const (
-	FailureAuthRequired       FailureKind = "auth_required"
-	FailureClientIncompatible FailureKind = "client_incompatible"
-	FailureTargetAmbiguous    FailureKind = "target_ambiguous"
-	FailureUnsupported        FailureKind = "unsupported"
-	FailureUserActionRequired FailureKind = "user_action_required"
-	FailureNotFound           FailureKind = "not_found"
-	FailureStale              FailureKind = "stale"
-	FailureDriverUnavailable  FailureKind = "driver_unavailable"
-	FailureSendUncertain      FailureKind = "send_uncertain"
+	FailureInvalidArgument      FailureKind = "invalid_argument"
+	FailureAuthRequired         FailureKind = "auth_required"
+	FailureClientIncompatible   FailureKind = "client_incompatible"
+	FailureTargetAmbiguous      FailureKind = "target_ambiguous"
+	FailureUnsupported          FailureKind = "unsupported"
+	FailureConfirmationRequired FailureKind = "confirmation_required"
+	FailureUserActionRequired   FailureKind = "user_action_required"
+	FailureNotFound             FailureKind = "not_found"
+	FailureStale                FailureKind = "stale"
+	FailureDriverUnavailable    FailureKind = "driver_unavailable"
+	FailureSendUncertain        FailureKind = "send_uncertain"
 )
 
 // Failure gives the service a stable classification without coupling it to a
@@ -121,6 +124,10 @@ type AuthAction struct {
 	Risk                 string `json:"risk,omitempty"`
 	Confirmation         string `json:"confirmation,omitempty"`
 	RequiresConfirmation bool   `json:"requires_confirmation,omitempty"`
+	ImageBound           bool   `json:"image_bound,omitempty"`
+	// ReplayKey groups changing generation-bound IDs for one logical action.
+	// It is challenge-local manager metadata and must never cross the API.
+	ReplayKey string `json:"-"`
 }
 
 type AuthActionRequest struct {
@@ -180,22 +187,25 @@ type Attachment struct {
 }
 
 type Message struct {
-	ID             string          `json:"id"`
-	ExternalID     string          `json:"-"`
-	ConversationID string          `json:"conversation_id"`
-	SenderID       string          `json:"sender_id,omitempty"`
-	SenderName     string          `json:"sender_name,omitempty"`
-	SentAt         time.Time       `json:"sent_at"`
-	Kind           string          `json:"kind"`
-	Text           string          `json:"text,omitempty"`
-	Attachments    []Attachment    `json:"attachments,omitempty"`
-	ReplyTo        string          `json:"reply_to,omitempty"`
-	SurfaceRef     string          `json:"surface_ref,omitempty"`
-	Source         string          `json:"source"`
-	Complete       bool            `json:"complete"`
-	Confidence     float64         `json:"confidence"`
-	Raw            json.RawMessage `json:"-"`
-	Sequence       int64           `json:"sequence,omitempty"`
+	ID             string `json:"id"`
+	ExternalID     string `json:"-"`
+	ConversationID string `json:"conversation_id"`
+	// GapBefore marks a conversation-scoped journal boundary: continuity to an
+	// earlier message in this same conversation is not proven.
+	GapBefore   bool            `json:"gap_before,omitempty"`
+	SenderID    string          `json:"sender_id,omitempty"`
+	SenderName  string          `json:"sender_name,omitempty"`
+	SentAt      time.Time       `json:"sent_at"`
+	Kind        string          `json:"kind"`
+	Text        string          `json:"text,omitempty"`
+	Attachments []Attachment    `json:"attachments,omitempty"`
+	ReplyTo     string          `json:"reply_to,omitempty"`
+	SurfaceRef  string          `json:"surface_ref,omitempty"`
+	Source      string          `json:"source"`
+	Complete    bool            `json:"complete"`
+	Confidence  float64         `json:"confidence"`
+	Raw         json.RawMessage `json:"-"`
+	Sequence    int64           `json:"sequence,omitempty"`
 }
 
 type ConversationQuery struct {
@@ -228,28 +238,113 @@ type SendResult struct {
 }
 
 type Surface struct {
+	ID               string           `json:"id"`
+	Kind             string           `json:"kind"`
+	Title            string           `json:"title,omitempty"`
+	URL              string           `json:"url,omitempty"`
+	AppID            string           `json:"app_id,omitempty"`
+	Generation       string           `json:"generation,omitempty"`
+	Screenshot       []byte           `json:"-"`
+	ScreenshotSHA256 string           `json:"screenshot_sha256,omitempty"`
+	OCRText          string           `json:"ocr_text,omitempty"`
+	Elements         []SurfaceElement `json:"elements,omitempty"`
+	Assets           []SurfaceAsset   `json:"assets,omitempty"`
+	Viewport         *SurfaceViewport `json:"viewport,omitempty"`
+	Actions          []Action         `json:"actions,omitempty"`
+	ObservedAt       time.Time        `json:"observed_at"`
+}
+
+// Bounds is always rendered as an object in the public API. Its decoder also
+// accepts the compact [x,y,width,height] form emitted by the UI companion.
+type Bounds struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+func (b *Bounds) UnmarshalJSON(data []byte) error {
+	type boundsAlias Bounds
+	if len(data) > 0 && data[0] == '[' {
+		var values []int
+		if err := json.Unmarshal(data, &values); err != nil {
+			return err
+		}
+		if len(values) != 4 {
+			return fmt.Errorf("surface bounds require exactly four integers")
+		}
+		*b = Bounds{X: values[0], Y: values[1], Width: values[2], Height: values[3]}
+		return nil
+	}
+	var value boundsAlias
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*b = Bounds(value)
+	return nil
+}
+
+type SurfaceElement struct {
+	ID          string   `json:"id"`
+	TargetID    string   `json:"target_id,omitempty"`
+	Label       string   `json:"label,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Role        string   `json:"role,omitempty"`
+	Bounds      Bounds   `json:"bounds"`
+	Source      string   `json:"source"`
+	Confidence  float64  `json:"confidence"`
+	ActionID    string   `json:"action_id,omitempty"`
+	ActionIDs   []string `json:"action_ids,omitempty"`
+}
+
+type SurfaceAsset struct {
 	ID         string    `json:"id"`
+	Token      string    `json:"token"`
 	Kind       string    `json:"kind"`
-	Title      string    `json:"title,omitempty"`
-	URL        string    `json:"url,omitempty"`
-	AppID      string    `json:"app_id,omitempty"`
-	Screenshot []byte    `json:"-"`
-	OCRText    string    `json:"ocr_text,omitempty"`
-	Actions    []Action  `json:"actions,omitempty"`
-	ObservedAt time.Time `json:"observed_at"`
+	Label      string    `json:"label,omitempty"`
+	Bounds     Bounds    `json:"bounds"`
+	Source     string    `json:"source"`
+	Confidence float64   `json:"confidence"`
+	ExpiresAt  time.Time `json:"expires_at"`
+}
+
+type SurfaceViewport struct {
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+type NamedSurface struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+}
+
+type SurfaceAssetExport struct {
+	SurfaceID string `json:"surface_id"`
+	AssetID   string `json:"asset_id"`
+	Fidelity  string `json:"fidelity"`
+	MediaType string `json:"media_type"`
+	SHA256    string `json:"sha256"`
+	Bytes     int64  `json:"bytes"`
+	Data      []byte `json:"-"`
 }
 
 type Action struct {
 	ID       string `json:"id"`
+	TargetID string `json:"target_id,omitempty"`
 	Label    string `json:"label"`
 	Kind     string `json:"kind"`
 	Risk     string `json:"risk,omitempty"`
+	Effect   string `json:"effect,omitempty"`
 	Disabled bool   `json:"disabled,omitempty"`
 }
 
 type SurfaceAction struct {
-	ActionID string `json:"action_id"`
-	Text     string `json:"text,omitempty"`
+	ActionID     string `json:"action_id"`
+	Text         string `json:"text,omitempty"`
+	TextProvided bool   `json:"-"`
+	Confirmed    bool   `json:"confirmed,omitempty"`
 }
 
 // Driver owns exactly one active official-client runtime. The manager creates
@@ -283,4 +378,16 @@ type Factory func(AccountRuntime) (Driver, error)
 // stopped, label-verified runtime that belongs to one saved account.
 type AccountPurger interface {
 	Purge(context.Context, AccountRuntime) error
+}
+
+// NamedSurfaceOpener is optional because only personal WeChat currently has a
+// semantic launcher for a mini program that is not backed by a message card.
+type NamedSurfaceOpener interface {
+	OpenNamedSurface(context.Context, NamedSurface) (Surface, error)
+}
+
+// SurfaceAssetExporter exports a rendered crop from the exact latest surface
+// snapshot. The opaque token is intentionally short-lived and generation-bound.
+type SurfaceAssetExporter interface {
+	ExportSurfaceAsset(context.Context, string, string) (SurfaceAssetExport, error)
 }

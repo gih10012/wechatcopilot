@@ -1,19 +1,293 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gih10012/wechatcopilot/internal/api"
 	"github.com/gih10012/wechatcopilot/internal/config"
 	"github.com/gih10012/wechatcopilot/internal/driver"
 	"github.com/gih10012/wechatcopilot/internal/driver/fake"
 	"github.com/gih10012/wechatcopilot/internal/service"
 )
+
+func TestRestoreRetryRecoversAfterDependencyBecomesReady(t *testing.T) {
+	var attempts int
+	var waits []time.Duration
+	var reports []int
+	temporary := errors.New("temporary Docker outage")
+	err := runRestoreRetry(context.Background(), restoreRetryPolicy{
+		maxAttempts: 5, initialBackoff: 10 * time.Millisecond, maxBackoff: 15 * time.Millisecond,
+		wait: func(_ context.Context, delay time.Duration) error {
+			waits = append(waits, delay)
+			return nil
+		},
+	}, func(context.Context) []error {
+		attempts++
+		if attempts < 3 {
+			return []error{temporary}
+		}
+		return nil
+	}, func(attempt, maximum int, err error) {
+		if maximum != 5 || !errors.Is(err, temporary) {
+			t.Fatalf("restore report = attempt %d/%d error %v", attempt, maximum, err)
+		}
+		reports = append(reports, attempt)
+	})
+	if err != nil {
+		t.Fatalf("late dependency recovery failed: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("restore attempts = %d, want 3", attempts)
+	}
+	wantWaits := []time.Duration{10 * time.Millisecond, 15 * time.Millisecond}
+	if len(waits) != len(wantWaits) {
+		t.Fatalf("restore waits = %v, want %v", waits, wantWaits)
+	}
+	for i := range waits {
+		if waits[i] != wantWaits[i] {
+			t.Fatalf("restore waits = %v, want %v", waits, wantWaits)
+		}
+	}
+	if len(reports) != 2 || reports[0] != 1 || reports[1] != 2 {
+		t.Fatalf("restore reports = %v, want [1 2]", reports)
+	}
+}
+
+func TestRestoreRetryStopsAtPermanentFailureLimit(t *testing.T) {
+	var attempts int
+	var waits int
+	permanent := errors.New("Docker remains unavailable")
+	err := runRestoreRetry(context.Background(), restoreRetryPolicy{
+		maxAttempts: 4, initialBackoff: time.Millisecond, maxBackoff: 2 * time.Millisecond,
+		wait: func(context.Context, time.Duration) error {
+			waits++
+			return nil
+		},
+	}, func(context.Context) []error {
+		attempts++
+		return []error{permanent}
+	}, nil)
+	if !errors.Is(err, permanent) {
+		t.Fatalf("permanent restore error = %v", err)
+	}
+	if attempts != 4 || waits != 3 {
+		t.Fatalf("permanent recovery attempts=%d waits=%d, want 4 and 3", attempts, waits)
+	}
+}
+
+func TestRestoreRetryCancellationInterruptsBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	result := make(chan error, 1)
+	var attempts atomic.Int32
+	go func() {
+		result <- runRestoreRetry(ctx, restoreRetryPolicy{
+			maxAttempts: 10, initialBackoff: time.Hour, maxBackoff: time.Hour,
+		}, func(context.Context) []error {
+			if attempts.Add(1) == 1 {
+				close(started)
+			}
+			return []error{errors.New("not ready")}
+		}, nil)
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("restore attempt did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled restore error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("restore backoff ignored cancellation")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("restore attempted %d times after cancellation", got)
+	}
+}
+
+func TestStopRestoreRecoveryWaitsForCanceledAttempt(t *testing.T) {
+	started := make(chan struct{})
+	exited := make(chan struct{})
+	var once sync.Once
+	server := &Server{
+		restore: func(ctx context.Context) []error {
+			once.Do(func() { close(started) })
+			<-ctx.Done()
+			close(exited)
+			return []error{ctx.Err()}
+		},
+		recoveryPolicy: restoreRetryPolicy{maxAttempts: 3, initialBackoff: time.Hour, maxBackoff: time.Hour},
+	}
+	server.startRestoreRecovery()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("restore attempt did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := server.stopRestoreRecovery(ctx); err != nil {
+		t.Fatalf("stop restore recovery: %v", err)
+	}
+	select {
+	case <-exited:
+	default:
+		t.Fatal("recovery stop returned before the active restore attempt exited")
+	}
+}
+
+func TestShutdownDoesNotCloseServiceAcrossStuckRestore(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	exited := make(chan struct{})
+	var closeCalls atomic.Int32
+	server := &Server{
+		httpServer: &http.Server{},
+		restore: func(ctx context.Context) []error {
+			close(started)
+			<-release
+			close(exited)
+			return []error{ctx.Err()}
+		},
+		closeService: func(context.Context) error {
+			closeCalls.Add(1)
+			return nil
+		},
+		recoveryPolicy: restoreRetryPolicy{maxAttempts: 3, initialBackoff: time.Hour, maxBackoff: time.Hour},
+	}
+	server.startRestoreRecovery()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("restore attempt did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := server.Shutdown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdown error = %v, want deadline exceeded", err)
+	}
+	if calls := closeCalls.Load(); calls != 0 {
+		t.Fatalf("service closed %d times while restore was still running", calls)
+	}
+	close(release)
+	select {
+	case <-exited:
+	case <-time.After(time.Second):
+		t.Fatal("canceled restore attempt did not exit")
+	}
+	if err := server.Shutdown(context.Background()); err != nil {
+		t.Fatalf("retry shutdown after restore exit: %v", err)
+	}
+	if calls := closeCalls.Load(); calls != 1 {
+		t.Fatalf("service close calls = %d, want 1", calls)
+	}
+}
+
+func TestRestoreRetryRejectsZeroBackoff(t *testing.T) {
+	var attempts atomic.Int32
+	err := runRestoreRetry(context.Background(), restoreRetryPolicy{maxAttempts: 2}, func(context.Context) []error {
+		attempts.Add(1)
+		return []error{errors.New("unavailable")}
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "positive initial backoff") {
+		t.Fatalf("zero-backoff retry error = %v", err)
+	}
+	if attempts.Load() != 0 {
+		t.Fatal("invalid zero-backoff policy entered a retry loop")
+	}
+}
+
+func TestSurfaceActInvalidArgumentIsHTTPBadRequest(t *testing.T) {
+	root := t.TempDir()
+	paths := config.Paths{
+		Home: filepath.Join(root, "state"), Accounts: filepath.Join(root, "state", "accounts"),
+		Downloads: filepath.Join(root, "state", "downloads"), Runtime: filepath.Join(root, "runtime"),
+		Socket: filepath.Join(root, "runtime", "daemon.sock"), Registry: filepath.Join(root, "state", "accounts.json"),
+	}
+	control, err := service.New(paths, map[driver.Platform]driver.Factory{
+		driver.PlatformWeChat: func(driver.AccountRuntime) (driver.Driver, error) {
+			return &invalidArgumentSurfaceDriver{Driver: fake.New(driver.PlatformWeChat)}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = control.Close(context.Background()) })
+	account, err := control.AddAccount("personal", driver.PlatformWeChat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.Activate(context.Background(), account.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	server := New(paths.Socket, control)
+	request := httptest.NewRequest(http.MethodPost, "/v1/surfaces/act", bytes.NewBufferString(
+		`{"account":"personal","id":"surface-1","action_id":"input"}`,
+	))
+	response := httptest.NewRecorder()
+	server.httpServer.Handler.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("surface act status = %d, want %d; body=%s", response.Code, http.StatusBadRequest, response.Body.String())
+	}
+	var envelope api.Response
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		t.Fatal(err)
+	}
+	if envelope.OK || envelope.Error == nil || envelope.Error.Code != api.CodeInvalidArgument {
+		t.Fatalf("surface act response = %#v, want INVALID_ARGUMENT", envelope)
+	}
+}
+
+type invalidArgumentSurfaceDriver struct {
+	*fake.Driver
+}
+
+func (d *invalidArgumentSurfaceDriver) ActSurface(context.Context, string, driver.SurfaceAction) (driver.Surface, error) {
+	return driver.Surface{}, driver.NewFailure(driver.FailureInvalidArgument, "fixture rejected surface action arguments")
+}
+
+func TestSurfaceActRequestPreservesExplicitEmptyText(t *testing.T) {
+	tests := []struct {
+		name         string
+		body         string
+		textProvided bool
+		text         string
+	}{
+		{name: "absent", body: `{"account":"personal","id":"surface-1","action_id":"read"}`},
+		{name: "explicit empty", body: `{"account":"personal","id":"surface-1","action_id":"input","text":""}`, textProvided: true},
+		{name: "non-empty", body: `{"account":"personal","id":"surface-1","action_id":"input","text":"宿舍"}`, textProvided: true, text: "宿舍"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var request surfaceActRequest
+			if err := json.Unmarshal([]byte(test.body), &request); err != nil {
+				t.Fatal(err)
+			}
+			action := request.action()
+			if action.TextProvided != test.textProvided || action.Text != test.text {
+				t.Fatalf("surface action = %#v, want TextProvided=%v Text=%q", action, test.textProvided, test.text)
+			}
+		})
+	}
+}
 
 func TestListenNeverDeletesRegularFile(t *testing.T) {
 	control, socket := testService(t)

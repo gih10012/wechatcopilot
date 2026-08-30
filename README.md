@@ -23,7 +23,10 @@ communication inside the official clients.
 | Official-account history | Unsupported without a versioned WCDB adapter | Not applicable |
 | Text send | Beta UI path | Experimental UI path |
 | Attachment send | Experimental | Unsupported |
-| Message-backed webpages / mini programs | Experimental semantic actions | Experimental semantic actions |
+| Message-backed webpages / mini programs | Experimental | Experimental |
+| Open a mini program by exact name | Experimental | Unsupported |
+| Semantic snapshots and actions | Experimental | Experimental |
+| Rendered viewport / semantic-region export | Experimental | Unsupported |
 | Session persistence | Profile is persisted; real restart acceptance pending | Android `/data` is persisted; real restart acceptance pending |
 
 The two platforms may run concurrently. Activating a second account on the same
@@ -51,8 +54,12 @@ Agent -> Skill / MCP / CLI -> local Unix socket -> policy service
   `docker exec` requests to Android loopback.
 - Sends use `prepare -> inspect -> confirmed commit`, a persistent idempotency
   journal, and no automatic retry after an uncertain UI result.
-- Surface actions use opaque semantic IDs. Payment, transfer, authorization,
-  identity, account-security, and other high-risk screens stop for the user.
+- Surfaces expose a screenshot-bound observation plus elements, bounds, and
+  opaque semantic action IDs. Agents observe again after every action instead
+  of assuming a mini program follows a fixed flow.
+- Surface actions are one-shot and target-local. Payment, transfer,
+  authorization, identity, account-security, and other high-risk actions are
+  never dispatched; externally visible writes require current user approval.
 
 See [architecture](docs/architecture.md), [security model](docs/security.md),
 and [agent guide](docs/agent-guide.md) for the detailed boundaries.
@@ -171,6 +178,26 @@ code, raw X11, ADB, database, container, or shell tool. The repository's
 [`wechatcopilot` Skill](skills/wechatcopilot/SKILL.md), also included in Linux
 release archives, adds account-selection, capability, confirmation,
 partial-read, and uncertain-send policy for cooperative agents.
+
+Mini programs use a general observation loop rather than app-specific scripts:
+
+```bash
+./bin/wechatcopilot surfaces open \
+  --account ACCOUNT_ID --mini-program CAMPUS_APP --without-image-data --json
+./bin/wechatcopilot surfaces snapshot \
+  --account ACCOUNT_ID --surface SURFACE_ID --without-image-data --json
+./bin/wechatcopilot surfaces act \
+  --account ACCOUNT_ID --surface SURFACE_ID --action ACTION_ID \
+  --without-image-data --json
+```
+
+Inspect the fields returned at every step, then snapshot again after navigation,
+input, or scrolling. On the current personal-WeChat path, each snapshot includes
+elements, actions, and a generation-bound full-window `rendered_viewport` asset;
+accessible image nodes may add tighter rendered crops. Current WeCom may expose
+only its matching screenshot and actions and does not advertise asset export.
+Rendered crops are not original-media downloads. This path remains experimental
+and has not completed real-client end-to-end acceptance.
 
 MCP and the Skill are behavioral guardrails, not a same-UID security sandbox.
 Every process running as the daemon's Unix user can access that user's files

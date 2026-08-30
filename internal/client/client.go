@@ -19,6 +19,19 @@ type Client struct {
 	http   *http.Client
 }
 
+// A surface response can contain a base64-encoded screenshot whose decoded
+// size is capped at 32 MiB by the runtime. 48 MiB leaves room for base64 and
+// the bounded surface metadata while still placing a hard limit on the local
+// daemon protocol.
+const maxDaemonResponseBytes int64 = 48 << 20
+
+type responseEnvelope struct {
+	SchemaVersion string          `json:"schema_version"`
+	OK            bool            `json:"ok"`
+	Data          json.RawMessage `json:"data,omitempty"`
+	Error         *api.Error      `json:"error,omitempty"`
+}
+
 func New(socket string) *Client {
 	dialer := &net.Dialer{Timeout: 2 * time.Second}
 	transport := &http.Transport{
@@ -59,10 +72,9 @@ func (c *Client) call(ctx context.Context, method, path string, input, out any) 
 		return api.WrapError(http.StatusServiceUnavailable, api.CodeDaemonUnavailable, "wechatcopilot daemon is unavailable", err)
 	}
 	defer response.Body.Close()
-	var envelope api.Response
-	decoder := json.NewDecoder(io.LimitReader(response.Body, 32<<20))
-	if err := decoder.Decode(&envelope); err != nil {
-		return fmt.Errorf("decode daemon response: %w", err)
+	envelope, err := decodeDaemonResponse(response.Body, maxDaemonResponseBytes)
+	if err != nil {
+		return err
 	}
 	if !envelope.OK {
 		if envelope.Error == nil {
@@ -70,12 +82,33 @@ func (c *Client) call(ctx context.Context, method, path string, input, out any) 
 		}
 		return &api.AppError{Status: response.StatusCode, Code: envelope.Error.Code, Message: envelope.Error.Message, Details: envelope.Error.Details}
 	}
-	if out == nil || envelope.Data == nil {
+	if out == nil || len(envelope.Data) == 0 || bytes.Equal(envelope.Data, []byte("null")) {
 		return nil
 	}
-	contents, err := json.Marshal(envelope.Data)
-	if err != nil {
-		return err
+	return json.Unmarshal(envelope.Data, out)
+}
+
+func decodeDaemonResponse(body io.Reader, maximum int64) (responseEnvelope, error) {
+	if maximum <= 0 {
+		return responseEnvelope{}, errors.New("decode daemon response: invalid response limit")
 	}
-	return json.Unmarshal(contents, out)
+	limited := &io.LimitedReader{R: body, N: maximum + 1}
+	decoder := json.NewDecoder(limited)
+	var envelope responseEnvelope
+	decodeErr := decoder.Decode(&envelope)
+	var trailing json.RawMessage
+	trailingErr := decoder.Decode(&trailing)
+	if limited.N == 0 {
+		return responseEnvelope{}, fmt.Errorf("decode daemon response: response exceeds %d bytes", maximum)
+	}
+	if decodeErr != nil {
+		return responseEnvelope{}, fmt.Errorf("decode daemon response: %w", decodeErr)
+	}
+	if !errors.Is(trailingErr, io.EOF) {
+		if trailingErr == nil {
+			trailingErr = errors.New("multiple JSON values")
+		}
+		return responseEnvelope{}, fmt.Errorf("decode daemon response: trailing data: %w", trailingErr)
+	}
+	return envelope, nil
 }

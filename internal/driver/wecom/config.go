@@ -127,7 +127,11 @@ func accountDataDir(stateDir, accountID string) (string, error) {
 	if !filepath.IsAbs(stateDir) {
 		return "", errors.New("account state directory must be absolute")
 	}
-	return filepath.Join(filepath.Clean(stateDir), "wecom", "android-data"), nil
+	stateDir = filepath.Clean(stateDir)
+	if filepath.Base(stateDir) != accountID {
+		return "", errors.New("account state directory is not bound to the account ID")
+	}
+	return filepath.Join(stateDir, "wecom", "android-data"), nil
 }
 
 func allowedAPKHost(host string) bool {

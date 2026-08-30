@@ -31,9 +31,9 @@ import (
 const (
 	challengeTTL       = 10 * time.Minute
 	completedRetention = 60 * time.Second
-	// Three onboarding stages may each make one bounded retry before the
-	// challenge fails closed.
-	maxAuthActionAttemptsPerAction    = 2
+	// A confirmed generation is preconsumed before driver invocation. The
+	// challenge also has a total cap for distinct logical onboarding stages.
+	maxAuthActionAttemptsPerAction    = 1
 	maxAuthActionAttemptsPerChallenge = 6
 )
 
@@ -68,6 +68,7 @@ type entry struct {
 	totalActionAttempts int
 	actionInFlight      bool
 	performedActions    map[string]bool
+	performedReplayKeys map[string]bool
 	lastObservedAt      time.Time
 	closed              bool
 	done                chan struct{}
@@ -140,7 +141,8 @@ func (m *Manager) Begin(ctx context.Context, accountID string, instance driver.D
 	item := &entry{
 		public: public, token: token, driver: instance, listener: listener,
 		actionAttempts: make(map[string]int), performedActions: make(map[string]bool),
-		lastObservedAt: snapshot.ObservedAt, done: make(chan struct{}),
+		performedReplayKeys: make(map[string]bool),
+		lastObservedAt:      snapshot.ObservedAt, done: make(chan struct{}),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, item.handlePage)
@@ -452,13 +454,19 @@ func (e *entry) availableAuthActionsLocked(snapshot driver.AuthSnapshot) []drive
 		return nil
 	}
 	counts := make(map[string]int, len(snapshot.Actions))
+	replayCounts := make(map[string]int, len(snapshot.Actions))
 	for _, action := range snapshot.Actions {
 		counts[action.ID]++
+		if replayKey, ok := authActionReplayKey(action); ok {
+			replayCounts[replayKey]++
+		}
 	}
 	result := make([]driver.AuthAction, 0, len(snapshot.Actions))
 	for _, action := range snapshot.Actions {
+		replayKey, validReplayKey := authActionReplayKey(action)
 		if action.ID == "" || strings.TrimSpace(action.ID) != action.ID || counts[action.ID] != 1 ||
-			e.performedActions[action.ID] || e.actionAttempts[action.ID] >= maxAuthActionAttemptsPerAction {
+			!validReplayKey || replayCounts[replayKey] != 1 || e.performedActions[action.ID] ||
+			e.performedReplayKeys[replayKey] || e.actionAttempts[action.ID] >= maxAuthActionAttemptsPerAction {
 			continue
 		}
 		result = append(result, action)
@@ -466,10 +474,35 @@ func (e *entry) availableAuthActionsLocked(snapshot driver.AuthSnapshot) []drive
 	return result
 }
 
+func authActionReplayKey(action driver.AuthAction) (string, bool) {
+	key := action.ReplayKey
+	if key == "" {
+		// Legacy/static drivers retain their original one-ID replay scope.
+		key = action.ID
+	}
+	if key == "" || strings.TrimSpace(key) != key || len(key) > 256 {
+		return "", false
+	}
+	for _, character := range key {
+		if character < 0x21 || character > 0x7e {
+			return "", false
+		}
+	}
+	return key, true
+}
+
 func (e *entry) handleImage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+	actionID := ""
+	if values, present := r.URL.Query()["action_id"]; present {
+		if len(values) != 1 || values[0] == "" || strings.TrimSpace(values[0]) != values[0] || len(values[0]) > 512 {
+			http.Error(w, "invalid authentication image binding", http.StatusBadRequest)
+			return
+		}
+		actionID = values[0]
 	}
 	e.mu.Lock()
 	unavailable := e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.completedLocked()
@@ -493,9 +526,22 @@ func (e *entry) handleImage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "login image is no longer available", http.StatusGone)
 		return
 	}
-	image := snapshot.QRCodePNG
-	if len(image) == 0 {
+	var image []byte
+	if actionID != "" {
+		replayKey, validBinding := uniqueImageBoundAction(snapshot, actionID)
+		e.mu.Lock()
+		consumedBinding := e.actionInFlight || e.performedActions[actionID] || e.performedReplayKeys[replayKey]
+		e.mu.Unlock()
+		if !validBinding || consumedBinding || len(snapshot.ScreenshotPNG) == 0 {
+			http.Error(w, "authentication image binding is stale", http.StatusConflict)
+			return
+		}
 		image = snapshot.ScreenshotPNG
+	} else {
+		image = snapshot.QRCodePNG
+		if len(image) == 0 {
+			image = snapshot.ScreenshotPNG
+		}
 	}
 	if len(image) == 0 {
 		http.Error(w, "login image not available", http.StatusNotFound)
@@ -503,6 +549,39 @@ func (e *entry) handleImage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "image/png")
 	_, _ = w.Write(image)
+}
+
+func uniqueImageBoundAction(snapshot driver.AuthSnapshot, actionID string) (string, bool) {
+	if snapshot.State != driver.StateAuthRequired {
+		return "", false
+	}
+	matches := 0
+	targetReplayKey := ""
+	for _, action := range snapshot.Actions {
+		if action.ID != actionID {
+			continue
+		}
+		if !action.ImageBound {
+			return "", false
+		}
+		replayKey, ok := authActionReplayKey(action)
+		if !ok {
+			return "", false
+		}
+		targetReplayKey = replayKey
+		matches++
+	}
+	if matches != 1 {
+		return "", false
+	}
+	replayMatches := 0
+	for _, action := range snapshot.Actions {
+		replayKey, ok := authActionReplayKey(action)
+		if ok && replayKey == targetReplayKey {
+			replayMatches++
+		}
+	}
+	return targetReplayKey, replayMatches == 1
 }
 
 func (e *entry) handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -638,7 +717,7 @@ func (e *entry) submitCode(ctx context.Context, code string) (err error) {
 	return e.driver.SubmitAuthCode(ctx, code)
 }
 
-func (e *entry) performAuthAction(ctx context.Context, actionID string, confirmed bool) (err error) {
+func (e *entry) performAuthAction(ctx context.Context, actionID string, confirmed bool) error {
 	actionID = strings.TrimSpace(actionID)
 	e.mu.Lock()
 	if e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.completedLocked() {
@@ -662,12 +741,6 @@ func (e *entry) performAuthAction(ctx context.Context, actionID string, confirme
 	defer func() {
 		e.mu.Lock()
 		e.actionInFlight = false
-		if err == nil || driver.AuthActionWasConsumed(err) {
-			if e.performedActions == nil {
-				e.performedActions = make(map[string]bool)
-			}
-			e.performedActions[actionID] = true
-		}
 		e.mu.Unlock()
 	}()
 
@@ -694,6 +767,20 @@ func (e *entry) performAuthAction(ctx context.Context, actionID string, confirme
 	if advertised == nil {
 		return errActionUnavailable
 	}
+	replayKey, validReplayKey := authActionReplayKey(*advertised)
+	if !validReplayKey {
+		return errActionUnavailable
+	}
+	replayMatches := 0
+	for _, action := range snapshot.Actions {
+		candidate, ok := authActionReplayKey(action)
+		if ok && candidate == replayKey {
+			replayMatches++
+		}
+	}
+	if replayMatches != 1 {
+		return errActionUnavailable
+	}
 	actor, ok := e.driver.(driver.AuthActionDriver)
 	if !ok {
 		return errActionUnavailable
@@ -706,6 +793,16 @@ func (e *entry) performAuthAction(ctx context.Context, actionID string, confirme
 	if e.actionAttempts == nil {
 		e.actionAttempts = make(map[string]int)
 	}
+	if e.performedActions == nil {
+		e.performedActions = make(map[string]bool)
+	}
+	if e.performedReplayKeys == nil {
+		e.performedReplayKeys = make(map[string]bool)
+	}
+	if e.performedActions[actionID] || e.performedReplayKeys[replayKey] {
+		e.mu.Unlock()
+		return errActionUnavailable
+	}
 	if e.actionAttempts[actionID] >= maxAuthActionAttemptsPerAction ||
 		e.totalActionAttempts >= maxAuthActionAttemptsPerChallenge {
 		e.mu.Unlock()
@@ -713,6 +810,11 @@ func (e *entry) performAuthAction(ctx context.Context, actionID string, confirme
 	}
 	e.actionAttempts[actionID]++
 	e.totalActionAttempts++
+	// Consume both the concrete generation and its logical operation before
+	// crossing into the driver. No result can prove a failed call was harmless
+	// enough to replay automatically.
+	e.performedActions[actionID] = true
+	e.performedReplayKeys[replayKey] = true
 	e.mu.Unlock()
 	return actor.PerformAuthAction(ctx, driver.AuthActionRequest{ActionID: actionID, Confirmed: confirmed})
 }
@@ -974,6 +1076,7 @@ const actionButtons=document.querySelector('#action-buttons');
 let screen=document.querySelector('.screen');
 const screenLink=document.querySelector('.screen-link');
 let actionSignature='';
+let imageBoundActionID='';
 let imageRefreshes=0;
 let imageGeneration=0;
 let uiGeneration=0;
@@ -981,7 +1084,7 @@ let stateInFlight=false;
 let pollTimer=0;
 let completed=false;
 function refreshImage(){
-  if(completed)return;
+  if(completed||imageBoundActionID)return;
   const generation=++imageGeneration;
   const source=base+'/image?v='+Date.now();
   const candidate=new Image();
@@ -1000,17 +1103,38 @@ async function performAction(action,button){
     const response=await fetch(base+'/action',{method:'POST',headers:{'content-type':'application/json','X-WeChatCopilot-Action':'user-confirmed'},body:JSON.stringify({action_id:action.id,confirmed:true})});
     if(completed||generation!==uiGeneration)return;
     prompt.textContent=response.ok?'操作已提交，正在刷新官方客户端画面':'操作不可用；请确认页面未变化后重试';
-    if(response.ok){actionSignature='';refreshImage();scheduleState(0)}else{button.disabled=false}
+    if(response.ok){actionSignature='';imageBoundActionID='';refreshImage();scheduleState(0)}else{button.disabled=false}
   }catch(_error){if(!completed&&generation===uiGeneration){prompt.textContent='无法连接登录服务，请稍后重试';button.disabled=false;scheduleState(0)}}
+}
+function populateActionButtons(available){
+  actionButtons.replaceChildren();
+  for(const action of available){const button=document.createElement('button');button.type='button';button.className='auth-action';button.textContent=action.label;button.addEventListener('click',()=>performAction(action,button));actionButtons.append(button)}
+  actions.hidden=available.length===0;
 }
 function renderActions(values){
   const available=Array.isArray(values)?values:[];
   const signature=JSON.stringify(available);
   if(signature===actionSignature)return;
   actionSignature=signature;
+  imageGeneration++;
+  const hadImageBound=imageBoundActionID!=='';
+  imageBoundActionID='';
+  const bound=available.filter(action=>action&&action.image_bound===true);
+  if(bound.length===0){populateActionButtons(available);if(hadImageBound)refreshImage();return}
   actionButtons.replaceChildren();
-  for(const action of available){const button=document.createElement('button');button.type='button';button.className='auth-action';button.textContent=action.label;button.addEventListener('click',()=>performAction(action,button));actionButtons.append(button)}
-  actions.hidden=available.length===0;
+  actions.hidden=true;
+  screenLink.hidden=true;
+  if(bound.length!==1)return;
+  const action=bound[0];
+  imageBoundActionID=action.id;
+  const generation=++imageGeneration;
+  const source=base+'/image?action_id='+encodeURIComponent(action.id)+'&v='+Date.now();
+  const candidate=new Image();
+  candidate.className='screen';
+  candidate.alt=screen.alt;
+  candidate.onload=()=>{if(completed||generation!==imageGeneration||signature!==actionSignature||imageBoundActionID!==action.id)return;screen.replaceWith(candidate);screen=candidate;screenLink.href=source;screenLink.hidden=false;populateActionButtons(available)};
+  candidate.onerror=()=>{if(completed||generation!==imageGeneration||signature!==actionSignature)return;actionSignature='';imageBoundActionID='';actions.hidden=true};
+  candidate.src=source;
 }
 async function refreshState(){
   if(completed||stateInFlight)return;

@@ -13,6 +13,26 @@ import (
 	"time"
 )
 
+func TestAndroidContainerExecTargetsImmutableResolvedContainerID(t *testing.T) {
+	executor := &recordingExecutor{output: []byte("ok")}
+	immutableID := testContainerID("immutable-container-id")
+	android := AndroidContainer{
+		DockerBinary: "docker", Container: "mutable-account-name", Executor: executor,
+		Resolve: func(context.Context) (string, error) { return immutableID, nil },
+	}
+	if _, err := android.run(context.Background(), "/system/bin/toybox", "true"); err != nil {
+		t.Fatal(err)
+	}
+	if len(executor.calls) != 1 {
+		t.Fatalf("Android exec calls = %d", len(executor.calls))
+	}
+	args := executor.calls[0].args
+	if len(args) < 4 || args[0] != "container" || args[1] != "exec" ||
+		args[2] != immutableID || args[2] == android.Container {
+		t.Fatalf("Android exec did not use immutable resolved container ID: %v", args)
+	}
+}
+
 func TestAndroidContainerPackageVersionRequiresInstalledPackage(t *testing.T) {
 	executor := &sequenceExecutor{results: []executorResult{
 		{output: []byte("package:/data/app/com.tencent.wework/base.apk\n")},
@@ -105,14 +125,14 @@ func TestAndroidInstallCopiesDigestCheckedSnapshotAndCleansIt(t *testing.T) {
 		}
 	})
 	android := AndroidContainer{
-		DockerBinary: "docker", Container: "synthetic", Executor: executor,
-		Verify: func(context.Context) error { return nil },
+		DockerBinary: "docker", Container: "mutable-name", Executor: executor,
+		Resolve: func(context.Context) (string, error) { return testContainerID("immutable-install-id"), nil },
 	}
 	if err := android.Install(context.Background(), hostPath, containerPath, digest); err != nil {
 		t.Fatal(err)
 	}
 	joined := fmt.Sprint(commands)
-	if !strings.Contains(joined, "container cp "+hostPath+" synthetic:"+containerPath) ||
+	if !strings.Contains(joined, "container cp "+hostPath+" "+testContainerID("immutable-install-id")+":"+containerPath) ||
 		!strings.Contains(joined, "/system/bin/pm install -r "+containerPath) {
 		t.Fatalf("install did not use the fixed copy/install path: %s", joined)
 	}
@@ -121,6 +141,9 @@ func TestAndroidInstallCopiesDigestCheckedSnapshotAndCleansIt(t *testing.T) {
 	}
 	if strings.Contains(joined, " sh ") || strings.Contains(joined, "adb") {
 		t.Fatalf("install escaped the fixed direct-exec command set: %s", joined)
+	}
+	if strings.Contains(joined, "mutable-name") {
+		t.Fatalf("install used the mutable container name after immutable resolution: %s", joined)
 	}
 }
 

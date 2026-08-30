@@ -14,6 +14,7 @@ import (
 	"github.com/gih10012/wechatcopilot/internal/api"
 	"github.com/gih10012/wechatcopilot/internal/client"
 	"github.com/gih10012/wechatcopilot/internal/config"
+	"github.com/gih10012/wechatcopilot/internal/driver/wecom"
 	"github.com/spf13/cobra"
 )
 
@@ -26,6 +27,7 @@ type application struct {
 	stdout                      io.Writer
 	stderr                      io.Writer
 	validateSwapConfidentiality func() error
+	legacyWeComExecutor         wecom.Executor
 }
 
 func NewRoot(version string, stdin io.Reader, stdout, stderr io.Writer) *cobra.Command {
@@ -33,9 +35,20 @@ func NewRoot(version string, stdin io.Reader, stdout, stderr io.Writer) *cobra.C
 }
 
 func newRoot(version string, stdin io.Reader, stdout, stderr io.Writer, validateSwapConfidentiality func() error) *cobra.Command {
+	return newRootWithDependencies(version, stdin, stdout, stderr, validateSwapConfidentiality, nil)
+}
+
+func newRootWithDependencies(
+	version string,
+	stdin io.Reader,
+	stdout, stderr io.Writer,
+	validateSwapConfidentiality func() error,
+	legacyWeComExecutor wecom.Executor,
+) *cobra.Command {
 	a := &application{
 		version: version, stdin: stdin, stdout: stdout, stderr: stderr,
 		validateSwapConfidentiality: validateSwapConfidentiality,
+		legacyWeComExecutor:         legacyWeComExecutor,
 	}
 	root := &cobra.Command{
 		Use:           "wechatcopilot",

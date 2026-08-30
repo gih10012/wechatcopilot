@@ -1,8 +1,10 @@
 package wechat
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -124,6 +126,123 @@ func TestDockerBackendUsesOnlyIsolatedProfileMounts(t *testing.T) {
 	if !strings.Contains(string(last.Stdin), "123456") {
 		t.Fatal("authentication code was not passed through stdin")
 	}
+}
+
+func TestDockerBackendParsesOnlyFixedSavedAccountAuthAction(t *testing.T) {
+	runner := &dockerFixtureRunner{}
+	backend := activeDockerControlFixture(t, runner)
+	generation := strings.Repeat("a", 64)
+	screenshot := testSurfacePNG(t, 8, 6)
+	digest := sha256.Sum256(screenshot)
+	screenshotSHA256 := hex.EncodeToString(digest[:])
+	runner.execResponse = mustMarshalFixture(map[string]any{
+		"ok": true, "state": "AUTH_REQUIRED", "auth_kind": "phone_confirmation",
+		"prompt": "Confirm saved account", "auth_generation": generation,
+		"screenshot_base64": base64.StdEncoding.EncodeToString(screenshot), "screenshot_sha256": screenshotSHA256,
+		"actions": []map[string]any{{
+			"id": savedAccountLoginActionPrefix + generation, "label": "runtime-controlled label",
+			"risk": "low", "confirmation": "runtime-controlled confirmation",
+			"requires_confirmation": true, "image_bound": true,
+		}},
+	})
+	probe, err := backend.Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := savedAccountLoginAction(generation)
+	if len(probe.Actions) != 1 || probe.Actions[0] != want {
+		t.Fatalf("canonical authentication actions = %#v, want %#v", probe.Actions, want)
+	}
+	if !bytes.Equal(probe.ScreenshotPNG, screenshot) {
+		t.Fatal("backend did not preserve the screenshot bound to the authentication action")
+	}
+
+	invalid := []map[string]any{
+		{
+			"ok": true, "state": "ONLINE", "auth_kind": "phone_confirmation",
+			"auth_generation": generation, "screenshot_base64": base64.StdEncoding.EncodeToString(screenshot),
+			"screenshot_sha256": screenshotSHA256,
+			"actions":           []map[string]any{{"id": savedAccountLoginActionPrefix + generation, "requires_confirmation": true, "image_bound": true}},
+		},
+		{
+			"ok": true, "state": "AUTH_REQUIRED", "auth_kind": "phone_confirmation",
+			"auth_generation": generation, "screenshot_base64": base64.StdEncoding.EncodeToString(screenshot),
+			"screenshot_sha256": screenshotSHA256,
+			"actions":           []map[string]any{{"id": "arbitrary_action", "requires_confirmation": true, "image_bound": true}},
+		},
+		{
+			"ok": true, "state": "AUTH_REQUIRED", "auth_kind": "phone_confirmation",
+			"auth_generation": generation, "screenshot_base64": base64.StdEncoding.EncodeToString(screenshot),
+			"screenshot_sha256": screenshotSHA256,
+			"actions":           []map[string]any{{"id": savedAccountLoginActionPrefix + generation, "requires_confirmation": true}},
+		},
+		{
+			"ok": true, "state": "AUTH_REQUIRED", "auth_kind": "phone_confirmation",
+			"auth_generation": generation, "screenshot_base64": base64.StdEncoding.EncodeToString(screenshot),
+			"screenshot_sha256": strings.Repeat("f", 64),
+			"actions":           []map[string]any{{"id": savedAccountLoginActionPrefix + generation, "requires_confirmation": true, "image_bound": true}},
+		},
+		{
+			"ok": true, "state": "AUTH_REQUIRED", "auth_kind": "phone_confirmation",
+			"auth_generation": generation, "screenshot_base64": base64.StdEncoding.EncodeToString(screenshot),
+			"screenshot_sha256": screenshotSHA256,
+		},
+	}
+	for index, response := range invalid {
+		runner.execResponse = mustMarshalFixture(response)
+		if _, err := backend.Probe(context.Background()); !errors.Is(err, ErrClientIncompatible) {
+			t.Fatalf("invalid authentication action response %d error = %v, want ErrClientIncompatible", index, err)
+		}
+	}
+}
+
+func TestDockerBackendSavedAccountLoginUsesFixedLocatorFreeOperation(t *testing.T) {
+	runner := &dockerFixtureRunner{execResponse: []byte(`{"ok":true,"consumed":true}`)}
+	backend := activeDockerControlFixture(t, runner)
+	generation := strings.Repeat("b", 64)
+	if err := backend.ContinueSavedAccountLogin(context.Background(), generation); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("authentication action commands = %d, want 1", len(runner.commands))
+	}
+	var request map[string]any
+	if err := json.Unmarshal(runner.commands[0].Stdin, &request); err != nil {
+		t.Fatal(err)
+	}
+	if len(request) != 2 || request["operation"] != continueSavedAccountLoginOperation ||
+		request["expected_auth_generation"] != generation {
+		t.Fatalf("authentication control request must contain only its fixed operation and opaque generation: %#v", request)
+	}
+
+	runner.execResponse = []byte(`{"ok":false,"code":"ACTION_OUTCOME_UNCERTAIN","error":"response lost after activation","consumed":true}`)
+	err := backend.ContinueSavedAccountLogin(context.Background(), generation)
+	if err == nil || !shared.AuthActionWasConsumed(err) {
+		t.Fatalf("consumed control failure = %v, want consumed marker", err)
+	}
+	commands := len(runner.commands)
+	if err := backend.ContinueSavedAccountLogin(context.Background(), strings.Repeat("A", 64)); !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("invalid authentication generation error = %v, want ErrInvalidArgument", err)
+	}
+	if len(runner.commands) != commands {
+		t.Fatal("invalid authentication generation reached the control process")
+	}
+}
+
+func activeDockerControlFixture(t *testing.T, runner CommandRunner) *DockerBackend {
+	t.Helper()
+	backend, err := NewDockerBackend(DockerConfig{
+		Image:                  "wechatcopilot/wechat-runtime:test",
+		AppImagePath:           filepath.Join(t.TempDir(), "unused.AppImage"),
+		ExpectedAppImageSHA256: strings.Repeat("0", 64),
+		Runner:                 runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.profile = &Profile{}
+	backend.container = "wechatcopilot-wechat-fixture"
+	return backend
 }
 
 func writeAppImageFixture(t *testing.T, path, payload string) string {
@@ -605,7 +724,207 @@ func TestDockerBackendClassifiesStaleSurfaceLocator(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner.execResponse = []byte(`{"ok":false,"code":"ACTION_STALE","error":"surface changed"}`)
-	if _, err := backend.ActSurface(context.Background(), "opaque-locator", ""); !errors.Is(err, ErrActionStale) {
+	if _, err := backend.ActSurface(context.Background(), "window-1", "opaque-locator", ""); !errors.Is(err, ErrActionStale) {
 		t.Fatalf("ActSurface error = %v, want ErrActionStale", err)
+	}
+}
+
+func TestDockerBackendUsesEmbeddedFrameForNamedSurface(t *testing.T) {
+	root := t.TempDir()
+	appImage := filepath.Join(root, "WeChat.AppImage")
+	appDigest := writeAppImageFixture(t, appImage, "fixture")
+	profile, err := (ProfileManager{}).Ensure(sharedAccountFixture(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &dockerFixtureRunner{image: fixtureRuntimeImage()}
+	backend, err := NewDockerBackend(DockerConfig{
+		Image: "wechatcopilot/wechat-runtime:test", AppImagePath: appImage,
+		ExpectedAppImageSHA256: appDigest, Runner: runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Start(context.Background(), profile); err != nil {
+		t.Fatal(err)
+	}
+	screenshot := []byte("one exact embedded frame")
+	digest := sha256.Sum256(screenshot)
+	runner.commands = nil
+	runner.execResponse = mustMarshalFixture(map[string]any{
+		"ok": true,
+		"surface": map[string]any{
+			"kind": "miniprogram", "title": "校园瞄", "generation": "generation-1",
+			"window_identity": "window-token", "screenshot_base64": base64.StdEncoding.EncodeToString(screenshot),
+			"screenshot_sha256": hex.EncodeToString(digest[:]),
+			"viewport": map[string]any{
+				"bounds": []int{0, 0, 80, 60}, "generation": "generation-1",
+				"screenshot_sha256": hex.EncodeToString(digest[:]), "window_identity": "window-token",
+			},
+			"elements": []map[string]any{
+				{
+					"id": "element-1", "target_id": "target-1", "label": "宿舍", "role": "text",
+					"bounds": []int{2, 3, 20, 10}, "source": "atspi", "confidence": 1.0,
+					"locator": "element-locator-with-issued-time-100",
+				},
+				{
+					"id": "element-2", "target_id": "target-2", "label": "宿舍", "role": "text",
+					"bounds": []int{32, 3, 20, 10}, "source": "atspi", "confidence": 1.0,
+					"locator": "element-locator-with-issued-time-100-other",
+				},
+			},
+			"assets": []map[string]any{{
+				"id": "asset-1", "token": "asset-backend", "role": "image", "bounds": []int{5, 7, 30, 20},
+				"source": "atspi", "confidence": 0.95,
+			}},
+			"actions": []map[string]any{
+				{
+					"id": "action-1", "replay_id": "replay-1", "target_id": "target-1", "label": "宿舍", "kind": "activate",
+					"risk": "medium", "effect": "navigate", "locator": "action-locator-with-issued-time-101",
+				},
+				{
+					"id": "action-2", "replay_id": "replay-2", "target_id": "target-2", "label": "宿舍", "kind": "activate",
+					"risk": "medium", "effect": "navigate", "locator": "action-locator-with-issued-time-101-other",
+				},
+			},
+		},
+	})
+	surface, err := backend.OpenNamedSurface(context.Background(), "miniprogram", "校园瞄")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(surface.Screenshot) != string(screenshot) || surface.ScreenshotSHA256 != hex.EncodeToString(digest[:]) {
+		t.Fatal("backend did not preserve the exact embedded screenshot")
+	}
+	if surface.WindowIdentity != "window-token" || surface.Viewport == nil || surface.Viewport.Width != 80 {
+		t.Fatalf("surface frame identity/viewport = %#v", surface)
+	}
+	if len(surface.Elements) != 2 || surface.Elements[0].Bounds.X != 2 || surface.Elements[0].ActionID != "action-1" ||
+		len(surface.Elements[0].ActionIDs) != 1 || surface.Elements[0].ActionIDs[0] != "action-1" ||
+		surface.Elements[1].ActionID != "action-2" || surface.Elements[0].Label != surface.Elements[1].Label ||
+		surface.Elements[0].TargetID == surface.Elements[1].TargetID {
+		t.Fatalf("dynamic elements = %#v", surface.Elements)
+	}
+	if len(surface.Assets) != 1 || surface.Assets[0].Kind != "image" || len(surface.Actions) != 2 ||
+		surface.Actions[0].Action.Effect != "navigate" || surface.Actions[0].Action.TargetID != "target-1" ||
+		surface.Actions[0].ReplayID != "replay-1" || surface.Actions[1].Action.TargetID != "target-2" ||
+		surface.Actions[1].ReplayID != "replay-2" {
+		t.Fatalf("dynamic assets/actions = %#v / %#v", surface.Assets, surface.Actions)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("embedded snapshot unexpectedly triggered another capture: %#v", runner.commands)
+	}
+	var request controlRequest
+	if err := json.Unmarshal(runner.commands[0].Stdin, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Operation != "open_named_surface" || request.Kind != "miniprogram" || request.Name != "校园瞄" {
+		t.Fatalf("named surface request = %#v", request)
+	}
+	runner.commands = nil
+	if _, err := backend.SnapshotSurface(context.Background(), "window-token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(runner.commands[0].Stdin, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Operation != "snapshot_surface" || request.ExpectedWindowIdentity != "window-token" {
+		t.Fatalf("bound snapshot request = %#v", request)
+	}
+}
+
+func TestDockerBackendBindsMessageSurfaceKind(t *testing.T) {
+	root := t.TempDir()
+	appImage := filepath.Join(root, "WeChat.AppImage")
+	appDigest := writeAppImageFixture(t, appImage, "fixture")
+	profile, err := (ProfileManager{}).Ensure(sharedAccountFixture(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &dockerFixtureRunner{image: fixtureRuntimeImage()}
+	backend, err := NewDockerBackend(DockerConfig{
+		Image: "wechatcopilot/wechat-runtime:test", AppImagePath: appImage,
+		ExpectedAppImageSHA256: appDigest, Runner: runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Start(context.Background(), profile); err != nil {
+		t.Fatal(err)
+	}
+	runner.execResponse = mustMarshalFixture(map[string]any{
+		"ok": true, "conversation_title": "Fixture chat", "conversation_locator": "conversation-locator",
+		"messages": []map[string]any{{
+			"text": "article", "kind": "link", "accessible_label": "Example article",
+			"surface_kind": "web", "surface_locator": "signed-card-locator", "confidence": 0.9,
+		}},
+	})
+	visible, err := backend.ReadVisibleMessages(context.Background(), "Fixture chat", "conversation-locator")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(visible.Messages) != 1 || visible.Messages[0].SurfaceLocator != "signed-card-locator" {
+		t.Fatalf("message surface locator was not parsed: %#v", visible.Messages)
+	}
+	screenshot := testSurfacePNG(t, 3, 2)
+	digest := sha256.Sum256(screenshot)
+	runner.execResponse = mustMarshalFixture(map[string]any{
+		"ok": true,
+		"surface": map[string]any{
+			"kind": "web", "generation": "web-generation", "window_identity": "web-window",
+			"screenshot_base64": base64.StdEncoding.EncodeToString(screenshot),
+			"screenshot_sha256": hex.EncodeToString(digest[:]),
+		},
+	})
+	runner.commands = nil
+	_, err = backend.OpenSurface(context.Background(), SurfaceTarget{
+		Reference: "surface-ref", ConversationID: "chat-1", ConversationTitle: "Fixture chat",
+		ConversationLocator: "conversation-locator", AccessibleLabel: "Example article", Kind: "web",
+		SurfaceLocator: "signed-card-locator",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.commands) != 1 {
+		t.Fatalf("message surface commands = %d, want 1", len(runner.commands))
+	}
+	var request controlRequest
+	if err := json.Unmarshal(runner.commands[0].Stdin, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Operation != "open_surface" || request.Kind != "web" || request.SurfaceLocator != "signed-card-locator" {
+		t.Fatalf("message surface request = %#v", request)
+	}
+
+	for _, kind := range []string{"", "article", "WEB"} {
+		runner.commands = nil
+		_, err := backend.OpenSurface(context.Background(), SurfaceTarget{Kind: kind})
+		if !errors.Is(err, ErrClientIncompatible) {
+			t.Fatalf("kind %q error = %v, want ErrClientIncompatible", kind, err)
+		}
+		if len(runner.commands) != 0 {
+			t.Fatalf("invalid kind %q reached control backend: %#v", kind, runner.commands)
+		}
+	}
+	runner.commands = nil
+	if _, err := backend.OpenSurface(context.Background(), SurfaceTarget{Kind: "web"}); !errors.Is(err, ErrClientIncompatible) {
+		t.Fatalf("missing message locator error = %v, want ErrClientIncompatible", err)
+	}
+	if len(runner.commands) != 0 {
+		t.Fatalf("missing message locator reached control backend: %#v", runner.commands)
+	}
+
+	runner.execResponse = mustMarshalFixture(map[string]any{
+		"ok": true,
+		"surface": map[string]any{
+			"kind": "miniprogram", "generation": "mini-generation", "window_identity": "mini-window",
+			"screenshot_base64": base64.StdEncoding.EncodeToString(screenshot),
+			"screenshot_sha256": hex.EncodeToString(digest[:]),
+		},
+	})
+	if _, err := backend.OpenSurface(context.Background(), SurfaceTarget{
+		Kind: "web", SurfaceLocator: "signed-card-locator",
+	}); !errors.Is(err, ErrClientIncompatible) {
+		t.Fatalf("mismatched returned kind error = %v, want ErrClientIncompatible", err)
 	}
 }

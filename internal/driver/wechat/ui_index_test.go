@@ -19,7 +19,8 @@ func TestUIIndexMarksVisibleDataIncompleteAndStable(t *testing.T) {
 		visibleMessages: []VisibleMessage{
 			{Text: "incoming fixture", Kind: "text", Confidence: 0.45},
 			{Text: "https://example.invalid/article", Kind: "link", Outgoing: true,
-				AccessibleLabel: "Example article", SurfaceKind: "web", Confidence: 0.55},
+				AccessibleLabel: "Example article", SurfaceKind: "web",
+				SurfaceLocator: "signed-card-locator", Confidence: 0.55},
 		},
 		selectedTitle: "Exact Project Group", selectedLocator: "locator-1",
 	}
@@ -62,12 +63,133 @@ func TestUIIndexMarksVisibleDataIncompleteAndStable(t *testing.T) {
 	if messages[1].SurfaceRef == "" {
 		t.Fatal("visible link did not expose a bounded surface reference")
 	}
-	target, err := index.ResolveSurface(context.Background(), messages[1].SurfaceRef)
+	if messagesAgain[1].SurfaceRef == messages[1].SurfaceRef {
+		t.Fatal("a fresh visible-message observation reused its surface click lease")
+	}
+	target, err := index.ResolveSurface(context.Background(), messagesAgain[1].SurfaceRef)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if target.ConversationTitle != conversation.Title || target.ConversationLocator != "locator-1" || target.AccessibleLabel != "Example article" {
+	if target.ConversationTitle != conversation.Title || target.ConversationLocator != "locator-1" ||
+		target.AccessibleLabel != "Example article" || target.SurfaceLocator != "signed-card-locator" {
 		t.Fatalf("unsafe surface target: %+v", target)
+	}
+}
+
+func TestUIIndexInvalidatesOldReferenceAfterExactCloneReobservation(t *testing.T) {
+	backend := &fakeBackend{
+		probe: ProbeResult{State: shared.StateOnline},
+		visibleConversations: []VisibleConversation{{
+			Title: "Project", Kind: "visible", Locator: "conversation-locator",
+		}},
+		visibleMessages: []VisibleMessage{{
+			Text: "article", Kind: "link", AccessibleLabel: "Same label", SurfaceKind: "web",
+			SurfaceLocator: "signed-original-node", Confidence: uiConfidence,
+		}},
+		selectedTitle: "Project", selectedLocator: "conversation-locator",
+	}
+	index := NewUIIndex(backend, "wx-main", time.Now)
+	conversations, err := index.ListConversations(context.Background(), shared.ConversationQuery{})
+	if err != nil || len(conversations) != 1 {
+		t.Fatalf("conversations=%#v err=%v", conversations, err)
+	}
+	first, err := index.ReadMessages(context.Background(), shared.MessageQuery{ConversationID: conversations[0].ID})
+	if err != nil || len(first) != 1 || first[0].SurfaceRef == "" {
+		t.Fatalf("first messages=%#v err=%v", first, err)
+	}
+	oldReference := first[0].SurfaceRef
+	second, err := index.ReadMessages(context.Background(), shared.MessageQuery{ConversationID: conversations[0].ID})
+	if err != nil || len(second) != 1 || second[0].SurfaceRef == "" {
+		t.Fatalf("second messages=%#v err=%v", second, err)
+	}
+	if second[0].SurfaceRef == oldReference {
+		t.Fatal("a new observation batch reused the original surface reference")
+	}
+	if _, err := index.ResolveSurface(context.Background(), oldReference); !errors.Is(err, ErrSurfaceMissing) {
+		t.Fatalf("old exact-clone reference error = %v, want ErrSurfaceMissing", err)
+	}
+	newTarget, err := index.ResolveSurface(context.Background(), second[0].SurfaceRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if newTarget.SurfaceLocator != "signed-original-node" {
+		t.Fatalf("new surface reference changed the exact locator: %#v", newTarget)
+	}
+	if _, err := index.ResolveSurface(context.Background(), second[0].SurfaceRef); !errors.Is(err, ErrSurfaceMissing) {
+		t.Fatalf("consumed surface reference error = %v, want ErrSurfaceMissing", err)
+	}
+}
+
+func TestDriverNeverClicksOldReferenceAfterExactCloneReobservation(t *testing.T) {
+	backend := &fakeBackend{
+		probe: ProbeResult{State: shared.StateOnline, ObservedAt: time.Now()},
+		visibleConversations: []VisibleConversation{{
+			Title: "Project", Kind: "visible", Locator: "conversation-locator",
+		}},
+		visibleMessages: []VisibleMessage{{
+			Text: "article", Kind: "link", AccessibleLabel: "Same label", SurfaceKind: "web",
+			SurfaceLocator: "same-observable-locator", Confidence: uiConfidence,
+		}},
+		selectedTitle: "Project", selectedLocator: "conversation-locator",
+	}
+	driver, err := New(Config{Backend: backend, Now: time.Now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary := t.TempDir()
+	if err := driver.Start(context.Background(), shared.AccountRuntime{
+		AccountID: "wx-main", Alias: "Main",
+		StateDir: filepath.Join(temporary, "state"), RuntimeDir: filepath.Join(temporary, "runtime"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = driver.Stop(context.Background()) })
+	conversations, err := driver.ListConversations(context.Background(), shared.ConversationQuery{})
+	if err != nil || len(conversations) != 1 {
+		t.Fatalf("conversations=%#v err=%v", conversations, err)
+	}
+	first, err := driver.ReadMessages(context.Background(), shared.MessageQuery{ConversationID: conversations[0].ID})
+	if err != nil || len(first) != 1 || first[0].SurfaceRef == "" {
+		t.Fatalf("first messages=%#v err=%v", first, err)
+	}
+	oldReference := first[0].SurfaceRef
+	second, err := driver.ReadMessages(context.Background(), shared.MessageQuery{ConversationID: conversations[0].ID})
+	if err != nil || len(second) != 1 || second[0].SurfaceRef == oldReference {
+		t.Fatalf("second messages=%#v err=%v", second, err)
+	}
+	if _, err := driver.OpenSurface(context.Background(), oldReference); !errors.Is(err, ErrSurfaceMissing) {
+		t.Fatalf("old exact-clone open error = %v, want ErrSurfaceMissing", err)
+	}
+	if len(backend.openedSurfaces) != 0 {
+		t.Fatalf("old exact-clone reference reached click backend: %#v", backend.openedSurfaces)
+	}
+}
+
+func TestUIIndexSurfaceReferenceExpiresBeforeResolution(t *testing.T) {
+	clock := time.Date(2026, time.August, 17, 10, 0, 0, 0, time.UTC)
+	backend := &fakeBackend{
+		probe: ProbeResult{State: shared.StateOnline},
+		visibleConversations: []VisibleConversation{{
+			Title: "Project", Locator: "conversation-locator",
+		}},
+		visibleMessages: []VisibleMessage{{
+			Text: "article", AccessibleLabel: "Article", SurfaceKind: "web",
+			SurfaceLocator: "signed-node", Confidence: uiConfidence,
+		}},
+		selectedTitle: "Project", selectedLocator: "conversation-locator",
+	}
+	index := NewUIIndex(backend, "wx-main", func() time.Time { return clock })
+	conversations, err := index.ListConversations(context.Background(), shared.ConversationQuery{})
+	if err != nil || len(conversations) != 1 {
+		t.Fatalf("conversations=%#v err=%v", conversations, err)
+	}
+	messages, err := index.ReadMessages(context.Background(), shared.MessageQuery{ConversationID: conversations[0].ID})
+	if err != nil || len(messages) != 1 || messages[0].SurfaceRef == "" {
+		t.Fatalf("messages=%#v err=%v", messages, err)
+	}
+	clock = clock.Add(uiSurfaceRefTTL)
+	if _, err := index.ResolveSurface(context.Background(), messages[0].SurfaceRef); !errors.Is(err, ErrSurfaceMissing) {
+		t.Fatalf("expired surface reference error = %v, want ErrSurfaceMissing", err)
 	}
 }
 

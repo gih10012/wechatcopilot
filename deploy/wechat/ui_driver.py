@@ -623,17 +623,14 @@ def saved_account_action_from_interface(interface):
     if interface is None or interface.nActions != 1:
         return None
     name = normalized_exact(action_name(interface, 0))
-    if name in SAVED_ACCOUNT_DIRECT_ACTION_NAMES:
-        dispatch = "atspi"
-    elif name in SAVED_ACCOUNT_FOCUS_ACTION_NAMES:
-        # Current Qt builds expose push buttons with SetFocus as their only
-        # AT-SPI action. That action does not activate the button, so the
-        # user-confirmed login path uses the already generation-bound target
-        # geometry and the verified full-frame X11 pointer critical section.
-        dispatch = "verified_pointer"
-    else:
+    if name not in SAVED_ACCOUNT_DIRECT_ACTION_NAMES + SAVED_ACCOUNT_FOCUS_ACTION_NAMES:
         return None
-    return {"index": 0, "name": name, "dispatch": dispatch}
+    # Official Qt builds are inconsistent here: some saved-account controls
+    # expose SetFocus (which cannot activate), while others advertise Click
+    # but return false without changing the UI. Both are only semantic proof
+    # that this exact fixed control exists. Dispatch both through the same
+    # generation-bound, full-frame-verified X11 pointer critical section.
+    return {"index": 0, "name": name, "dispatch": "verified_pointer"}
 
 
 def saved_account_action_spec(node):

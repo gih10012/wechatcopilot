@@ -1049,7 +1049,7 @@ class TargetSelectionTests(unittest.TestCase):
         self.assertEqual([], english_switch.activated)
         self.assertEqual([], chinese_switch.activated)
 
-    def test_continue_saved_account_login_revalidates_then_clicks_only_login(self):
+    def test_continue_click_saved_account_login_uses_only_bound_pointer_action(self):
         user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
         login = FakeNode(
             "Log In", "push button", (290, 380, 240, 50), actions=("click",),
@@ -1069,17 +1069,25 @@ class TargetSelectionTests(unittest.TestCase):
                 with mock.patch.object(
                     driver, "verified_window_identity", return_value=verified_wechat_identity(),
                 ) as verify:
-                    result = driver.dispatch({
-                        "operation": driver.SAVED_ACCOUNT_AUTH_ACTION_ID,
-                        "expected_auth_generation": generation,
-                    })
+                    with mock.patch.object(driver, "visual_pointer_action") as pointer:
+                        result = driver.dispatch({
+                            "operation": driver.SAVED_ACCOUNT_AUTH_ACTION_ID,
+                            "expected_auth_generation": generation,
+                        })
 
         self.assertEqual({"ok": True, "consumed": True}, result)
         self.assertGreaterEqual(verify.call_count, 6)
-        self.assertEqual([0], login.activated)
+        self.assertEqual([], login.activated)
         self.assertEqual([], switch.activated)
+        pointer.assert_called_once_with(
+            (290, 380, 240, 50), 1,
+            expected_window_identity=driver.encode_window_identity(verified_wechat_identity()),
+            expected_rendered_frame_sha256=driver.rendered_frame_digest(
+                screenshot["pixels"], screenshot["dimensions"],
+            ),
+        )
 
-    def test_switch_saved_account_login_revalidates_then_clicks_only_switch(self):
+    def test_switch_click_saved_account_login_uses_only_bound_pointer_action(self):
         user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
         login = FakeNode(
             "Log In", "push button", (290, 380, 240, 50), actions=("click",),
@@ -1099,14 +1107,22 @@ class TargetSelectionTests(unittest.TestCase):
                 with mock.patch.object(
                     driver, "verified_window_identity", return_value=verified_wechat_identity(),
                 ):
-                    result = driver.dispatch({
-                        "operation": driver.SAVED_ACCOUNT_SWITCH_AUTH_ACTION_ID,
-                        "expected_auth_generation": generation,
-                    })
+                    with mock.patch.object(driver, "visual_pointer_action") as pointer:
+                        result = driver.dispatch({
+                            "operation": driver.SAVED_ACCOUNT_SWITCH_AUTH_ACTION_ID,
+                            "expected_auth_generation": generation,
+                        })
 
         self.assertEqual({"ok": True, "consumed": True}, result)
         self.assertEqual([], login.activated)
-        self.assertEqual([0], switch.activated)
+        self.assertEqual([], switch.activated)
+        pointer.assert_called_once_with(
+            (290, 455, 240, 40), 1,
+            expected_window_identity=driver.encode_window_identity(verified_wechat_identity()),
+            expected_rendered_frame_sha256=driver.rendered_frame_digest(
+                screenshot["pixels"], screenshot["dimensions"],
+            ),
+        )
 
     def test_continue_setfocus_saved_account_login_uses_only_bound_pointer_action(self):
         user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
@@ -1464,7 +1480,7 @@ class TargetSelectionTests(unittest.TestCase):
         self.assertEqual(13, query_count)
         self.assertEqual([], executed)
 
-    def test_rejected_saved_account_click_is_reported_consumed_without_retry(self):
+    def test_rejecting_qt_click_is_not_invoked_for_saved_account_action(self):
         user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
         login = FakeNode(
             "Log In", "push button", (290, 380, 240, 50), actions=("click",),
@@ -1492,22 +1508,23 @@ class TargetSelectionTests(unittest.TestCase):
                 with mock.patch.object(
                     driver, "verified_window_identity", return_value=verified_wechat_identity(),
                 ):
-                    with mock.patch.object(
-                        driver, "read_request",
-                        return_value={
-                            "operation": driver.SAVED_ACCOUNT_AUTH_ACTION_ID,
-                            "expected_auth_generation": generation,
-                        },
-                    ):
-                        with mock.patch.object(driver, "emit", side_effect=emitted.append):
-                            driver.main()
+                    with mock.patch.object(driver, "visual_pointer_action") as pointer:
+                        with mock.patch.object(
+                            driver, "read_request",
+                            return_value={
+                                "operation": driver.SAVED_ACCOUNT_AUTH_ACTION_ID,
+                                "expected_auth_generation": generation,
+                            },
+                        ):
+                            with mock.patch.object(driver, "emit", side_effect=emitted.append):
+                                driver.main()
 
-        self.assertEqual([0], login.activated)
+        self.assertEqual([], login.activated)
         self.assertEqual([], switch.activated)
         self.assertEqual(1, len(emitted))
-        self.assertFalse(emitted[0]["ok"])
-        self.assertEqual("ACTION_OUTCOME_UNCERTAIN", emitted[0]["code"])
+        self.assertTrue(emitted[0]["ok"])
         self.assertTrue(emitted[0]["consumed"])
+        pointer.assert_called_once()
 
     def test_bound_surface_dispatch_does_not_require_main_window_online_evidence(self):
         with mock.patch.object(driver, "probe", side_effect=AssertionError("must not probe")):

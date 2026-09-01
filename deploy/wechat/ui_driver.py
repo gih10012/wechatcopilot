@@ -48,7 +48,8 @@ SAVED_ACCOUNT_ALTERNATIVE_LABEL_GROUPS = (
     SAVED_ACCOUNT_SWITCH_LABELS, SAVED_ACCOUNT_TRANSFER_LABELS,
 )
 SAVED_ACCOUNT_CONTROL_ROLES = ("push button", "button")
-SAVED_ACCOUNT_ACTION_NAMES = ("click", "press", "activate")
+SAVED_ACCOUNT_DIRECT_ACTION_NAMES = ("click", "press", "activate")
+SAVED_ACCOUNT_FOCUS_ACTION_NAMES = ("setfocus",)
 SAVED_ACCOUNT_USER_PREFIXES = ("current user", "当前用户")
 SAVED_ACCOUNT_AUTH_ACTION_ID = "continue_saved_account_login"
 SAVED_ACCOUNT_AUTH_ACTION_TEMPLATE = {
@@ -605,9 +606,17 @@ def saved_account_action_from_interface(interface):
     if interface is None or interface.nActions != 1:
         return None
     name = normalized_exact(action_name(interface, 0))
-    if name not in SAVED_ACCOUNT_ACTION_NAMES:
+    if name in SAVED_ACCOUNT_DIRECT_ACTION_NAMES:
+        dispatch = "atspi"
+    elif name in SAVED_ACCOUNT_FOCUS_ACTION_NAMES:
+        # Current Qt builds expose push buttons with SetFocus as their only
+        # AT-SPI action. That action does not activate the button, so the
+        # user-confirmed login path uses the already generation-bound target
+        # geometry and the verified full-frame X11 pointer critical section.
+        dispatch = "verified_pointer"
+    else:
         return None
-    return {"index": 0, "name": name}
+    return {"index": 0, "name": name, "dispatch": dispatch}
 
 
 def saved_account_action_spec(node):
@@ -4045,7 +4054,10 @@ def x11_bound_window(connection, expected_identity, x_module):
         raise ControlFailure("ACTION_STALE", "active X11 window changed before pointer injection")
     window = connection.create_resource_object("window", active_xid)
     window_geometry = window.get_geometry()
-    translated = window.translate_coords(root, 0, 0)
+    # python-xlib's method receiver is the destination window; its first
+    # argument is the source window. Translate the client origin into root
+    # coordinates, matching xwininfo's absolute geometry captured earlier.
+    translated = root.translate_coords(window, 0, 0)
     geometry = (
         int(translated.x), int(translated.y),
         int(window_geometry.width), int(window_geometry.height),
@@ -4361,6 +4373,7 @@ def capture_saved_account_confirmation():
         "scope": after_scope,
         "scope_identity": scope_identity(after_scope),
         "identity_digest": identity_digest,
+        "window_identity": encode_window_identity(after_identity),
         "target": after_target,
         "page_semantics": after_semantic,
         "rendered_frame_sha256": rendered_digest,
@@ -4420,20 +4433,27 @@ def continue_saved_account_login(request):
     action = saved_account_action_from_interface(interface)
     if action is None or action != login["action"]:
         raise ControlFailure("ACTION_STALE", "saved-account login action changed")
-    try:
-        accepted = interface.doAction(action["index"])
-    except Exception as exc:
-        raise ControlFailure(
-            "ACTION_OUTCOME_UNCERTAIN",
-            "saved-account login was dispatched but its outcome is unknown",
-            consumed=True,
-        ) from exc
-    if not accepted:
-        raise ControlFailure(
-            "ACTION_OUTCOME_UNCERTAIN",
-            "saved-account login was dispatched but the client did not confirm acceptance",
-            consumed=True,
+    if action["dispatch"] == "verified_pointer":
+        visual_pointer_action(
+            login["geometry"], 1,
+            expected_window_identity=final["window_identity"],
+            expected_rendered_frame_sha256=final["rendered_frame_sha256"],
         )
+    else:
+        try:
+            accepted = interface.doAction(action["index"])
+        except Exception as exc:
+            raise ControlFailure(
+                "ACTION_OUTCOME_UNCERTAIN",
+                "saved-account login was dispatched but its outcome is unknown",
+                consumed=True,
+            ) from exc
+        if not accepted:
+            raise ControlFailure(
+                "ACTION_OUTCOME_UNCERTAIN",
+                "saved-account login was dispatched but the client did not confirm acceptance",
+                consumed=True,
+            )
     return {"ok": True, "consumed": True}
 
 

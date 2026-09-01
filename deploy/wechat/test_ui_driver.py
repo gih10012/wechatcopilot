@@ -774,6 +774,34 @@ class TargetSelectionTests(unittest.TestCase):
         self.assertTrue(state["actions"][0]["image_bound"])
         self.assertEqual([], login.activated)
 
+    def test_real_setfocus_saved_account_layout_uses_a_confirmed_visual_action(self):
+        geometry = (200, 100, 291, 396)
+        user = FakeNode("Current UserAlice", "label", (245, 150, 200, 28))
+        login = FakeNode(
+            "Log In", "push button", (275, 285, 140, 44), actions=("SetFocus",),
+        )
+        switch = FakeNode(
+            "Switch Account", "push button", (215, 350, 125, 38), actions=("SetFocus",),
+        )
+        transfer = FakeNode(
+            "Transfer files only", "push button", (350, 350, 125, 38), actions=("SetFocus",),
+        )
+        _root, window = install_tree(user, login, switch, transfer)
+        window.geometry = geometry
+
+        with saved_account_screenshot(dimensions=(291, 396)):
+            with mock.patch.object(
+                driver, "verified_window_identity",
+                return_value=verified_wechat_identity(geometry=geometry),
+            ):
+                state = driver.probe()
+
+        self.assertEqual("AUTH_REQUIRED", state["state"])
+        self.assertEqual("phone_confirmation", state["auth_kind"])
+        self.assertEqual(1, len(state["actions"]))
+        self.assertTrue(state["actions"][0]["image_bound"])
+        self.assertEqual([], login.activated)
+
     def test_saved_account_title_and_avatar_never_publish_qr_bounds(self):
         title = FakeNode("WeChat Login", "label", (300, 115, 220, 28))
         user = FakeNode("Current UserAlice", "label", (300, 155, 220, 28))
@@ -1045,6 +1073,64 @@ class TargetSelectionTests(unittest.TestCase):
         self.assertGreaterEqual(verify.call_count, 6)
         self.assertEqual([0], login.activated)
         self.assertEqual([], switch.activated)
+
+    def test_continue_setfocus_saved_account_login_uses_only_bound_pointer_action(self):
+        user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
+        login = FakeNode(
+            "Log In", "push button", (290, 380, 240, 50), actions=("SetFocus",),
+        )
+        switch = FakeNode(
+            "Switch Account", "push button", (290, 455, 240, 40), actions=("SetFocus",),
+        )
+        _root, window = install_tree(user, login, switch)
+        window.geometry = (200, 100, 420, 600)
+        scope = (window, (0,))
+        identity = verified_wechat_identity()
+
+        with saved_account_screenshot() as screenshot:
+            generation = expected_saved_auth_generation(
+                window, screenshot["pixels"], screenshot["dimensions"],
+            )
+            with mock.patch.object(driver, "active_surface_root", return_value=scope):
+                with mock.patch.object(
+                    driver, "verified_window_identity", return_value=identity,
+                ):
+                    with mock.patch.object(driver, "visual_pointer_action") as pointer:
+                        result = driver.dispatch({
+                            "operation": driver.SAVED_ACCOUNT_AUTH_ACTION_ID,
+                            "expected_auth_generation": generation,
+                        })
+
+        self.assertEqual({"ok": True, "consumed": True}, result)
+        self.assertEqual([], login.activated)
+        self.assertEqual([], switch.activated)
+        pointer.assert_called_once_with(
+            (290, 380, 240, 50), 1,
+            expected_window_identity=driver.encode_window_identity(identity),
+            expected_rendered_frame_sha256=driver.rendered_frame_digest(
+                screenshot["pixels"], screenshot["dimensions"],
+            ),
+        )
+
+    def test_unknown_saved_account_action_is_not_visualized(self):
+        user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
+        login = FakeNode(
+            "Log In", "push button", (290, 380, 240, 50), actions=("SetValue",),
+        )
+        switch = FakeNode(
+            "Switch Account", "push button", (290, 455, 240, 40), actions=("SetValue",),
+        )
+        _root, window = install_tree(user, login, switch)
+        window.geometry = (200, 100, 420, 600)
+
+        with mock.patch.object(
+            driver, "verified_window_identity", return_value={"process_kind": "wechat"},
+        ):
+            state = driver.probe()
+
+        self.assertEqual("AUTH_REQUIRED", state["state"])
+        self.assertNotIn("actions", state)
+        self.assertEqual([], login.activated)
 
     def test_continue_saved_account_login_rejects_locator_before_capture(self):
         with mock.patch.object(driver, "active_surface_root") as capture:
@@ -2306,18 +2392,20 @@ class TargetSelectionTests(unittest.TestCase):
             def get_geometry(self):
                 return types.SimpleNamespace(width=1000, height=800)
 
-            def translate_coords(self, _root, _x, _y):
-                return types.SimpleNamespace(x=0, y=0)
-
             def get_full_property(self, _atom, _kind):
                 return Property(42)
 
         class Root:
             def __init__(self, active):
                 self.active = active
+                self.translated = (0, 0)
 
             def get_full_property(self, _atom, _kind):
                 return Property(self.active)
+
+            def translate_coords(self, source, x, y):
+                self.translate_call = (source, x, y)
+                return types.SimpleNamespace(x=self.translated[0], y=self.translated[1])
 
         class Connection:
             def __init__(self, active):
@@ -2339,18 +2427,20 @@ class TargetSelectionTests(unittest.TestCase):
             driver, "process_record",
             return_value={"starttime": identity["pid_starttime"]},
         ):
+            connection = Connection(int(identity["xid"], 16))
             _bound_root, bound_window, geometry = driver.x11_bound_window(
-                Connection(int(identity["xid"], 16)), identity, fake_x,
+                connection, identity, fake_x,
             )
             self.assertIsInstance(bound_window, Window)
             self.assertEqual((0, 0, 1000, 800), geometry)
+            self.assertEqual((bound_window, 0, 0), connection.root.translate_call)
 
             with self.assertRaises(driver.ControlFailure) as raised:
                 driver.x11_bound_window(Connection(0x9999), identity, fake_x)
             self.assertEqual("ACTION_STALE", raised.exception.code)
 
             moved = Connection(int(identity["xid"], 16))
-            moved.window.translate_coords = lambda *_args: types.SimpleNamespace(x=1, y=0)
+            moved.root.translated = (1, 0)
             with self.assertRaises(driver.ControlFailure) as raised:
                 driver.x11_bound_window(moved, identity, fake_x)
             self.assertEqual("ACTION_STALE", raised.exception.code)

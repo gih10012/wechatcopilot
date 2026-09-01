@@ -31,6 +31,15 @@ import (
 const (
 	challengeTTL       = 10 * time.Minute
 	completedRetention = 60 * time.Second
+	// The official clients can briefly construct their main window before a
+	// server-side login attempt is finally accepted. A single ONLINE probe is
+	// therefore only a candidate: keep the challenge open until the same
+	// runtime remains online across several fresh observations and this entire
+	// stability window. This prevents the browser and `accounts login --wait`
+	// from reporting success immediately before the client falls back to its
+	// login screen.
+	onlineStabilityWindow           = 15 * time.Second
+	minimumStableOnlineObservations = 3
 	// A confirmed generation is preconsumed before driver invocation. The
 	// challenge also has a total cap for distinct logical onboarding stages.
 	maxAuthActionAttemptsPerAction    = 1
@@ -55,23 +64,25 @@ type Challenge struct {
 }
 
 type entry struct {
-	mu                  sync.Mutex
-	public              Challenge
-	token               string
-	driver              driver.Driver
-	server              *http.Server
-	listener            net.Listener
-	codeAttempts        int
-	codeInFlight        bool
-	codeSubmitted       bool
-	actionAttempts      map[string]int
-	totalActionAttempts int
-	actionInFlight      bool
-	performedActions    map[string]bool
-	performedReplayKeys map[string]bool
-	lastObservedAt      time.Time
-	closed              bool
-	done                chan struct{}
+	mu                   sync.Mutex
+	public               Challenge
+	token                string
+	driver               driver.Driver
+	server               *http.Server
+	listener             net.Listener
+	codeAttempts         int
+	codeInFlight         bool
+	codeSubmitted        bool
+	actionAttempts       map[string]int
+	totalActionAttempts  int
+	actionInFlight       bool
+	performedActions     map[string]bool
+	performedReplayKeys  map[string]bool
+	lastObservedAt       time.Time
+	onlineCandidateSince time.Time
+	onlineObservations   int
+	closed               bool
+	done                 chan struct{}
 }
 
 type Manager struct {
@@ -129,21 +140,20 @@ func (m *Manager) Begin(ctx context.Context, accountID string, instance driver.D
 	}
 	_ = os.Chmod(qrPath, 0o600)
 	snapshot, _ := instance.AuthSnapshot(ctx)
+	now := time.Now().UTC()
 	public := Challenge{
 		ID: challengeID, AccountID: accountID, LocalURL: localURL, LANURL: lanURL,
 		LinkQRPath: qrPath, State: snapshot.State, Kind: snapshot.Kind, Prompt: snapshot.Prompt,
-		ExpiresAt: time.Now().UTC().Add(challengeTTL),
-	}
-	if snapshot.State == driver.StateOnline {
-		now := time.Now().UTC()
-		public.CompletedAt = &now
+		ExpiresAt: now.Add(challengeTTL),
 	}
 	item := &entry{
 		public: public, token: token, driver: instance, listener: listener,
 		actionAttempts: make(map[string]int), performedActions: make(map[string]bool),
 		performedReplayKeys: make(map[string]bool),
-		lastObservedAt:      snapshot.ObservedAt, done: make(chan struct{}),
+		done:                make(chan struct{}),
 	}
+	item.observeAuthSnapshotLocked(snapshot, now)
+	public = item.public
 	mux := http.NewServeMux()
 	mux.HandleFunc(path, item.handlePage)
 	mux.HandleFunc(path+"/state", item.handleState)
@@ -278,12 +288,7 @@ func (m *Manager) monitor(id string, item *entry) {
 			item.mu.Unlock()
 			return
 		}
-		item.public.State = snapshot.State
-		item.public.Kind = snapshot.Kind
-		item.public.Prompt = snapshot.Prompt
-		item.lastObservedAt = snapshot.ObservedAt
-		if snapshot.State == driver.StateOnline {
-			item.markCompletedLocked(now)
+		if item.observeAuthSnapshotLocked(snapshot, now) {
 			completedAt := *item.public.CompletedAt
 			item.mu.Unlock()
 			item.waitForCompletedRetention(completedAt)
@@ -294,7 +299,7 @@ func (m *Manager) monitor(id string, item *entry) {
 }
 
 func (e *entry) completedLocked() bool {
-	return e.public.CompletedAt != nil || e.public.State == driver.StateOnline
+	return e.public.CompletedAt != nil
 }
 
 func (e *entry) markCompletedLocked(now time.Time) {
@@ -303,6 +308,40 @@ func (e *entry) markCompletedLocked(now time.Time) {
 		completedAt := now.UTC()
 		e.public.CompletedAt = &completedAt
 	}
+}
+
+func (e *entry) observeAuthSnapshotLocked(snapshot driver.AuthSnapshot, now time.Time) bool {
+	e.public.Kind = snapshot.Kind
+	e.lastObservedAt = snapshot.ObservedAt
+	if e.lastObservedAt.IsZero() {
+		e.lastObservedAt = now
+	}
+	if snapshot.State != driver.StateOnline {
+		e.onlineCandidateSince = time.Time{}
+		e.onlineObservations = 0
+		e.public.State = snapshot.State
+		e.public.Prompt = snapshot.Prompt
+		return false
+	}
+
+	if e.onlineCandidateSince.IsZero() {
+		e.onlineCandidateSince = now
+		e.onlineObservations = 1
+	} else {
+		e.onlineObservations++
+	}
+	if e.onlineObservations >= minimumStableOnlineObservations &&
+		now.Sub(e.onlineCandidateSince) >= onlineStabilityWindow {
+		e.markCompletedLocked(now)
+		return true
+	}
+
+	// Do not expose the candidate as ONLINE. Both the browser and CLI treat
+	// ONLINE as terminal and would otherwise close the only useful diagnostic
+	// view while the official client can still roll back to authentication.
+	e.public.State = driver.StateStarting
+	e.public.Prompt = "官方客户端已进入主界面，正在确认登录状态稳定"
+	return false
 }
 
 func (e *entry) waitForCompletedRetention(completedAt time.Time) {
@@ -413,18 +452,13 @@ func (e *entry) handleState(w http.ResponseWriter, r *http.Request) {
 		writeChallengeState(w, data, false, nil, observedAt)
 		return
 	}
-	e.public.Kind = snapshot.Kind
-	e.public.Prompt = snapshot.Prompt
-	e.lastObservedAt = snapshot.ObservedAt
-	if snapshot.State == driver.StateOnline {
-		e.markCompletedLocked(now)
+	if e.observeAuthSnapshotLocked(snapshot, now) {
 		data := e.public
 		observedAt := e.lastObservedAt
 		e.mu.Unlock()
 		writeChallengeState(w, data, false, nil, observedAt)
 		return
 	}
-	e.public.State = snapshot.State
 	data := e.public
 	canSubmitCode := snapshot.State == driver.StateAuthRequired && snapshot.Kind == driver.AuthSMS &&
 		snapshot.CanSubmitCode && !e.codeInFlight && !e.codeSubmitted && !e.actionInFlight
@@ -517,10 +551,12 @@ func (e *entry) handleImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	e.mu.Lock()
-	if snapshot.State == driver.StateOnline {
-		e.markCompletedLocked(time.Now().UTC())
-	}
-	unavailable = e.closed || time.Now().UTC().After(e.public.ExpiresAt) || e.completedLocked()
+	now := time.Now().UTC()
+	e.observeAuthSnapshotLocked(snapshot, now)
+	// Never serve pixels from an authenticated main window through a login
+	// endpoint, including while ONLINE is still only a stability candidate.
+	unavailable = e.closed || now.After(e.public.ExpiresAt) || e.completedLocked() ||
+		snapshot.State == driver.StateOnline
 	e.mu.Unlock()
 	if unavailable {
 		http.Error(w, "login image is no longer available", http.StatusGone)
@@ -1124,15 +1160,16 @@ function renderActions(values){
   actionButtons.replaceChildren();
   actions.hidden=true;
   screenLink.hidden=true;
-  if(bound.length!==1)return;
+  if(bound.length!==available.length)return;
   const action=bound[0];
-  imageBoundActionID=action.id;
+  const binding=JSON.stringify(bound.map(value=>value.id));
+  imageBoundActionID=binding;
   const generation=++imageGeneration;
   const source=base+'/image?action_id='+encodeURIComponent(action.id)+'&v='+Date.now();
   const candidate=new Image();
   candidate.className='screen';
   candidate.alt=screen.alt;
-  candidate.onload=()=>{if(completed||generation!==imageGeneration||signature!==actionSignature||imageBoundActionID!==action.id)return;screen.replaceWith(candidate);screen=candidate;screenLink.href=source;screenLink.hidden=false;populateActionButtons(available)};
+  candidate.onload=()=>{if(completed||generation!==imageGeneration||signature!==actionSignature||imageBoundActionID!==binding)return;screen.replaceWith(candidate);screen=candidate;screenLink.href=source;screenLink.hidden=false;populateActionButtons(available)};
   candidate.onerror=()=>{if(completed||generation!==imageGeneration||signature!==actionSignature)return;actionSignature='';imageBoundActionID='';actions.hidden=true};
   candidate.src=source;
 }

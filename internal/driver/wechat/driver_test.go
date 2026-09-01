@@ -42,6 +42,7 @@ type fakeBackend struct {
 	actErr               error
 	authActionCalls      int
 	authActionErr        error
+	authOperation        string
 	authGeneration       string
 	authActionStarted    chan struct{}
 	authActionRelease    <-chan struct{}
@@ -65,7 +66,14 @@ func (f *fakeBackend) SubmitAuthCode(context.Context, string) error {
 	return nil
 }
 func (f *fakeBackend) ContinueSavedAccountLogin(_ context.Context, generation string) error {
+	return f.savedAccountAuthAction(continueSavedAccountLoginOperation, generation)
+}
+func (f *fakeBackend) SwitchSavedAccountLogin(_ context.Context, generation string) error {
+	return f.savedAccountAuthAction(switchSavedAccountLoginOperation, generation)
+}
+func (f *fakeBackend) savedAccountAuthAction(operation, generation string) error {
 	f.authActionCalls++
+	f.authOperation = operation
 	f.authGeneration = generation
 	if f.authActionStarted != nil {
 		close(f.authActionStarted)
@@ -965,9 +973,12 @@ func TestAuthSnapshotPassesThroughSavedAccountAction(t *testing.T) {
 func TestSavedAccountLoginActionUsesFixedInternalReplayKeyAcrossGenerations(t *testing.T) {
 	first := savedAccountLoginAction(strings.Repeat("a", 64))
 	second := savedAccountLoginAction(strings.Repeat("b", 64))
+	switchAction := savedAccountSwitchAction(strings.Repeat("a", 64))
 	if first.ID == second.ID || first.ReplayKey != continueSavedAccountLoginOperation ||
-		second.ReplayKey != continueSavedAccountLoginOperation {
-		t.Fatalf("saved-account replay binding first=%#v second=%#v", first, second)
+		second.ReplayKey != continueSavedAccountLoginOperation ||
+		switchAction.ReplayKey != switchSavedAccountLoginOperation ||
+		switchAction.ReplayKey == first.ReplayKey {
+		t.Fatalf("saved-account replay binding first=%#v second=%#v switch=%#v", first, second, switchAction)
 	}
 	encoded, err := json.Marshal(first)
 	if err != nil {
@@ -1036,6 +1047,39 @@ func TestPerformSavedAccountLoginRequiresAdvertisedConfirmedFixedAction(t *testi
 	}
 	if backend.authActionCalls != 0 {
 		t.Fatal("stale account-bound authentication action reached backend")
+	}
+}
+
+func TestPerformSavedAccountSwitchRequiresItsAdvertisedGeneration(t *testing.T) {
+	generation := strings.Repeat("9", 64)
+	login := savedAccountLoginAction(generation)
+	switchAction := savedAccountSwitchAction(generation)
+	backend := &fakeBackend{
+		probe: ProbeResult{
+			State: shared.StateAuthRequired, AuthKind: shared.AuthPhoneConfirm,
+			Actions: []shared.AuthAction{login, switchAction}, ObservedAt: time.Now().UTC(),
+		},
+	}
+	driver := startFixtureDriver(t, backend, &fakeIndex{})
+
+	if err := driver.PerformAuthAction(context.Background(), shared.AuthActionRequest{
+		ActionID: switchAction.ID, Confirmed: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if backend.authActionCalls != 1 || backend.authOperation != switchSavedAccountLoginOperation ||
+		backend.authGeneration != generation {
+		t.Fatalf("switch dispatch calls=%d operation=%q generation=%q", backend.authActionCalls, backend.authOperation, backend.authGeneration)
+	}
+
+	backend.probe.Actions = []shared.AuthAction{login}
+	if err := driver.PerformAuthAction(context.Background(), shared.AuthActionRequest{
+		ActionID: switchAction.ID, Confirmed: true,
+	}); !errors.Is(err, ErrActionStale) {
+		t.Fatalf("unadvertised switch error = %v, want ErrActionStale", err)
+	}
+	if backend.authActionCalls != 1 {
+		t.Fatal("unadvertised switch reached backend")
 	}
 }
 

@@ -10,6 +10,8 @@ import (
 const (
 	continueSavedAccountLoginOperation = "continue_saved_account_login"
 	savedAccountLoginActionPrefix      = continueSavedAccountLoginOperation + "."
+	switchSavedAccountLoginOperation   = "switch_saved_account_login"
+	savedAccountSwitchActionPrefix     = switchSavedAccountLoginOperation + "."
 )
 
 func savedAccountLoginAction(generation string) shared.AuthAction {
@@ -21,6 +23,18 @@ func savedAccountLoginAction(generation string) shared.AuthAction {
 		RequiresConfirmation: true,
 		ImageBound:           true,
 		ReplayKey:            continueSavedAccountLoginOperation,
+	}
+}
+
+func savedAccountSwitchAction(generation string) shared.AuthAction {
+	return shared.AuthAction{
+		ID:                   savedAccountSwitchActionPrefix + generation,
+		Label:                "\u5207\u6362\u767b\u5f55\u65b9\u5f0f",
+		Risk:                 "high",
+		Confirmation:         "\u5f53\u524d\u8d26\u53f7\u5feb\u901f\u767b\u5f55\u672a\u6210\u529f\u65f6\uff0c\u53ef\u5207\u6362\u5230\u5b98\u65b9\u5fae\u4fe1\u5ba2\u6237\u7aef\u7684\u5176\u4ed6\u767b\u5f55\u65b9\u5f0f\u3002\u8bf7\u786e\u8ba4\u7ee7\u7eed\u3002",
+		RequiresConfirmation: true,
+		ImageBound:           true,
+		ReplayKey:            switchSavedAccountLoginOperation,
 	}
 }
 
@@ -120,6 +134,7 @@ type Backend interface {
 	Screenshot(context.Context) ([]byte, error)
 	SubmitAuthCode(context.Context, string) error
 	ContinueSavedAccountLogin(context.Context, string) error
+	SwitchSavedAccountLogin(context.Context, string) error
 	ListVisibleConversations(context.Context) ([]VisibleConversation, error)
 	ReadVisibleMessages(context.Context, string, string) (VisibleMessages, error)
 	Send(context.Context, UISendRequest) error

@@ -15,10 +15,10 @@ Keep provisioning and unlock in a trusted interactive terminal. `create` closes 
 2. Add an account with a unique human alias; record the returned opaque `account_id`.
 3. Activate the account.
 4. Stop agent execution and tell the user to run `accounts login` manually in a separate trusted terminal. Never invoke it or any `auth` subcommand through an agent shell or tool, and never ask the user to paste their inputs or outputs: those commands handle a bearer login URL or verification secret. Add `--lan` only when the user needs to complete login from another device on the same private network. Let the daemon prefer the default-route interface, or add `--lan-address <RFC1918_IP>` only for an exact address assigned to another eligible local interface.
-5. Open the one-time URL directly, complete QR scan, phone confirmation, or SMS entry, and wait for `ONLINE`.
+5. Open the one-time URL directly, complete QR scan, phone confirmation, or SMS entry, and wait for stable `ONLINE`. A saved personal-WeChat profile may first offer both “登录当前微信账号” and “切换登录方式”; only the user may confirm either image-bound action. Use the latter when Tencent rejects or rolls back the saved-account quick login, then complete the official client's refreshed QR or phone flow.
 6. Verify that restarting the runtime preserves `ONLINE` before relying on unattended reads.
 
-Login challenges expire after ten minutes and are single-use. A LAN challenge serves no external scripts and rejects public, wildcard, loopback, container-bridge, and unassigned binding addresses. `--lan-address` requires `--lan`; `WECHATCOPILOT_LAN_ADDRESS` is only considered for an explicitly requested LAN challenge. After success the challenge retains the completion result for about 60 seconds, then closes; an expired challenge closes without authenticating.
+Login challenges expire after ten minutes and are single-use. A LAN challenge serves no external scripts and rejects public, wildcard, loopback, container-bridge, and unassigned binding addresses. `--lan-address` requires `--lan`; `WECHATCOPILOT_LAN_ADDRESS` is only considered for an explicitly requested LAN challenge. A transient main window is not success: the official client must remain `ONLINE` across multiple observations for at least 15 seconds. After stable success the challenge retains the completion result for about 60 seconds, then closes; an expired challenge closes without authenticating.
 
 ## Switch accounts
 
@@ -54,4 +54,4 @@ The command succeeds only while the exact digest-pinned account container is sto
 
 ## Recover authentication
 
-When Tencent invalidates a session, preserve the profile and enter `AUTH_REQUIRED`. Ask the user to create a new login challenge manually rather than adding a replacement account; never create it through an agent tool. Stop if the official client reports a risk warning, device rejection, or unsupported environment; the project does not automate around these controls.
+When Tencent invalidates a session, preserve the profile and enter `AUTH_REQUIRED`. Ask the user to create a new login challenge manually rather than adding a replacement account; never create it through an agent tool. If the saved-account quick login returns to its initial screen, tell the user they may explicitly confirm “切换登录方式” on that same trusted page; this is a fixed, screenshot-bound route to the official client's other login flow, not permission for the agent to click it. Stop if the official client reports a risk warning, device rejection, or unsupported environment; the project does not automate around these controls.

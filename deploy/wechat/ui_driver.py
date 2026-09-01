@@ -52,10 +52,18 @@ SAVED_ACCOUNT_DIRECT_ACTION_NAMES = ("click", "press", "activate")
 SAVED_ACCOUNT_FOCUS_ACTION_NAMES = ("setfocus",)
 SAVED_ACCOUNT_USER_PREFIXES = ("current user", "当前用户")
 SAVED_ACCOUNT_AUTH_ACTION_ID = "continue_saved_account_login"
+SAVED_ACCOUNT_SWITCH_AUTH_ACTION_ID = "switch_saved_account_login"
 SAVED_ACCOUNT_AUTH_ACTION_TEMPLATE = {
     "label": "登录当前微信账号",
     "risk": "high",
     "confirmation": "请确认使用官方微信客户端显示的当前账号继续登录。",
+    "requires_confirmation": True,
+    "image_bound": True,
+}
+SAVED_ACCOUNT_SWITCH_ACTION_TEMPLATE = {
+    "label": "切换登录方式",
+    "risk": "high",
+    "confirmation": "当前账号快速登录未成功时，可切换到官方微信客户端的其他登录方式。请确认继续。",
     "requires_confirmation": True,
     "image_bound": True,
 }
@@ -414,6 +422,12 @@ def saved_account_auth_action(auth_generation):
     return action
 
 
+def saved_account_switch_auth_action(auth_generation):
+    action = dict(SAVED_ACCOUNT_SWITCH_ACTION_TEMPLATE)
+    action["id"] = f"{SAVED_ACCOUNT_SWITCH_AUTH_ACTION_ID}.{auth_generation}"
+    return action
+
+
 def probe():
     roots = application_roots()
     now = time.time()
@@ -462,11 +476,14 @@ def probe():
                 capture = None
             if capture is not None:
                 generation = capture["auth_generation"]
+                actions = [saved_account_auth_action(generation)]
+                if capture["target"].get("switch") is not None:
+                    actions.append(saved_account_switch_auth_action(generation))
                 response.update({
                     "auth_generation": generation,
                     "screenshot_base64": base64.b64encode(capture["screenshot"]).decode("ascii"),
                     "screenshot_sha256": capture["screenshot_sha256"],
-                    "actions": [saved_account_auth_action(generation)],
+                    "actions": actions,
                 })
         return response
     if main_wechat_ui_evidence(auth_nodes, main_geometry(auth_scope)):
@@ -816,9 +833,12 @@ def saved_account_confirmation_analysis(nodes, geometry):
         "alternatives": [saved_account_record_semantics(item) for item in alternatives],
         "user": saved_account_record_semantics(user_labels[0]),
     })
-    login["static_signature"] = node_signature(login["node"], login["path"])
+    for record in (login, *alternatives):
+        record["static_signature"] = node_signature(record["node"], record["path"])
+    switch = alternative_controls[0][0] if alternative_controls[0] else None
     target = {
         "login": login,
+        "switch": switch,
         "alternatives": alternatives,
         "user": user_labels[0],
         "signature": signature,
@@ -4383,12 +4403,14 @@ def capture_saved_account_confirmation():
     }
 
 
-def continue_saved_account_login(request):
+def perform_saved_account_auth_action(request, operation, target_name):
     if set(request) != {"operation", "expected_auth_generation"}:
         raise ControlFailure(
             "CLIENT_INCOMPATIBLE",
-            "saved-account login requires only operation and expected_auth_generation",
+            "saved-account authentication requires only operation and expected_auth_generation",
         )
+    if request.get("operation") != operation:
+        raise ControlFailure("CLIENT_INCOMPATIBLE", "saved-account authentication operation changed")
     expected_generation = request.get("expected_auth_generation")
     if not isinstance(expected_generation, str) or not re.fullmatch(
         r"[0-9a-f]{64}", expected_generation,
@@ -4419,23 +4441,25 @@ def continue_saved_account_login(request):
         raise ControlFailure(
             "ACTION_STALE", "saved-account login window changed before activation",
         )
-    login = final["target"]["login"]
-    if not path_is_within(login["path"], final["scope"][1]):
-        raise ControlFailure("ACTION_STALE", "saved-account login control left its window")
-    node = resolve_path(login["path"])
+    target = final["target"].get(target_name)
+    if target is None:
+        raise ControlFailure("ACTION_STALE", "saved-account authentication action is no longer available")
+    if not path_is_within(target["path"], final["scope"][1]):
+        raise ControlFailure("ACTION_STALE", "saved-account authentication control left its window")
+    node = resolve_path(target["path"])
     if (
         not visible_node(node, main_geometry(final["scope"]))
-        or observable_accessible_identity(node) != login["accessible_identity"]
-        or node_signature(node, login["path"]) != login["static_signature"]
+        or observable_accessible_identity(node) != target["accessible_identity"]
+        or node_signature(node, target["path"]) != target["static_signature"]
     ):
-        raise ControlFailure("ACTION_STALE", "saved-account login control changed")
+        raise ControlFailure("ACTION_STALE", "saved-account authentication control changed")
     interface = action_interface(node)
     action = saved_account_action_from_interface(interface)
-    if action is None or action != login["action"]:
-        raise ControlFailure("ACTION_STALE", "saved-account login action changed")
+    if action is None or action != target["action"]:
+        raise ControlFailure("ACTION_STALE", "saved-account authentication action changed")
     if action["dispatch"] == "verified_pointer":
         visual_pointer_action(
-            login["geometry"], 1,
+            target["geometry"], 1,
             expected_window_identity=final["window_identity"],
             expected_rendered_frame_sha256=final["rendered_frame_sha256"],
         )
@@ -4445,16 +4469,28 @@ def continue_saved_account_login(request):
         except Exception as exc:
             raise ControlFailure(
                 "ACTION_OUTCOME_UNCERTAIN",
-                "saved-account login was dispatched but its outcome is unknown",
+                "saved-account authentication action was dispatched but its outcome is unknown",
                 consumed=True,
             ) from exc
         if not accepted:
             raise ControlFailure(
                 "ACTION_OUTCOME_UNCERTAIN",
-                "saved-account login was dispatched but the client did not confirm acceptance",
+                "saved-account authentication action was dispatched but the client did not confirm acceptance",
                 consumed=True,
             )
     return {"ok": True, "consumed": True}
+
+
+def continue_saved_account_login(request):
+    return perform_saved_account_auth_action(
+        request, SAVED_ACCOUNT_AUTH_ACTION_ID, "login",
+    )
+
+
+def switch_saved_account_login(request):
+    return perform_saved_account_auth_action(
+        request, SAVED_ACCOUNT_SWITCH_AUTH_ACTION_ID, "switch",
+    )
 
 
 def dispatch(request):
@@ -4466,6 +4502,8 @@ def dispatch(request):
         return {"ok": True}
     if operation == SAVED_ACCOUNT_AUTH_ACTION_ID:
         return continue_saved_account_login(request)
+    if operation == SAVED_ACCOUNT_SWITCH_AUTH_ACTION_ID:
+        return switch_saved_account_login(request)
     if operation == "snapshot_surface":
         if not request.get("expected_window_identity"):
             raise ControlFailure("ACTION_STALE", "expected surface window identity is required")

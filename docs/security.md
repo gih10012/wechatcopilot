@@ -52,6 +52,8 @@ The page may advertise a fixed, high-risk onboarding action such as accepting th
 
 The one-time URL is a bearer secret. Run `accounts login` and every low-level `auth` command yourself in a separate trusted terminal; never invoke them through an agent tool or ask an agent to capture their input or output. Do not paste the URL into an agent conversation, public terminal transcript, or third-party URL scanner. Use a trusted private network; the LAN page is not intended to be exposed through port forwarding, a reverse proxy, or the public Internet.
 
+Personal WeChat saved-account recovery exposes only fixed, generation- and screenshot-bound actions. “登录当前微信账号” retries the account visibly named by the official client; “切换登录方式” navigates to the official client's alternative QR or phone flow when the saved quick-login credential is rejected. Both require a fresh browser confirmation by the user, are preconsumed before dispatch, and cannot be invoked through MCP. The challenge reports success only after the official client remains online for at least 15 seconds across multiple observations, so a transient main window followed by a login rollback is not accepted.
+
 ## Agent write policy
 
 Sending and sharing use a short-lived two-phase transaction. Preparation resolves the exact account and opaque conversation ID and returns the exact payload for inspection. Commit requires explicit confirmation and a caller-generated idempotency key.

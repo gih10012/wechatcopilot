@@ -128,7 +128,7 @@ func TestDockerBackendUsesOnlyIsolatedProfileMounts(t *testing.T) {
 	}
 }
 
-func TestDockerBackendParsesOnlyFixedSavedAccountAuthAction(t *testing.T) {
+func TestDockerBackendParsesOnlyFixedSavedAccountAuthActions(t *testing.T) {
 	runner := &dockerFixtureRunner{}
 	backend := activeDockerControlFixture(t, runner)
 	generation := strings.Repeat("a", 64)
@@ -139,18 +139,27 @@ func TestDockerBackendParsesOnlyFixedSavedAccountAuthAction(t *testing.T) {
 		"ok": true, "state": "AUTH_REQUIRED", "auth_kind": "phone_confirmation",
 		"prompt": "Confirm saved account", "auth_generation": generation,
 		"screenshot_base64": base64.StdEncoding.EncodeToString(screenshot), "screenshot_sha256": screenshotSHA256,
-		"actions": []map[string]any{{
-			"id": savedAccountLoginActionPrefix + generation, "label": "runtime-controlled label",
-			"risk": "low", "confirmation": "runtime-controlled confirmation",
-			"requires_confirmation": true, "image_bound": true,
-		}},
+		"actions": []map[string]any{
+			{
+				"id": savedAccountLoginActionPrefix + generation, "label": "runtime-controlled label",
+				"risk": "low", "confirmation": "runtime-controlled confirmation",
+				"requires_confirmation": true, "image_bound": true,
+			},
+			{
+				"id": savedAccountSwitchActionPrefix + generation, "label": "untrusted switch label",
+				"risk": "low", "confirmation": "untrusted switch confirmation",
+				"requires_confirmation": true, "image_bound": true,
+			},
+		},
 	})
 	probe, err := backend.Probe(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := savedAccountLoginAction(generation)
-	if len(probe.Actions) != 1 || probe.Actions[0] != want {
+	want := []shared.AuthAction{
+		savedAccountLoginAction(generation), savedAccountSwitchAction(generation),
+	}
+	if len(probe.Actions) != len(want) || probe.Actions[0] != want[0] || probe.Actions[1] != want[1] {
 		t.Fatalf("canonical authentication actions = %#v, want %#v", probe.Actions, want)
 	}
 	if !bytes.Equal(probe.ScreenshotPNG, screenshot) {
@@ -169,6 +178,12 @@ func TestDockerBackendParsesOnlyFixedSavedAccountAuthAction(t *testing.T) {
 			"auth_generation": generation, "screenshot_base64": base64.StdEncoding.EncodeToString(screenshot),
 			"screenshot_sha256": screenshotSHA256,
 			"actions":           []map[string]any{{"id": "arbitrary_action", "requires_confirmation": true, "image_bound": true}},
+		},
+		{
+			"ok": true, "state": "AUTH_REQUIRED", "auth_kind": "phone_confirmation",
+			"auth_generation": generation, "screenshot_base64": base64.StdEncoding.EncodeToString(screenshot),
+			"screenshot_sha256": screenshotSHA256,
+			"actions":           []map[string]any{{"id": savedAccountSwitchActionPrefix + generation, "requires_confirmation": true, "image_bound": true}},
 		},
 		{
 			"ok": true, "state": "AUTH_REQUIRED", "auth_kind": "phone_confirmation",
@@ -213,6 +228,21 @@ func TestDockerBackendSavedAccountLoginUsesFixedLocatorFreeOperation(t *testing.
 	if len(request) != 2 || request["operation"] != continueSavedAccountLoginOperation ||
 		request["expected_auth_generation"] != generation {
 		t.Fatalf("authentication control request must contain only its fixed operation and opaque generation: %#v", request)
+	}
+
+	if err := backend.SwitchSavedAccountLogin(context.Background(), generation); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.commands) != 2 {
+		t.Fatalf("authentication action commands = %d, want 2", len(runner.commands))
+	}
+	request = nil
+	if err := json.Unmarshal(runner.commands[1].Stdin, &request); err != nil {
+		t.Fatal(err)
+	}
+	if len(request) != 2 || request["operation"] != switchSavedAccountLoginOperation ||
+		request["expected_auth_generation"] != generation {
+		t.Fatalf("switch authentication request must contain only its fixed operation and opaque generation: %#v", request)
 	}
 
 	runner.execResponse = []byte(`{"ok":false,"code":"ACTION_OUTCOME_UNCERTAIN","error":"response lost after activation","consumed":true}`)

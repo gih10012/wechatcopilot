@@ -290,7 +290,7 @@ func (d *Driver) SubmitAuthCode(ctx context.Context, code string) error {
 }
 
 func (d *Driver) PerformAuthAction(ctx context.Context, request shared.AuthActionRequest) error {
-	expectedGeneration, ok := savedAccountLoginGeneration(request.ActionID)
+	operation, expectedGeneration, ok := savedAccountAuthOperation(request.ActionID)
 	if !ok {
 		return fmt.Errorf("%w: authentication action is not advertised", ErrActionStale)
 	}
@@ -307,27 +307,45 @@ func (d *Driver) PerformAuthAction(ctx context.Context, request shared.AuthActio
 	if err != nil {
 		return err
 	}
-	if probe.State != shared.StateAuthRequired || !savedAccountLoginActionAdvertised(probe.Actions, request.ActionID) {
-		return fmt.Errorf("%w: saved-account login confirmation is no longer advertised", ErrActionStale)
+	if probe.State != shared.StateAuthRequired || !savedAccountAuthActionAdvertised(probe.Actions, request.ActionID) {
+		return fmt.Errorf("%w: saved-account authentication action is no longer advertised", ErrActionStale)
 	}
-	if err := d.backend.ContinueSavedAccountLogin(ctx, expectedGeneration); err != nil {
-		if definitiveAuthActionRejection(err) || shared.AuthActionWasConsumed(err) {
-			return err
+	var actionErr error
+	switch operation {
+	case continueSavedAccountLoginOperation:
+		actionErr = d.backend.ContinueSavedAccountLogin(ctx, expectedGeneration)
+	case switchSavedAccountLoginOperation:
+		actionErr = d.backend.SwitchSavedAccountLogin(ctx, expectedGeneration)
+	default:
+		return fmt.Errorf("%w: authentication action is not advertised", ErrActionStale)
+	}
+	if actionErr != nil {
+		if definitiveAuthActionRejection(actionErr) || shared.AuthActionWasConsumed(actionErr) {
+			return actionErr
 		}
 		// Losing the Docker/control response cannot prove that the official
 		// client rejected the activation. Consume the one-time web action so a
-		// retry cannot click the login control twice.
-		return shared.MarkAuthActionConsumed(err)
+		// retry cannot dispatch the saved-account authentication action twice.
+		return shared.MarkAuthActionConsumed(actionErr)
 	}
 	return nil
 }
 
-func savedAccountLoginGeneration(actionID string) (string, bool) {
-	if !strings.HasPrefix(actionID, savedAccountLoginActionPrefix) {
-		return "", false
+func savedAccountAuthOperation(actionID string) (string, string, bool) {
+	for _, candidate := range []struct {
+		operation string
+		prefix    string
+	}{
+		{continueSavedAccountLoginOperation, savedAccountLoginActionPrefix},
+		{switchSavedAccountLoginOperation, savedAccountSwitchActionPrefix},
+	} {
+		if !strings.HasPrefix(actionID, candidate.prefix) {
+			continue
+		}
+		generation := strings.TrimPrefix(actionID, candidate.prefix)
+		return candidate.operation, generation, authGenerationPattern.MatchString(generation)
 	}
-	generation := strings.TrimPrefix(actionID, savedAccountLoginActionPrefix)
-	return generation, authGenerationPattern.MatchString(generation)
+	return "", "", false
 }
 
 func hasImageBoundAuthAction(actions []shared.AuthAction) bool {
@@ -339,7 +357,7 @@ func hasImageBoundAuthAction(actions []shared.AuthAction) bool {
 	return false
 }
 
-func savedAccountLoginActionAdvertised(actions []shared.AuthAction, actionID string) bool {
+func savedAccountAuthActionAdvertised(actions []shared.AuthAction, actionID string) bool {
 	matches := 0
 	for _, action := range actions {
 		if action.ID != actionID {

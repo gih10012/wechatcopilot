@@ -86,6 +86,8 @@ func TestChallengeUsesCorrectScopedRoutesAndPrivateCodeSubmission(t *testing.T) 
 		`generation!==uiGeneration`,
 		`completed||generation!==imageGeneration`,
 		`action.image_bound===true`,
+		`bound.length!==available.length`,
+		`bound.map(value=>value.id)`,
 		`base+'/image?action_id='+encodeURIComponent(action.id)`,
 		`signature!==actionSignature`,
 		`screenLink.hidden=true`,
@@ -304,6 +306,43 @@ func TestImageBindingRequiresUniqueImageBoundAction(t *testing.T) {
 	item.handleImage(response, httptest.NewRequest(http.MethodGet, "http://127.0.0.1/image", nil))
 	if response.Code != http.StatusOK || response.Body.String() != "static-image" {
 		t.Fatalf("static action generic image regressed: status=%d body=%q", response.Code, response.Body.String())
+	}
+}
+
+func TestDistinctImageBoundAuthActionsShareOneCurrentCapture(t *testing.T) {
+	generation := strings.Repeat("c", 64)
+	login := driver.AuthAction{
+		ID: "continue_saved_account_login." + generation, Label: "Login",
+		RequiresConfirmation: true, ImageBound: true, ReplayKey: "continue_saved_account_login",
+	}
+	switchAction := driver.AuthAction{
+		ID: "switch_saved_account_login." + generation, Label: "Switch",
+		RequiresConfirmation: true, ImageBound: true, ReplayKey: "switch_saved_account_login",
+	}
+	driverInstance := &fixedAuthActionDriver{
+		Driver: fake.New(driver.PlatformWeChat), actions: []driver.AuthAction{login, switchAction},
+		screenshot: []byte("shared-current-image"),
+	}
+	item := newAuthActionEntry(driverInstance)
+	state := readChallengeState(t, item)
+	if len(state.Actions) != 2 {
+		t.Fatalf("distinct current actions = %#v", state.Actions)
+	}
+	for _, action := range []driver.AuthAction{login, switchAction} {
+		response := httptest.NewRecorder()
+		item.handleImage(response, httptest.NewRequest(
+			http.MethodGet, "http://127.0.0.1/image?action_id="+url.QueryEscape(action.ID), nil,
+		))
+		if response.Code != http.StatusOK || response.Body.String() != "shared-current-image" {
+			t.Fatalf("action %q image status=%d body=%q", action.ID, response.Code, response.Body.String())
+		}
+	}
+	if err := item.performAuthAction(context.Background(), login.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	state = readChallengeState(t, item)
+	if len(state.Actions) != 1 || state.Actions[0].ID != switchAction.ID {
+		t.Fatalf("login consumption removed independent switch action: %#v", state.Actions)
 	}
 }
 
@@ -621,8 +660,16 @@ func TestChallengeStateLatchesOnlineAndNeverReexposesControls(t *testing.T) {
 	}
 	item := newAuthActionEntry(driverInstance)
 	state := readChallengeState(t, item)
+	if state.State != driver.StateStarting || state.CompletedAt != nil || state.CanSubmitCode || len(state.Actions) != 0 {
+		t.Fatalf("first online observation was not provisional: %#v", state)
+	}
+	item.mu.Lock()
+	item.onlineCandidateSince = time.Now().UTC().Add(-onlineStabilityWindow)
+	item.onlineObservations = minimumStableOnlineObservations - 1
+	item.mu.Unlock()
+	state = readChallengeState(t, item)
 	if state.State != driver.StateOnline || state.CompletedAt == nil || state.CanSubmitCode || len(state.Actions) != 0 {
-		t.Fatalf("online state was not terminal: %#v", state)
+		t.Fatalf("stable online state was not terminal: %#v", state)
 	}
 
 	driverInstance.setSnapshot(driver.AuthSnapshot{
@@ -633,8 +680,48 @@ func TestChallengeStateLatchesOnlineAndNeverReexposesControls(t *testing.T) {
 	if state.State != driver.StateOnline || state.CompletedAt == nil || state.CanSubmitCode || len(state.Actions) != 0 {
 		t.Fatalf("terminal state regressed after stale snapshot: %#v", state)
 	}
-	if calls := driverInstance.snapshotCalls.Load(); calls != 1 {
+	// The first provisional and second stable observations precede the
+	// terminal request, which must not perform a third driver query.
+	if calls := driverInstance.snapshotCalls.Load(); calls != 2 {
 		t.Fatalf("terminal state queried driver again: calls=%d", calls)
+	}
+}
+
+func TestChallengeTransientOnlineNeverCompletesAndResetsStability(t *testing.T) {
+	driverInstance := &mutableAuthStateDriver{
+		Driver: fake.New(driver.PlatformWeChat),
+		snapshot: driver.AuthSnapshot{
+			State: driver.StateOnline, ObservedAt: time.Now().UTC(),
+		},
+	}
+	item := newAuthActionEntry(driverInstance)
+	for observation := 0; observation < minimumStableOnlineObservations+2; observation++ {
+		state := readChallengeState(t, item)
+		if state.State != driver.StateStarting || state.CompletedAt != nil {
+			t.Fatalf("rapid online observation %d completed challenge: %#v", observation, state)
+		}
+	}
+
+	firstCandidate := item.onlineCandidateSince
+	driverInstance.setSnapshot(driver.AuthSnapshot{
+		State: driver.StateAuthRequired, Kind: driver.AuthPhoneConfirm,
+		Prompt: "login required", ObservedAt: time.Now().UTC(),
+	})
+	state := readChallengeState(t, item)
+	if state.State != driver.StateAuthRequired || state.CompletedAt != nil || state.Prompt != "login required" {
+		t.Fatalf("online rollback did not return to authentication: %#v", state)
+	}
+	if !item.onlineCandidateSince.IsZero() || item.onlineObservations != 0 {
+		t.Fatalf("online rollback retained candidate: since=%v observations=%d", item.onlineCandidateSince, item.onlineObservations)
+	}
+
+	driverInstance.setSnapshot(driver.AuthSnapshot{
+		State: driver.StateOnline, ObservedAt: time.Now().UTC(),
+	})
+	state = readChallengeState(t, item)
+	if state.State != driver.StateStarting || state.CompletedAt != nil ||
+		item.onlineCandidateSince.IsZero() || !item.onlineCandidateSince.After(firstCandidate) {
+		t.Fatalf("new online candidate reused rolled-back stability: state=%#v since=%v first=%v", state, item.onlineCandidateSince, firstCandidate)
 	}
 }
 
@@ -744,6 +831,9 @@ func TestLoginImageRejectsSnapshotThatBecameOnline(t *testing.T) {
 	}
 	if strings.Contains(response.Body.String(), "fixture") {
 		t.Fatal("online client screenshot was returned by the login image endpoint")
+	}
+	if item.public.CompletedAt != nil || item.public.State != driver.StateStarting {
+		t.Fatalf("one image request completed an unstable login: %#v", item.public)
 	}
 }
 

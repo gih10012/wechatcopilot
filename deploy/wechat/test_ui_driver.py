@@ -737,9 +737,10 @@ class TargetSelectionTests(unittest.TestCase):
                 self.assertIsNone(state["qr_bounds"])
                 generation = state["auth_generation"]
                 self.assertRegex(generation, r"^[0-9a-f]{64}$")
-                self.assertEqual(
-                    [driver.saved_account_auth_action(generation)], state["actions"],
-                )
+                expected_actions = [driver.saved_account_auth_action(generation)]
+                if alternative in ("Switch Account", "切换账号"):
+                    expected_actions.append(driver.saved_account_switch_auth_action(generation))
+                self.assertEqual(expected_actions, state["actions"])
                 self.assertEqual(
                     hashlib.sha256(screenshot["png"]).hexdigest(), state["screenshot_sha256"],
                 )
@@ -770,8 +771,8 @@ class TargetSelectionTests(unittest.TestCase):
 
         self.assertEqual("AUTH_REQUIRED", state["state"])
         self.assertEqual("phone_confirmation", state["auth_kind"])
-        self.assertEqual(1, len(state["actions"]))
-        self.assertTrue(state["actions"][0]["image_bound"])
+        self.assertEqual(2, len(state["actions"]))
+        self.assertTrue(all(action["image_bound"] for action in state["actions"]))
         self.assertEqual([], login.activated)
 
     def test_real_setfocus_saved_account_layout_uses_a_confirmed_visual_action(self):
@@ -798,8 +799,8 @@ class TargetSelectionTests(unittest.TestCase):
 
         self.assertEqual("AUTH_REQUIRED", state["state"])
         self.assertEqual("phone_confirmation", state["auth_kind"])
-        self.assertEqual(1, len(state["actions"]))
-        self.assertTrue(state["actions"][0]["image_bound"])
+        self.assertEqual(2, len(state["actions"]))
+        self.assertTrue(all(action["image_bound"] for action in state["actions"]))
         self.assertEqual([], login.activated)
 
     def test_saved_account_title_and_avatar_never_publish_qr_bounds(self):
@@ -1014,7 +1015,11 @@ class TargetSelectionTests(unittest.TestCase):
         self.assertEqual("AUTH_REQUIRED", state["state"])
         self.assertEqual("phone_confirmation", state["auth_kind"])
         self.assertEqual(
-            [driver.saved_account_auth_action(state["auth_generation"])], state["actions"],
+            [
+                driver.saved_account_auth_action(state["auth_generation"]),
+                driver.saved_account_switch_auth_action(state["auth_generation"]),
+            ],
+            state["actions"],
         )
         self.assertEqual([], login.activated)
         self.assertEqual([], switch.activated)
@@ -1074,6 +1079,35 @@ class TargetSelectionTests(unittest.TestCase):
         self.assertEqual([0], login.activated)
         self.assertEqual([], switch.activated)
 
+    def test_switch_saved_account_login_revalidates_then_clicks_only_switch(self):
+        user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
+        login = FakeNode(
+            "Log In", "push button", (290, 380, 240, 50), actions=("click",),
+        )
+        switch = FakeNode(
+            "Switch Account", "push button", (290, 455, 240, 40), actions=("click",),
+        )
+        _root, window = install_tree(user, login, switch)
+        window.geometry = (200, 100, 420, 600)
+        scope = (window, (0,))
+
+        with saved_account_screenshot() as screenshot:
+            generation = expected_saved_auth_generation(
+                window, screenshot["pixels"], screenshot["dimensions"],
+            )
+            with mock.patch.object(driver, "active_surface_root", return_value=scope):
+                with mock.patch.object(
+                    driver, "verified_window_identity", return_value=verified_wechat_identity(),
+                ):
+                    result = driver.dispatch({
+                        "operation": driver.SAVED_ACCOUNT_SWITCH_AUTH_ACTION_ID,
+                        "expected_auth_generation": generation,
+                    })
+
+        self.assertEqual({"ok": True, "consumed": True}, result)
+        self.assertEqual([], login.activated)
+        self.assertEqual([0], switch.activated)
+
     def test_continue_setfocus_saved_account_login_uses_only_bound_pointer_action(self):
         user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
         login = FakeNode(
@@ -1106,6 +1140,44 @@ class TargetSelectionTests(unittest.TestCase):
         self.assertEqual([], switch.activated)
         pointer.assert_called_once_with(
             (290, 380, 240, 50), 1,
+            expected_window_identity=driver.encode_window_identity(identity),
+            expected_rendered_frame_sha256=driver.rendered_frame_digest(
+                screenshot["pixels"], screenshot["dimensions"],
+            ),
+        )
+
+    def test_switch_setfocus_saved_account_login_uses_only_bound_pointer_action(self):
+        user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
+        login = FakeNode(
+            "Log In", "push button", (290, 380, 240, 50), actions=("SetFocus",),
+        )
+        switch = FakeNode(
+            "Switch Account", "push button", (290, 455, 240, 40), actions=("SetFocus",),
+        )
+        _root, window = install_tree(user, login, switch)
+        window.geometry = (200, 100, 420, 600)
+        scope = (window, (0,))
+        identity = verified_wechat_identity()
+
+        with saved_account_screenshot() as screenshot:
+            generation = expected_saved_auth_generation(
+                window, screenshot["pixels"], screenshot["dimensions"],
+            )
+            with mock.patch.object(driver, "active_surface_root", return_value=scope):
+                with mock.patch.object(
+                    driver, "verified_window_identity", return_value=identity,
+                ):
+                    with mock.patch.object(driver, "visual_pointer_action") as pointer:
+                        result = driver.dispatch({
+                            "operation": driver.SAVED_ACCOUNT_SWITCH_AUTH_ACTION_ID,
+                            "expected_auth_generation": generation,
+                        })
+
+        self.assertEqual({"ok": True, "consumed": True}, result)
+        self.assertEqual([], login.activated)
+        self.assertEqual([], switch.activated)
+        pointer.assert_called_once_with(
+            (290, 455, 240, 40), 1,
             expected_window_identity=driver.encode_window_identity(identity),
             expected_rendered_frame_sha256=driver.rendered_frame_digest(
                 screenshot["pixels"], screenshot["dimensions"],

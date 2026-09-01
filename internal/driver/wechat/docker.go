@@ -536,14 +536,26 @@ func validatedAuthCapture(response controlResponse, state shared.RuntimeState) (
 		return nil, nil, nil
 	}
 	if state != shared.StateAuthRequired || shared.AuthKind(response.AuthKind) != shared.AuthPhoneConfirm ||
-		response.CanSubmitCode || len(response.Actions) != 1 {
+		response.CanSubmitCode || len(response.Actions) < 1 || len(response.Actions) > 2 {
 		return nil, nil, fmt.Errorf("%w: invalid saved-account authentication actions", ErrClientIncompatible)
 	}
-	action := response.Actions[0]
-	if !authGenerationPattern.MatchString(response.AuthGeneration) ||
-		action.ID != savedAccountLoginActionPrefix+response.AuthGeneration ||
-		!action.RequiresConfirmation || !action.ImageBound {
+	if !authGenerationPattern.MatchString(response.AuthGeneration) {
 		return nil, nil, fmt.Errorf("%w: unsupported authentication action", ErrClientIncompatible)
+	}
+	wantIDs := map[string]shared.AuthAction{
+		savedAccountLoginActionPrefix + response.AuthGeneration:  savedAccountLoginAction(response.AuthGeneration),
+		savedAccountSwitchActionPrefix + response.AuthGeneration: savedAccountSwitchAction(response.AuthGeneration),
+	}
+	seen := make(map[string]bool, len(response.Actions))
+	for _, action := range response.Actions {
+		if _, ok := wantIDs[action.ID]; !ok || seen[action.ID] ||
+			!action.RequiresConfirmation || !action.ImageBound {
+			return nil, nil, fmt.Errorf("%w: unsupported authentication action", ErrClientIncompatible)
+		}
+		seen[action.ID] = true
+	}
+	if !seen[savedAccountLoginActionPrefix+response.AuthGeneration] {
+		return nil, nil, fmt.Errorf("%w: saved-account login action is missing", ErrClientIncompatible)
 	}
 	if response.ScreenshotBase64 == "" || !authGenerationPattern.MatchString(response.ScreenshotSHA256) ||
 		base64.StdEncoding.DecodedLen(len(response.ScreenshotBase64)) > maxEmbeddedSurfaceScreenshotBytes {
@@ -561,7 +573,11 @@ func validatedAuthCapture(response controlResponse, state shared.RuntimeState) (
 	// The runtime may only advertise the fixed semantic ID. Security wording is
 	// owned by the host so a compromised or outdated image cannot downgrade the
 	// required confirmation or mislabel the action in the one-time login page.
-	return []shared.AuthAction{savedAccountLoginAction(response.AuthGeneration)}, screenshot, nil
+	actions := []shared.AuthAction{savedAccountLoginAction(response.AuthGeneration)}
+	if seen[savedAccountSwitchActionPrefix+response.AuthGeneration] {
+		actions = append(actions, savedAccountSwitchAction(response.AuthGeneration))
+	}
+	return actions, screenshot, nil
 }
 
 func (b *DockerBackend) Screenshot(ctx context.Context) ([]byte, error) {
@@ -585,11 +601,22 @@ func (b *DockerBackend) SubmitAuthCode(ctx context.Context, code string) error {
 }
 
 func (b *DockerBackend) ContinueSavedAccountLogin(ctx context.Context, expectedGeneration string) error {
+	return b.savedAccountAuthAction(ctx, continueSavedAccountLoginOperation, expectedGeneration)
+}
+
+func (b *DockerBackend) SwitchSavedAccountLogin(ctx context.Context, expectedGeneration string) error {
+	return b.savedAccountAuthAction(ctx, switchSavedAccountLoginOperation, expectedGeneration)
+}
+
+func (b *DockerBackend) savedAccountAuthAction(ctx context.Context, operation, expectedGeneration string) error {
 	if !authGenerationPattern.MatchString(expectedGeneration) {
 		return fmt.Errorf("%w: invalid saved-account authentication generation", ErrInvalidArgument)
 	}
+	if operation != continueSavedAccountLoginOperation && operation != switchSavedAccountLoginOperation {
+		return fmt.Errorf("%w: invalid saved-account authentication operation", ErrInvalidArgument)
+	}
 	response, err := b.control(ctx, controlRequest{
-		Operation: continueSavedAccountLoginOperation, ExpectedAuthGeneration: expectedGeneration,
+		Operation: operation, ExpectedAuthGeneration: expectedGeneration,
 	})
 	if err != nil && response.Consumed {
 		return shared.MarkAuthActionConsumed(err)

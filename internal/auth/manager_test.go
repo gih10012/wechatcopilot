@@ -95,6 +95,10 @@ func TestChallengeUsesCorrectScopedRoutesAndPrivateCodeSubmission(t *testing.T) 
 		`codeButton.disabled=true`,
 		`codeButton.disabled=!state.can_submit_code`,
 		`if(response.ok){form.hidden=true}`,
+		`failure=await response.json()`,
+		`failure&&failure.error&&failure.error.message`,
+		`let actionNoticeUntil=0`,
+		`Date.now()>=actionNoticeUntil`,
 	} {
 		if !strings.Contains(string(body), lifecycleGuard) {
 			t.Fatalf("login page is missing lifecycle guard %q", lifecycleGuard)
@@ -487,6 +491,113 @@ func TestSavedAccountReplayKeySurvivesImageGenerationChangeAndDriverError(t *tes
 	}
 	if driverInstance.callCount(actionA.ID) != 1 || driverInstance.callCount(actionB.ID) != 0 {
 		t.Fatalf("logical operation dispatch counts A=%d B=%d", driverInstance.callCount(actionA.ID), driverInstance.callCount(actionB.ID))
+	}
+}
+
+func TestDefinitiveAuthActionRejectionReleasesReplayTombstoneForBoundedRetry(t *testing.T) {
+	action := driver.AuthAction{
+		ID: "continue_saved_account_login." + strings.Repeat("e", 64), Label: "Saved account",
+		ImageBound: true, ReplayKey: "continue_saved_account_login",
+	}
+	stale := driver.NewFailure(driver.FailureStale, "private driver detail must not escape")
+	driverInstance := &fixedAuthActionDriver{
+		Driver: fake.New(driver.PlatformWeChat), actions: []driver.AuthAction{action},
+		screenshot: []byte("saved-account-png"),
+		results:    map[string][]error{action.ID: {stale, stale}},
+	}
+	item := newAuthActionEntry(driverInstance)
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if err := item.performAuthAction(context.Background(), action.ID, true); !errors.Is(err, stale) {
+			t.Fatalf("definitive rejection %d = %v", attempt, err)
+		}
+		state := readChallengeState(t, item)
+		if len(state.Actions) != 1 || state.Actions[0].ID != action.ID {
+			t.Fatalf("definitively rejected action was not retryable after attempt %d: %#v", attempt, state.Actions)
+		}
+	}
+	if err := item.performAuthAction(context.Background(), action.ID, true); err != nil {
+		t.Fatalf("third bounded attempt: %v", err)
+	}
+	if calls := driverInstance.callCount(action.ID); calls != 3 {
+		t.Fatalf("bounded retry reached driver %d times", calls)
+	}
+	if state := readChallengeState(t, item); len(state.Actions) != 0 {
+		t.Fatalf("successful action remained available: %#v", state.Actions)
+	}
+}
+
+func TestConsumedClassifiedAuthActionErrorNeverReleasesReplayTombstone(t *testing.T) {
+	action := driver.AuthAction{
+		ID: "continue_saved_account_login." + strings.Repeat("f", 64), Label: "Saved account",
+		ImageBound: true, ReplayKey: "continue_saved_account_login",
+	}
+	staleAfterDispatch := driver.MarkAuthActionConsumed(
+		driver.NewFailure(driver.FailureStale, "post-dispatch verification changed"),
+	)
+	driverInstance := &fixedAuthActionDriver{
+		Driver: fake.New(driver.PlatformWeChat), actions: []driver.AuthAction{action},
+		screenshot: []byte("saved-account-png"),
+		results:    map[string][]error{action.ID: {staleAfterDispatch}},
+	}
+	item := newAuthActionEntry(driverInstance)
+
+	if err := item.performAuthAction(context.Background(), action.ID, true); !driver.AuthActionWasConsumed(err) {
+		t.Fatalf("consumed classified failure lost its marker: %v", err)
+	}
+	if state := readChallengeState(t, item); len(state.Actions) != 0 {
+		t.Fatalf("consumed classified action was advertised again: %#v", state.Actions)
+	}
+	if err := item.performAuthAction(context.Background(), action.ID, true); !errors.Is(err, errActionUnavailable) {
+		t.Fatalf("consumed classified action replay = %v", err)
+	}
+	if calls := driverInstance.callCount(action.ID); calls != 1 {
+		t.Fatalf("consumed classified action reached driver %d times", calls)
+	}
+}
+
+func TestAuthActionFailureResponseUsesStableSafeClassification(t *testing.T) {
+	action := driver.AuthAction{ID: "safe-action", Label: "Safe", ReplayKey: "safe-action"}
+	privateDetail := "private driver detail must not escape"
+	driverInstance := &fixedAuthActionDriver{
+		Driver: fake.New(driver.PlatformWeChat), actions: []driver.AuthAction{action},
+		results: map[string][]error{
+			action.ID: {driver.NewFailure(driver.FailureStale, privateDetail)},
+		},
+	}
+	item := newAuthActionEntry(driverInstance)
+	request := httptest.NewRequest(
+		http.MethodPost, "http://127.0.0.1/action",
+		strings.NewReader(`{"action_id":"safe-action","confirmed":true}`),
+	)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-WeChatCopilot-Action", "user-confirmed")
+	request.Header.Set("Origin", "http://127.0.0.1")
+	response := httptest.NewRecorder()
+	item.handleAction(response, request)
+
+	if response.Code != http.StatusConflict || response.Header().Get("Content-Type") != "application/json; charset=utf-8" {
+		t.Fatalf("classified action response status=%d content-type=%q body=%q", response.Code, response.Header().Get("Content-Type"), response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), privateDetail) {
+		t.Fatalf("private driver error escaped: %q", response.Body.String())
+	}
+	var payload struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Retryable bool   `json:"retryable"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode classified action response: %v", err)
+	}
+	if payload.OK || payload.Error.Code != "PAGE_CHANGED" || !payload.Error.Retryable || payload.Error.Message == "" {
+		t.Fatalf("classified action payload = %#v", payload)
+	}
+	if state := readChallengeState(t, item); len(state.Actions) != 1 {
+		t.Fatalf("safe rejection did not retain retryable action: %#v", state.Actions)
 	}
 }
 

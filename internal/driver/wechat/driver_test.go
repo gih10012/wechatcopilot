@@ -1007,7 +1007,7 @@ func TestAuthSnapshotRejectsImageBoundActionWithoutAtomicScreenshot(t *testing.T
 	}
 }
 
-func TestPerformSavedAccountLoginRequiresAdvertisedConfirmedFixedAction(t *testing.T) {
+func TestPerformSavedAccountLoginRequiresConfirmedFixedActionAndBackendGenerationCheck(t *testing.T) {
 	generation := strings.Repeat("b", 64)
 	action := savedAccountLoginAction(generation)
 	backend := &fakeBackend{
@@ -1039,18 +1039,18 @@ func TestPerformSavedAccountLoginRequiresAdvertisedConfirmedFixedAction(t *testi
 		t.Fatalf("invalid authentication actions reached backend %d times", backend.authActionCalls)
 	}
 
-	backend.probe.Actions = []shared.AuthAction{savedAccountLoginAction(strings.Repeat("c", 64))}
+	backend.authActionErr = ErrActionStale
 	if err := driver.PerformAuthAction(context.Background(), shared.AuthActionRequest{
 		ActionID: action.ID, Confirmed: true,
 	}); !errors.Is(err, ErrActionStale) {
-		t.Fatalf("changed-account authentication action error = %v, want ErrActionStale", err)
+		t.Fatalf("backend generation rejection = %v, want ErrActionStale", err)
 	}
-	if backend.authActionCalls != 0 {
-		t.Fatal("stale account-bound authentication action reached backend")
+	if backend.authActionCalls != 1 || backend.authGeneration != generation {
+		t.Fatalf("backend generation checks=%d generation=%q", backend.authActionCalls, backend.authGeneration)
 	}
 }
 
-func TestPerformSavedAccountSwitchRequiresItsAdvertisedGeneration(t *testing.T) {
+func TestPerformSavedAccountSwitchForwardsItsGenerationAndPreservesBackendRejection(t *testing.T) {
 	generation := strings.Repeat("9", 64)
 	login := savedAccountLoginAction(generation)
 	switchAction := savedAccountSwitchAction(generation)
@@ -1072,14 +1072,14 @@ func TestPerformSavedAccountSwitchRequiresItsAdvertisedGeneration(t *testing.T) 
 		t.Fatalf("switch dispatch calls=%d operation=%q generation=%q", backend.authActionCalls, backend.authOperation, backend.authGeneration)
 	}
 
-	backend.probe.Actions = []shared.AuthAction{login}
+	backend.authActionErr = ErrActionStale
 	if err := driver.PerformAuthAction(context.Background(), shared.AuthActionRequest{
 		ActionID: switchAction.ID, Confirmed: true,
 	}); !errors.Is(err, ErrActionStale) {
-		t.Fatalf("unadvertised switch error = %v, want ErrActionStale", err)
+		t.Fatalf("backend switch rejection = %v, want ErrActionStale", err)
 	}
-	if backend.authActionCalls != 1 {
-		t.Fatal("unadvertised switch reached backend")
+	if backend.authActionCalls != 2 || backend.authGeneration != generation {
+		t.Fatalf("backend switch checks=%d generation=%q", backend.authActionCalls, backend.authGeneration)
 	}
 }
 

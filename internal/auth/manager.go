@@ -42,7 +42,11 @@ const (
 	minimumStableOnlineObservations = 3
 	// A confirmed generation is preconsumed before driver invocation. The
 	// challenge also has a total cap for distinct logical onboarding stages.
-	maxAuthActionAttemptsPerAction    = 1
+	// A user-confirmed action may be offered again only when the driver
+	// definitively reports that it rejected the request before dispatch. This
+	// bounded allowance lets a transient generation/focus revalidation recover
+	// without ever replaying an accepted or uncertain operation.
+	maxAuthActionAttemptsPerAction    = 3
 	maxAuthActionAttemptsPerChallenge = 6
 )
 
@@ -657,11 +661,11 @@ func (e *entry) handleSubmit(w http.ResponseWriter, r *http.Request) {
 
 func (e *entry) handleAction(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeAuthActionFailure(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "登录操作请求方式无效", false)
 		return
 	}
 	if !sameOriginJSONRequest(r, "X-WeChatCopilot-Action", "user-confirmed") {
-		http.Error(w, "cross-origin authentication action rejected", http.StatusForbidden)
+		writeAuthActionFailure(w, http.StatusForbidden, "REQUEST_REJECTED", "登录确认请求未通过本机来源校验", false)
 		return
 	}
 	var body struct {
@@ -671,29 +675,81 @@ func (e *entry) handleAction(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(io.LimitReader(r.Body, 4096))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&body); err != nil || strings.TrimSpace(body.ActionID) == "" {
-		http.Error(w, "invalid authentication action", http.StatusBadRequest)
+		writeAuthActionFailure(w, http.StatusBadRequest, "INVALID_ACTION", "登录确认请求无效", false)
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		http.Error(w, "invalid authentication action", http.StatusBadRequest)
+		writeAuthActionFailure(w, http.StatusBadRequest, "INVALID_ACTION", "登录确认请求无效", false)
 		return
 	}
 	if err := e.performAuthAction(r.Context(), body.ActionID, body.Confirmed); err != nil {
 		switch {
 		case errors.Is(err, os.ErrNotExist):
-			http.Error(w, "authentication challenge expired or completed", http.StatusGone)
+			writeAuthActionFailure(w, http.StatusGone, "CHALLENGE_GONE", "本次登录页面已完成或过期，请重新运行登录命令", false)
 		case errors.Is(err, errTooManyActionAttempts):
-			http.Error(w, "too many action attempts", http.StatusTooManyRequests)
+			writeAuthActionFailure(w, http.StatusTooManyRequests, "ATTEMPT_LIMIT", "本次登录页面的确认次数已达上限，请重新运行登录命令", false)
 		case errors.Is(err, errActionInFlight):
-			http.Error(w, "authentication action already in progress", http.StatusConflict)
+			writeAuthActionFailure(w, http.StatusConflict, "ACTION_IN_PROGRESS", "上一项登录操作仍在处理中，请稍候", true)
 		case errors.Is(err, errConfirmationRequired):
-			http.Error(w, "explicit confirmation is required", http.StatusBadRequest)
+			writeAuthActionFailure(w, http.StatusBadRequest, "CONFIRMATION_REQUIRED", "该操作必须由你本人明确确认", true)
+		case errors.Is(err, errActionUnavailable):
+			writeAuthActionFailure(w, http.StatusConflict, "ACTION_NOT_CURRENT", "该按钮已过期或已使用；请等待画面刷新，必要时重新运行登录命令", true)
 		default:
-			http.Error(w, "authentication action is unavailable", http.StatusConflict)
+			writeClassifiedAuthActionFailure(w, err)
 		}
 		return
 	}
 	writeJSON(w, map[string]bool{"accepted": true})
+}
+
+func writeAuthActionFailure(w http.ResponseWriter, status int, code, message string, retryable bool) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Retryable bool   `json:"retryable"`
+		} `json:"error"`
+	}{
+		OK: false,
+		Error: struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Retryable bool   `json:"retryable"`
+		}{Code: code, Message: message, Retryable: retryable},
+	})
+}
+
+func writeClassifiedAuthActionFailure(w http.ResponseWriter, err error) {
+	kind, classified := driver.ClassifyFailure(err)
+	if !classified {
+		writeAuthActionFailure(
+			w, http.StatusConflict, "OUTCOME_UNCERTAIN",
+			"操作可能已提交；为避免重复操作，本次登录页面不会重放该操作，请观察官方客户端或重新运行登录命令",
+			false,
+		)
+		return
+	}
+	switch kind {
+	case driver.FailureStale:
+		writeAuthActionFailure(w, http.StatusConflict, "PAGE_CHANGED", "官方客户端页面在确认前发生变化；画面刷新后可再次确认", true)
+	case driver.FailureTargetAmbiguous:
+		writeAuthActionFailure(w, http.StatusConflict, "TARGET_AMBIGUOUS", "当前登录控件不唯一；请保持官方客户端仅显示一个登录窗口", true)
+	case driver.FailureClientIncompatible:
+		writeAuthActionFailure(w, http.StatusConflict, "CLIENT_INCOMPATIBLE", "当前官方客户端登录控件无法安全操作", false)
+	case driver.FailureUserActionRequired:
+		writeAuthActionFailure(w, http.StatusConflict, "USER_ACTION_REQUIRED", "该步骤只能在官方客户端中由你本人完成", false)
+	case driver.FailureAuthRequired:
+		writeAuthActionFailure(w, http.StatusConflict, "AUTH_SCREEN_CHANGED", "官方客户端已切换到另一种登录验证页面；请按新画面继续", true)
+	case driver.FailureInvalidArgument:
+		writeAuthActionFailure(w, http.StatusBadRequest, "INVALID_ACTION", "登录确认请求与当前客户端页面不匹配", false)
+	case driver.FailureDriverUnavailable:
+		writeAuthActionFailure(w, http.StatusServiceUnavailable, "DRIVER_UNAVAILABLE", "官方客户端运行时暂时不可用", true)
+	default:
+		writeAuthActionFailure(w, http.StatusConflict, "ACTION_UNAVAILABLE", "当前登录操作不可用", false)
+	}
 }
 
 var (
@@ -852,7 +908,38 @@ func (e *entry) performAuthAction(ctx context.Context, actionID string, confirme
 	e.performedActions[actionID] = true
 	e.performedReplayKeys[replayKey] = true
 	e.mu.Unlock()
-	return actor.PerformAuthAction(ctx, driver.AuthActionRequest{ActionID: actionID, Confirmed: confirmed})
+	err = actor.PerformAuthAction(ctx, driver.AuthActionRequest{ActionID: actionID, Confirmed: confirmed})
+	if err != nil && authActionDefinitivelyRejected(err) {
+		// The action was reserved before crossing the driver boundary so a
+		// concurrent refreshed generation could never race it. A classified,
+		// non-consumed rejection is the only outcome that proves no side effect
+		// occurred; release just the replay tombstones while retaining bounded
+		// attempt accounting.
+		e.mu.Lock()
+		delete(e.performedActions, actionID)
+		delete(e.performedReplayKeys, replayKey)
+		e.mu.Unlock()
+	}
+	return err
+}
+
+func authActionDefinitivelyRejected(err error) bool {
+	if err == nil || driver.AuthActionWasConsumed(err) {
+		return false
+	}
+	kind, ok := driver.ClassifyFailure(err)
+	if !ok {
+		return false
+	}
+	switch kind {
+	case driver.FailureInvalidArgument, driver.FailureAuthRequired,
+		driver.FailureClientIncompatible, driver.FailureTargetAmbiguous,
+		driver.FailureUserActionRequired, driver.FailureStale,
+		driver.FailureDriverUnavailable:
+		return true
+	default:
+		return false
+	}
 }
 
 func sameOriginJSONRequest(r *http.Request, markerHeader, markerValue string) bool {
@@ -1119,6 +1206,8 @@ let uiGeneration=0;
 let stateInFlight=false;
 let pollTimer=0;
 let completed=false;
+let actionNotice='';
+let actionNoticeUntil=0;
 function refreshImage(){
   if(completed||imageBoundActionID)return;
   const generation=++imageGeneration;
@@ -1138,8 +1227,13 @@ async function performAction(action,button){
   try{
     const response=await fetch(base+'/action',{method:'POST',headers:{'content-type':'application/json','X-WeChatCopilot-Action':'user-confirmed'},body:JSON.stringify({action_id:action.id,confirmed:true})});
     if(completed||generation!==uiGeneration)return;
-    prompt.textContent=response.ok?'操作已提交，正在刷新官方客户端画面':'操作不可用；请确认页面未变化后重试';
-    if(response.ok){actionSignature='';imageBoundActionID='';refreshImage();scheduleState(0)}else{button.disabled=false}
+    let failure=null;
+    if(!response.ok){try{failure=await response.json()}catch(_error){failure=null}}
+    if(completed||generation!==uiGeneration)return;
+    actionNotice=response.ok?'操作已提交，正在刷新官方客户端画面':(failure&&failure.error&&failure.error.message)||'当前登录操作不可用';
+    actionNoticeUntil=Date.now()+(response.ok?3000:10000);
+    prompt.textContent=actionNotice;
+    if(response.ok){actionSignature='';imageBoundActionID='';refreshImage();scheduleState(0)}else{button.disabled=false;actionSignature='';imageBoundActionID='';scheduleState(0)}
   }catch(_error){if(!completed&&generation===uiGeneration){prompt.textContent='无法连接登录服务，请稍后重试';button.disabled=false;scheduleState(0)}}
 }
 function populateActionButtons(available){
@@ -1192,7 +1286,7 @@ async function refreshState(){
       screenLink.hidden=true;
       return;
     }
-    prompt.textContent=state.prompt||state.state;
+    if(Date.now()>=actionNoticeUntil){actionNotice='';prompt.textContent=state.prompt||state.state}
     form.hidden=!state.can_submit_code;
     codeButton.disabled=!state.can_submit_code;
     renderActions(state.actions);

@@ -303,13 +303,6 @@ func (d *Driver) PerformAuthAction(ctx context.Context, request shared.AuthActio
 	if !d.started() {
 		return ErrNotStarted
 	}
-	probe, err := d.backend.Probe(ctx)
-	if err != nil {
-		return err
-	}
-	if probe.State != shared.StateAuthRequired || !savedAccountAuthActionAdvertised(probe.Actions, request.ActionID) {
-		return fmt.Errorf("%w: saved-account authentication action is no longer advertised", ErrActionStale)
-	}
 	var actionErr error
 	switch operation {
 	case continueSavedAccountLoginOperation:
@@ -355,20 +348,6 @@ func hasImageBoundAuthAction(actions []shared.AuthAction) bool {
 		}
 	}
 	return false
-}
-
-func savedAccountAuthActionAdvertised(actions []shared.AuthAction, actionID string) bool {
-	matches := 0
-	for _, action := range actions {
-		if action.ID != actionID {
-			continue
-		}
-		if !action.RequiresConfirmation || !action.ImageBound {
-			return false
-		}
-		matches++
-	}
-	return matches == 1
 }
 
 func definitiveAuthActionRejection(err error) bool {

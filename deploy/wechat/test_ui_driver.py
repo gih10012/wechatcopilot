@@ -1076,7 +1076,10 @@ class TargetSelectionTests(unittest.TestCase):
                         })
 
         self.assertEqual({"ok": True, "consumed": True}, result)
-        self.assertGreaterEqual(verify.call_count, 6)
+        # One stable capture brackets its screenshot with two independently
+        # verified window observations; the pointer path performs the final
+        # exact-window/full-frame check under an X11 server grab.
+        self.assertEqual(2, verify.call_count)
         self.assertEqual([], login.activated)
         self.assertEqual([], switch.activated)
         pointer.assert_called_once_with(
@@ -1307,7 +1310,7 @@ class TargetSelectionTests(unittest.TestCase):
         self.assertEqual([], login.activated)
         self.assertEqual([], switch.activated)
 
-    def test_third_capture_rejects_an_accessible_login_replacement(self):
+    def test_final_resolution_rejects_an_accessible_login_replacement(self):
         user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
         login = FakeNode(
             "Log In", "push button", (290, 380, 240, 50), actions=("click",),
@@ -1321,32 +1324,26 @@ class TargetSelectionTests(unittest.TestCase):
         _root, window = install_tree(user, login, switch)
         window.geometry = (200, 100, 420, 600)
         scope = (window, (0,))
-        active_calls = 0
-
-        def active_scope():
-            nonlocal active_calls
-            active_calls += 1
-            if active_calls == 5:
-                window.children[1] = replacement
-            return scope
-
         with saved_account_screenshot() as screenshot:
             generation = expected_saved_auth_generation(
                 window, screenshot["pixels"], screenshot["dimensions"],
             )
-            with mock.patch.object(driver, "active_surface_root", side_effect=active_scope):
+            with mock.patch.object(driver, "active_surface_root", return_value=scope):
                 with mock.patch.object(
                     driver, "verified_window_identity", return_value=verified_wechat_identity(),
                 ):
-                    with self.assertRaises(driver.ControlFailure) as raised:
-                        driver.dispatch({
-                            "operation": driver.SAVED_ACCOUNT_AUTH_ACTION_ID,
-                            "expected_auth_generation": generation,
-                        })
+                    with mock.patch.object(driver, "resolve_path", return_value=replacement):
+                        with mock.patch.object(driver, "visual_pointer_action") as pointer:
+                            with self.assertRaises(driver.ControlFailure) as raised:
+                                driver.dispatch({
+                                    "operation": driver.SAVED_ACCOUNT_AUTH_ACTION_ID,
+                                    "expected_auth_generation": generation,
+                                })
 
         self.assertEqual("ACTION_STALE", raised.exception.code)
         self.assertEqual([], login.activated)
         self.assertEqual([], replacement.activated)
+        pointer.assert_not_called()
 
     def test_continue_saved_account_login_rejects_changed_rendered_account(self):
         user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
@@ -1360,18 +1357,19 @@ class TargetSelectionTests(unittest.TestCase):
         window.geometry = (200, 100, 420, 600)
         scope = (window, (0,))
         first_pixels = fixture_pixels(value=0x22)
-        changed_pixels = fixture_pixels(value=0x77)
         generation = expected_saved_auth_generation(window, first_pixels)
 
         with mock.patch.object(driver, "active_surface_root", return_value=scope):
             with mock.patch.object(
                 driver, "verified_window_identity", return_value=verified_wechat_identity(),
             ):
-                with mock.patch.object(driver, "capture_screenshot_png", return_value=b"png"):
+                with saved_account_screenshot(pixels=first_pixels):
                     with mock.patch.object(
-                        driver, "screenshot_rgba",
-                        side_effect=((first_pixels, (420, 600)), (changed_pixels, (420, 600))),
-                    ):
+                        driver, "visual_pointer_action",
+                        side_effect=driver.ControlFailure(
+                            "ACTION_STALE", "complete rendered surface changed before pointer injection",
+                        ),
+                    ) as pointer:
                         with self.assertRaises(driver.ControlFailure) as raised:
                             driver.dispatch({
                                 "operation": driver.SAVED_ACCOUNT_AUTH_ACTION_ID,
@@ -1381,6 +1379,7 @@ class TargetSelectionTests(unittest.TestCase):
         self.assertEqual("ACTION_STALE", raised.exception.code)
         self.assertFalse(raised.exception.consumed)
         self.assertEqual([], login.activated)
+        pointer.assert_called_once()
 
     def test_continue_saved_account_login_requires_the_advertised_generation(self):
         user = FakeNode("Current UserAlice", "label", (300, 145, 220, 30))
@@ -1459,7 +1458,7 @@ class TargetSelectionTests(unittest.TestCase):
         def changing_query_action():
             nonlocal query_count
             query_count += 1
-            name = "delete" if query_count == 13 else "click"
+            name = "delete" if query_count == 5 else "click"
             return ChangingAction(login, (name,))
 
         login.queryAction = changing_query_action
@@ -1477,7 +1476,7 @@ class TargetSelectionTests(unittest.TestCase):
                         })
 
         self.assertEqual("ACTION_STALE", raised.exception.code)
-        self.assertEqual(13, query_count)
+        self.assertEqual(5, query_count)
         self.assertEqual([], executed)
 
     def test_rejecting_qt_click_is_not_invoked_for_saved_account_action(self):

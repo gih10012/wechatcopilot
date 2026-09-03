@@ -4413,39 +4413,27 @@ def perform_saved_account_auth_action(request, operation, target_name):
         r"[0-9a-f]{64}", expected_generation,
     ):
         raise ControlFailure("CLIENT_INCOMPATIBLE", "invalid saved-account authentication generation")
-    initial = capture_saved_account_confirmation()
-    confirmed = capture_saved_account_confirmation()
-    if (
-        initial["auth_generation"] != expected_generation
-        or confirmed["auth_generation"] != expected_generation
-        or initial["identity_digest"] != confirmed["identity_digest"]
-        or initial["scope_identity"] != confirmed["scope_identity"]
-        or initial["target"]["signature"] != confirmed["target"]["signature"]
-    ):
+    # One stable capture already brackets the screenshot with independent
+    # before/after accessibility observations. Repeating that complete capture
+    # several more times adds no binding evidence: the expected generation is
+    # the browser-observed full-frame, semantic, window and account binding.
+    # It does add several process boundaries during which an otherwise static
+    # Qt login window can transiently refresh. Resolve the exact target from
+    # this one current capture, then let visual_pointer_action verify the same
+    # X11 window and every rendered pixel again while the server is grabbed.
+    current = capture_saved_account_confirmation()
+    if current["auth_generation"] != expected_generation:
         raise ControlFailure(
             "ACTION_STALE", "saved-account login page changed before confirmation",
         )
-
-    # Capture the active scope again immediately before the only side effect,
-    # then resolve the login control afresh from its accessibility path.
-    final = capture_saved_account_confirmation()
-    if (
-        final["auth_generation"] != expected_generation
-        or confirmed["identity_digest"] != final["identity_digest"]
-        or confirmed["scope_identity"] != final["scope_identity"]
-        or confirmed["target"]["signature"] != final["target"]["signature"]
-    ):
-        raise ControlFailure(
-            "ACTION_STALE", "saved-account login window changed before activation",
-        )
-    target = final["target"].get(target_name)
+    target = current["target"].get(target_name)
     if target is None:
         raise ControlFailure("ACTION_STALE", "saved-account authentication action is no longer available")
-    if not path_is_within(target["path"], final["scope"][1]):
+    if not path_is_within(target["path"], current["scope"][1]):
         raise ControlFailure("ACTION_STALE", "saved-account authentication control left its window")
     node = resolve_path(target["path"])
     if (
-        not visible_node(node, main_geometry(final["scope"]))
+        not visible_node(node, main_geometry(current["scope"]))
         or observable_accessible_identity(node) != target["accessible_identity"]
         or node_signature(node, target["path"]) != target["static_signature"]
     ):
@@ -4457,8 +4445,8 @@ def perform_saved_account_auth_action(request, operation, target_name):
     if action["dispatch"] == "verified_pointer":
         visual_pointer_action(
             target["geometry"], 1,
-            expected_window_identity=final["window_identity"],
-            expected_rendered_frame_sha256=final["rendered_frame_sha256"],
+            expected_window_identity=current["window_identity"],
+            expected_rendered_frame_sha256=current["rendered_frame_sha256"],
         )
     else:
         try:
